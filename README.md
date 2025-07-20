@@ -1,4 +1,4 @@
-# GHttpsServerIOCP - A High-Performance HTTPS Server in Delphi
+# GHttpsServerIOCP - A HTTPS Server in Delphi
 
 This project is an implementation of an asynchronous, multi-threaded HTTPS server for Windows, written in Delphi. The server utilizes I/O Completion Ports (IOCP) and the native Windows TLS/SSL stack (SChannel), ensuring high performance, scalability, and security.
 
