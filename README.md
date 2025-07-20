@@ -50,7 +50,7 @@ The server requires an SSL certificate for HTTPS. For local development, you can
 1.  Open a Command Prompt (CMD) **as an Administrator**.
 2.  Run the following command:
     ```bash
-    MakeCert.exe" -r -pe -n "CN=localhost" -ss GHttpsIOCPSvr -a sha256 -sky exchange -sp "Microsoft Enhanced RSA and AES Cryptographic Provider" -sy 24
+    MakeCert.exe -r -pe -n "CN=localhost" -ss GHttpsIOCPSvr -a sha256 -sky exchange -sp "Microsoft Enhanced RSA and AES Cryptographic Provider" -sy 24
     ```
     **Note:** The certificate store name (`-ss GHttpsIOCPSvr`) **must** match the name specified in the server's code (`'GHttpsIOCPSvr'`).
 
@@ -69,27 +69,14 @@ All server logic resides within the main `program` block. Here is the fundamenta
 program GHttpsIOCPSvr;
 
 {$APPTYPE CONSOLE}
-// ... uses clause ...
 
 begin
-  // (Logger and other initial setup)
   try
-    // 1. CREATE THE SERVER INSTANCE
-    // Parameters: Port, Certificate CN, Certificate Store Name
     var Server := TGHttpsServerIOCP.Create(8443, 'localhost', 'GHttpsIOCPSvr');
     try
-      // 2. REGISTER YOUR ENDPOINTS HERE
-      // (See examples in the next section)
-      // Server.RegisterEndpointProc('/hello', hmGET, ...);
-      // Server.RegisterEndpointProc('/api/data', hmGET, ...);
-
-
-      // 3. START THE SERVER
       Server.Start;
       Logger.Info('Server running. Press Enter to stop...');
-      Readln; // Wait for user input to stop
-
-      // 4. STOP THE SERVER CLEANLY
+      Readln;
       Server.Stop;
     finally
       Server.Free;
@@ -104,12 +91,12 @@ begin
 end.
 ```
 
-## Endpoint Registration Examples
+## How to Add Your Own Endpoints (Code Examples)
 
 You register your endpoints inside the `try...finally` block, after creating the server instance and before calling `Server.Start`. Here are common patterns.
 
 ### Example 1: Simple Text Response
-This is a basic "Hello, World!" endpoint.
+A basic "Hello, World!" endpoint.
 
 **Delphi Code:**
 ```delphi
@@ -120,17 +107,13 @@ Server.RegisterEndpointProc('/hello', hmGET,
   end
 );
 ```
-**Test with curl:**
-```bash
-curl -k https://localhost:8443/hello
-```
+**Test with curl:** `curl -k https://localhost:8443/hello`
 
 ### Example 2: Returning JSON Content
-This example creates and returns a `TJSONObject`.
+Creates and returns a `TJSONObject`.
 
 **Delphi Code:**
 ```delphi
-uses System.JSON;
 ...
 Server.RegisterEndpointProc('/api/data', hmGET,
   procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
@@ -141,7 +124,6 @@ Server.RegisterEndpointProc('/api/data', hmGET,
     try
       Json.AddPair('id', TJSONNumber.Create(123));
       Json.AddPair('name', TJSONString.Create('Test Product'));
-      Json.AddPair('active', TJSONTrue.Create);
       AResponse.AddJSONContent(Json.ToJSON);
     finally
       Json.Free;
@@ -149,13 +131,10 @@ Server.RegisterEndpointProc('/api/data', hmGET,
   end
 );
 ```
-**Test with curl:**
-```bash
-curl -k https://localhost:8443/api/data
-```
+**Test with curl:** `curl -k https://localhost:8443/api/data`
 
 ### Example 3: Reading Query Parameters
-This endpoint reads an `id` parameter from the URL query string.
+Reads an `id` parameter from the URL query string.
 
 **Delphi Code:**
 ```delphi
@@ -169,13 +148,34 @@ Server.RegisterEndpointProc('/api/user', hmGET,
   end
 );
 ```
-**Test with curl:**
-```bash
-curl -k "https://localhost:8443/api/user?id=456"
-```
+**Test with curl:** `curl -k "https://localhost:8443/api/user?id=456"`
 
-### Example 4: Creating a Protected Endpoint (JWT)
-To protect an endpoint, simply add `atJWTBearer` as the final parameter. The server will automatically validate the token before executing your handler.
+### Example 4: Handling POST with a JSON Body
+Reads a JSON body from a POST request.
+
+**Delphi Code:**
+```delphi
+Server.RegisterEndpointProc('/api/submit', hmPOST,
+  procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+  var
+    JsonRequest: TJSONObject;
+    Name: string;
+  begin
+    JsonRequest := TJSONObject.ParseJSONValue(ARequest.BodyAsString) as TJSONObject;
+    if Assigned(JsonRequest) then
+    try
+      Name := JsonRequest.GetValue<string>('name', 'Unknown');
+      AResponse.AddTextContent('text/plain', 'Received name: ' + Name);
+    finally
+      JsonRequest.Free;
+    end;
+  end
+);
+```
+**Test with curl:** `curl -k -X POST https://localhost:8443/api/submit -H "Content-Type: application/json" -d "{\"name\":\"John Doe\"}"`
+
+### Example 5: Creating a Protected Endpoint (JWT)
+To protect an endpoint, add `atJWTBearer` as the final parameter.
 
 **Delphi Code:**
 ```delphi
@@ -184,7 +184,7 @@ Server.RegisterEndpointProc('/api/secure/data', hmGET,
   begin
     AResponse.AddTextContent('text/plain', 'This is a secret message!');
   end,
-  atJWTBearer // <-- This makes the endpoint require a valid JWT token
+  atJWTBearer
 );
 ```
 **Test with curl:**
@@ -194,31 +194,58 @@ TOKEN="YOUR_TOKEN"
 curl -k -H "Authorization: Bearer $TOKEN" https://localhost:8443/api/secure/data
 ```
 
----
+### Example 6: Generating a JWT Token (Login Logic)
+This example shows the full logic for a login endpoint: validating credentials, adding custom claims, and creating a token.
 
-## Endpoints in the Demo Application
-
-The main `GHttpsIOCPSvr.dpr` file includes the following pre-configured endpoints for demonstration.
-
-| Method | Path        | Authorization | Description                                                                 |
-|--------|-------------|---------------|-----------------------------------------------------------------------------|
-| `GET`  | `/`         | None          | Shows a welcome HTML page.                                                  |
-| `POST` | `/login`    | None          | Authenticates with `admin`/`password123` to get a JWT.                      |
-| `GET`  | `/echo`     | None          | Echoes back URL query parameters in an HTML page.                           |
-| `POST` | `/echojson` | **JWT**       | Protected endpoint. Echoes back the JSON body it receives.                  |
-| `GET`  | `/large`    | None          | Streams a large 10MB file from the server disk.                             |
-| `POST` | `/upload`   | None          | Handles `multipart/form-data` file uploads. Saves files to `./uploads/`.   |
-
-
-## Project Structure
-
-*   `GHttpsIOCPSvr.dpr`: The main project file and application entry point.
-*   `src/GHttpsServerIOCP.pas`: The core server class.
-*   `src/GRequest.pas`, `GRequestBody.pas`: Request parsing and handling.
-*   `src/GResponse.pas`: Response construction.
-*   `src/GJWTManager.pas`: JWT creation and validation.
-*   `src/OverlappedExPool.pas`: `OVERLAPPED` object pool for performance.
-*   `src/WinApiAdditions.pas`: WinAPI definitions for SChannel and IOCP.
+**Delphi Code:**
+```delphi
+Server.RegisterEndpointProc('/login', hmPOST,
+  procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+  var
+    JsonRequest: TJSONObject;
+    Username, Password, Token: string;
+    CustomClaims, JsonResponse: TJSONObject;
+  begin
+    JsonRequest := TJSONObject.ParseJSONValue(ARequest.BodyAsString) as TJSONObject;
+    if not Assigned(JsonRequest) then Exit; // Basic validation
+    try
+      Username := JsonRequest.GetValue<string>('username', '');
+      Password := JsonRequest.GetValue<string>('password', '');
+      if (Username = 'admin') and (Password = 'password123') then
+      begin
+        CustomClaims := TJSONObject.Create;
+        try
+          CustomClaims.AddPair('role', 'administrator');
+          CustomClaims.AddPair('department', 'IT');
+          Token := AServer.JWTManager.CreateToken(Username, CustomClaims);
+          JsonResponse := TJSONObject.Create;
+          try
+            JsonResponse.AddPair('token_type', 'Bearer');
+            JsonResponse.AddPair('access_token', Token);
+            AResponse.AddJSONContent(JsonResponse.ToJSON);
+          finally
+            JsonResponse.Free;
+          end;
+        finally
+          CustomClaims.Free;
+        end;
+      end
+      else
+      begin
+        AResponse.SetUnauthorized('Invalid username or password.');
+      end;
+    finally
+      JsonRequest.Free;
+    end;
+  end
+);
+```
+**Test with curl:**
+```bash
+curl -k -X POST https://localhost:8443/login \
+-H "Content-Type: application/json" \
+-d "{\"username\":\"admin\",\"password\":\"password123\"}"
+```
 
 ## License
 
