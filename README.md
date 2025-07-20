@@ -50,7 +50,7 @@ The server requires an SSL certificate for HTTPS. For local development, you can
 1.  Open a Command Prompt (CMD) **as an Administrator**.
 2.  Run the following command:
     ```bash
-    MakeCert.exe -r -pe -n "CN=localhost" -ss GHttpsIOCPSvr -a sha256 -sky exchange -sp "Microsoft Enhanced RSA and AES Cryptographic Provider" -sy 24
+    MakeCert.exe" -r -pe -n "CN=localhost" -ss GHttpsIOCPSvr -a sha256 -sky exchange -sp "Microsoft Enhanced RSA and AES Cryptographic Provider" -sy 24
     ```
     **Note:** The certificate store name (`-ss GHttpsIOCPSvr`) **must** match the name specified in the server's code (`'GHttpsIOCPSvr'`).
 
