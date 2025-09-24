@@ -111,6 +111,8 @@ type
     FThrottleNewConnections: LongInt;
     FSubjectName:String;
     FCertificateStore:String;
+    FActiveOverlapped: TList<POverlappedEx>;
+    FActiveOverlappedLock: TCriticalSection;
     function InitializeWinsock: Boolean;
     function CreateListenSocket: Boolean;
     function CreateCompletionPort: Boolean;
@@ -215,6 +217,18 @@ begin
       AOverlapped^.Socket := INVALID_SOCKET;
     end;
     Server.CleanupOverlappedEx(AOverlapped);
+    Server.FActiveOverlappedLock.Enter;
+    try
+      Server.FActiveOverlapped.Remove(AOverlapped);
+    finally
+      Server.FActiveOverlappedLock.Leave;
+    end;
+    Server.FActiveOverlappedLock.Enter;
+    try
+      Server.FActiveOverlapped.Remove(AOverlapped);
+    finally
+      Server.FActiveOverlappedLock.Leave;
+    end;
     Server.FOverlappedPool.Release(AOverlapped);
     AOverlapped := nil;
   except
@@ -279,6 +293,9 @@ constructor TGHttpsServerIOCP.Create(APort: Word;
 begin
   inherited Create;
 
+  FActiveOverlapped := TList<POverlappedEx>.Create;
+  FActiveOverlappedLock := TCriticalSection.Create;
+
   FJWTManager := TJWTManager.Create(
     ASecretKey,
     'JWTManager',
@@ -309,15 +326,9 @@ begin
   FCertificateStore := ACertificateStore;
   ZeroMemory(@FServerCredHandle, SizeOf(FServerCredHandle));
   Logger.Info(Format('Creating OverlappedEx pool. Max connections: %d', [AMaxConnections]));
-  FOverlappedPool := TOverlappedExPool.Create(
-    AMaxConnections div 4,
-    AMaxConnections,
-    AMinFreeMemoryMb,
-    AMaxMemoryLoadPercent
-  );
-
+  FOverlappedPool := TOverlappedExPool.Create(AMaxConnections div 4, AMaxConnections, AMinFreeMemoryMb, AMaxMemoryLoadPercent);
   Logger.Info(Format('HTTPS Server created - MaxRequest: %d MB, MaxResponse: %d MB, ChunkSize: %d KB',
-             [FMaxRequestSize div 1048576, FMaxResponseSize div 1048576, FChunkSize div 1024]));
+                       [FMaxRequestSize div 1048576, FMaxResponseSize div 1048576, FChunkSize div 1024]));
 end;
 
 destructor TGHttpsServerIOCP.Destroy;
@@ -351,6 +362,8 @@ begin
   ElapsedMs := MilliSecondsBetween(Now, StartTime);
   Logger.Info('Cleanup TGHttpsServerIOCP end in %dms', [ElapsedMs]);
   FJWTManager.Free;
+  FActiveOverlapped.Free;
+  FActiveOverlappedLock.Free;
   inherited;
 end;
 
@@ -1105,23 +1118,51 @@ var
   i: Integer;
   ThreadHandle: THandle;
   Handles: TArray<THandle>;
+  ActiveListCopy: TArray<POverlappedEx>;
+  Overlapped: POverlappedEx;
 begin
   if not FRunning then
     Exit;
   Logger.Info('Stopping the server...');
   FRunning := False;
+
   if FListenSocket <> INVALID_SOCKET then
   begin
     Logger.Info('[STOP] Closing the listening socket to cancel the pending AcceptEx operation...');
     closesocket(FListenSocket);
     FListenSocket := INVALID_SOCKET;
   end;
+
+  Logger.Info('[STOP] Closing all active client sockets to cancel pending I/O operations...');
+  FActiveOverlappedLock.Enter;
+  try
+    ActiveListCopy := FActiveOverlapped.ToArray;
+    Logger.Info('[STOP] Found %d active connections to close.', [Length(ActiveListCopy)]);
+  finally
+    FActiveOverlappedLock.Leave;
+  end;
+
+  for Overlapped in ActiveListCopy do
+  begin
+    if Assigned(Overlapped) and (Overlapped^.Socket <> INVALID_SOCKET) then
+    begin
+      try
+        shutdown(Overlapped^.Socket, SD_BOTH);
+        closesocket(Overlapped^.Socket);
+      except
+        on E: Exception do
+          Logger.Error('[STOP] Error closing client socket: %s', [E.Message]);
+      end;
+    end;
+  end;
+
   if (FCompletionPort <> 0) and (FWorkerThreads.Count > 0) then
   begin
-    Logger.Info('[STOP] Sending shutdown signals to the worker threads...');
+    Logger.Info('[STOP] Sending shutdown signals to any idle worker threads...');
     for i := 1 to FWorkerThreads.Count do
       PostQueuedCompletionStatus(FCompletionPort, 0, 0, nil);
   end;
+
   Logger.Info('[STOP] Waiting for worker threads to terminate...');
   if FWorkerThreads.Count > 0 then
   begin
@@ -1140,15 +1181,17 @@ begin
   begin
     if FMonitorThread <> 0 then
     begin
-        Logger.Info('[STOP] Waiting for the monitoring thread to terminate...');
-        WaitForSingleObject(FMonitorThread, 2000);
-        CloseHandle(FMonitorThread);
-        FMonitorThread := 0;
+      Logger.Info('[STOP] Waiting for the monitoring thread to terminate...');
+      WaitForSingleObject(FMonitorThread, 2000);
+      CloseHandle(FMonitorThread);
+      FMonitorThread := 0;
     end;
   end;
+
   for ThreadHandle in FWorkerThreads do
-    CloseHandle(ThreadHandle);
+      CloseHandle(ThreadHandle);
   FWorkerThreads.Clear;
+
   if FCompletionPort <> 0 then
   begin
     Logger.Info('[STOP] Closing the completion port...');
@@ -1183,7 +1226,8 @@ begin
       on E: Exception do Logger.Info('[STOP] Exception w CertFreeCertificateContext: ' + E.Message);
     end;
   end;
-  Logger.Info('[STOP] Executing  WSACleanup...');
+
+  Logger.Info('[STOP] Executing WSACleanup...');
   WSACleanup;
   Logger.Info('Server shut down cleanly.');
 end;
@@ -1201,6 +1245,12 @@ begin
   begin
     Logger.Error('Failed to accept connection: the OverlappedEx pool is full or out of memory.');
     Exit;
+  end;
+  FActiveOverlappedLock.Enter;
+  try
+    FActiveOverlapped.Add(OverlappedEx);
+  finally
+    FActiveOverlappedLock.Leave;
   end;
   OverlappedEx^.OpType := otAccept;
   OverlappedEx^.Socket := Socket;
@@ -1238,6 +1288,14 @@ begin
     closesocket(ClientSocket);
     Exit;
   end;
+
+  FActiveOverlappedLock.Enter;
+  try
+    FActiveOverlapped.Add(OverlappedEx);
+  finally
+    FActiveOverlappedLock.Leave;
+  end;
+
 
   OverlappedEx^.OpType := otSSLHandshake;
   OverlappedEx^.Socket := ClientSocket;
@@ -1385,9 +1443,11 @@ begin
         Result := False;
       end;
     else
-      Logger.Error('SSL Handshake failed: 0x%x', [Status]);
-      OverlappedEx.SSLNeedsMoreData := False;
-      Result := False;
+      begin
+        Logger.Error('SSL Handshake failed: 0x%x', [Status]);
+        OverlappedEx.SSLNeedsMoreData := False;
+        Result := False;
+      end;
     end;
   except
     on E: Exception do
@@ -1736,6 +1796,12 @@ begin
               TInterlocked.Increment(Server.FRequestsPerSecondCounter);
               InterlockedIncrement64(Server.FActiveConnections);
               Server.HandleHttpsHandshake(OverlappedEx^.ClientSocket);
+            end;
+            Server.FActiveOverlappedLock.Enter;
+            try
+              Server.FActiveOverlapped.Remove(OverlappedEx);
+            finally
+              Server.FActiveOverlappedLock.Leave;
             end;
             Server.FOverlappedPool.Release(OverlappedEx);
           end;
