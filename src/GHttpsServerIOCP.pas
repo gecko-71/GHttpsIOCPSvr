@@ -223,12 +223,7 @@ begin
     finally
       Server.FActiveOverlappedLock.Leave;
     end;
-    Server.FActiveOverlappedLock.Enter;
-    try
-      Server.FActiveOverlapped.Remove(AOverlapped);
-    finally
-      Server.FActiveOverlappedLock.Leave;
-    end;
+    
     Server.FOverlappedPool.Release(AOverlapped);
     AOverlapped := nil;
   except
@@ -1268,6 +1263,12 @@ begin
     if WSAGetLastError <> ERROR_IO_PENDING then
     begin
       closesocket(ClientSocket);
+      FActiveOverlappedLock.Enter;
+      try
+        FActiveOverlapped.Remove(OverlappedEx);
+      finally
+        FActiveOverlappedLock.Leave;
+      end;
       FOverlappedPool.Release(OverlappedEx);
       OverlappedEx := nil;
     end;
@@ -1311,9 +1312,12 @@ begin
   begin
     if WSAGetLastError <> WSA_IO_PENDING then
     begin
-      Logger.Error('Failed to start SSL handshake: ' + IntToStr(WSAGetLastError));
-      closesocket(ClientSocket);
-      FOverlappedPool.Release(OverlappedEx);
+      //Logger.Error('Failed to start SSL handshake: ' + IntToStr(WSAGetLastError));
+      //closesocket(ClientSocket);
+      //FOverlappedPool.Release(OverlappedEx);
+      var LReason := 'Failed to start SSL handshake: ' + IntToStr(WSAGetLastError);
+      Logger.Error(LReason);
+      CleanupConnectionWithReason(Self, OverlappedEx, LReason);
     end;
   end;
 end;
