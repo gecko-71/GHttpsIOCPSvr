@@ -1,7 +1,7 @@
 ﻿{
   MIT License
 
-  Copyright (c) (c) 2025 GECKO-71
+  Copyright (c) (c) 2026 GECKO-71
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -29,6 +29,7 @@ interface
 uses
   System.SysUtils,
   System.Classes,
+  System.SyncObjs,
   System.Generics.Collections,
   Winapi.Windows,
   WinApiAdditions;
@@ -37,6 +38,7 @@ type
   TOverlappedExPool = class
   private
     FPool: TQueue<POverlappedEx>;
+    FAllAllocated: TList<POverlappedEx>;
     FLock: TObject;
     FInitialSize: Integer;
     FTotalCreated: Integer;
@@ -66,6 +68,7 @@ constructor TOverlappedExPool.Create(AInitialSize, AMaxSize: Integer;
 begin
   inherited Create;
   FPool := TQueue<POverlappedEx>.Create;
+  FAllAllocated := TList<POverlappedEx>.Create;
   FLock := TObject.Create;
   FInitialSize := AInitialSize;
   FMaxSize := AMaxSize;
@@ -84,11 +87,36 @@ destructor TOverlappedExPool.Destroy;
 var
   Overlapped: POverlappedEx;
 begin
-  while FPool.Count > 0 do
-  begin
-    Overlapped := FPool.Dequeue;
-    if Assigned(Overlapped) then
-      Dispose(Overlapped);
+  TMonitor.Enter(FLock);
+  try
+    if Assigned(FPool) then
+      FPool.Clear;
+    if Assigned(FAllAllocated) then
+    begin
+      for Overlapped in FAllAllocated do
+      begin
+        if Assigned(Overlapped) then
+        begin
+          try
+            var Req := TObject(InterlockedExchangePointer(Pointer(Overlapped^.Request), nil));
+            if Assigned(Req) then
+              Req.Free;
+          except
+          end;
+          try
+            var Resp := TObject(InterlockedExchangePointer(Pointer(Overlapped^.Response), nil));
+            if Assigned(Resp) then
+              Resp.Free;
+          except
+          end;
+          Dispose(Overlapped);
+        end;
+      end;
+      FAllAllocated.Free;
+      FAllAllocated := nil;
+    end;
+  finally
+    TMonitor.Exit(FLock);
   end;
   FPool.Free;
   FLock.Free;
@@ -103,6 +131,9 @@ begin
   for i := 1 to ACount do
   begin
     New(Overlapped);
+    ZeroMemory(Overlapped, SizeOf(TOverlappedEx));
+    Overlapped^.InPool := 1;
+    FAllAllocated.Add(Overlapped);
     FPool.Enqueue(Overlapped);
     Inc(FTotalCreated);
   end;
@@ -151,30 +182,40 @@ begin
       end;
     end
     else
-    begin
       InterlockedIncrement(FTotalCreated);
-    end;
     if not HasSufficientMemory then
     begin
       InterlockedDecrement(FTotalCreated);
       Exit(nil);
     end;
     New(Result);
+    TMonitor.Enter(FLock);
+    try
+      FAllAllocated.Add(Result);
+    finally
+      TMonitor.Exit(FLock);
+    end;
   end;
   if Assigned(Result) then
+  begin
+    SetLength(Result^.ClientReceiveBuffer, 0);
     ZeroMemory(Result, SizeOf(TOverlappedEx));
+    Result^.InPool := 0;
+  end;
 end;
 
 procedure TOverlappedExPool.Release(AOverlapped: POverlappedEx);
 begin
-  if Assigned(AOverlapped) then
-  begin
-    TMonitor.Enter(FLock);
-    try
-      FPool.Enqueue(AOverlapped);
-    finally
-      TMonitor.Exit(FLock);
-    end;
+  if not Assigned(AOverlapped) then
+    Exit;
+  if InterlockedCompareExchange(AOverlapped^.InPool, 1, 0) <> 0 then
+    Exit;
+
+  TMonitor.Enter(FLock);
+  try
+    FPool.Enqueue(AOverlapped);
+  finally
+    TMonitor.Exit(FLock);
   end;
 end;
 

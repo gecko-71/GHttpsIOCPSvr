@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DEMO 02 — JWT Security & WAF Server</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 32px 16px; }
+    .container { max-width: 860px; margin: 0 auto; }
+    h1 { color: #38bdf8; font-size: 1.9em; margin-bottom: 4px; }
+    .subtitle { color: #64748b; font-size: .95em; margin-bottom: 28px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 22px 24px; margin-bottom: 18px; }
+    .card h2 { font-size: 1em; font-weight: 600; color: #ffffff; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 14px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+    .field { display: flex; flex-direction: column; gap: 5px; flex: 1; min-width: 140px; }
+    label { font-size: .8em; color: #ffffff; }
+    input, select { background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; padding: 8px 12px; font-size: .9em; outline: none; transition: border-color .2s; }
+    input:focus { border-color: #38bdf8; }
+    btn, button { cursor: pointer; border: none; border-radius: 6px; padding: 9px 18px; font-size: .9em; font-weight: 600; transition: opacity .15s, transform .1s; }
+    button:active { transform: scale(.97); }
+    .btn-blue { background: #0369a1; color: #fff; }
+    .btn-purple { background: #7c3aed; color: #fff; }
+    .btn-green { background: #15803d; color: #fff; }
+    .btn-red { background: #b91c1c; color: #fff; }
+    .btn-gray { background: #334155; color: #cbd5e1; }
+    button:hover { opacity: .85; }
+    .token-box { background: #0f172a; border: 1px solid #1d4ed8; border-radius: 6px; padding: 10px 14px; font-family: monospace; font-size: .8em; color: #93c5fd; word-break: break-all; margin-top: 10px; min-height: 38px; }
+    .result { background: #020617; border: 1px solid #1e293b; border-radius: 6px; padding: 14px; font-family: monospace; font-size: .82em; white-space: pre-wrap; word-break: break-all; margin-top: 12px; min-height: 52px; max-height: 280px; overflow-y: auto; color: #94a3b8; }
+    .result.ok { border-color: #15803d; color: #86efac; }
+    .result.err { border-color: #b91c1c; color: #fca5a5; }
+    .result.warn { border-color: #b45309; color: #fcd34d; }
+    .badge { display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: .75em; font-weight: 700; margin-right: 6px; }
+    .badge-post { background: #7c3aed; color: #fff; }
+    .badge-get { background: #0369a1; color: #fff; }
+    .ep-path { font-family: monospace; color: #f1f5f9; font-size: .95em; }
+    .ep-desc { color: #ffffff; font-size: .82em; margin-top: 3px; }
+    .sep { border: none; border-top: 1px solid #1e293b; margin: 14px 0; }
+    .status-dot { width: 9px; height: 9px; border-radius: 50%; background: #64748b; display: inline-block; margin-right: 6px; vertical-align: middle; }
+    .status-dot.green { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+    .status-dot.red { background: #ef4444; }
+    #server-status { font-size: .85em; color: #ffffff; margin-bottom: 22px; }
+    .waf-options { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .waf-btn { background: #1e293b; border: 1px solid #334155; border-radius: 5px; color: #cbd5e1; padding: 5px 12px; font-size: .8em; cursor: pointer; transition: background .15s; }
+    .waf-btn:hover { background: #334155; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>DEMO 02: JWT Security &amp; WAF Server</h1>
+  <div class="subtitle">GHttpsServerIOCP &mdash; Interactive Demo &mdash; Port 8082</div>
+
+  <div id="server-status"><span class="status-dot" id="dot"></span><span id="status-text">Checking server...</span></div>
+
+  <!-- LOGIN -->
+  <div class="card">
+    <h2>1 — Login &amp; Obtain JWT Token</h2>
+    <div class="row">
+      <div class="field">
+        <label>Username</label>
+        <input id="username" value="admin" placeholder="admin / user">
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input id="password" type="password" value="admin123" placeholder="admin123 / user123">
+      </div>
+      <button class="btn-purple" onclick="doLogin()">POST /api/login</button>
+    </div>
+    <div style="font-size:.8em;color:#ffffff;margin-bottom:6px;">Try: <code>admin / admin123</code> or <code>user / user123</code> or wrong credentials</div>
+    <div style="font-size:.8em;color:#ffffff;margin-bottom:2px;">JWT Token:</div>
+    <div class="token-box" id="token-display">— no token yet —</div>
+    <div class="result" id="login-result"></div>
+  </div>
+
+  <!-- PROTECTED ENDPOINTS -->
+  <div class="card">
+    <h2>2 — Test Protected Endpoints</h2>
+    <div style="margin-bottom:12px;">
+      <span class="badge badge-get">GET</span><span class="ep-path">/api/protected/profile</span>
+      <div class="ep-desc">Returns user profile. Requires valid JWT token.</div>
+      <button class="btn-blue" style="margin-top:8px;" onclick="doProtected('/api/protected/profile', 'profile-result')">Request Profile</button>
+      <div class="result" id="profile-result"></div>
+    </div>
+    <hr class="sep">
+    <div>
+      <span class="badge badge-get">GET</span><span class="ep-path">/api/protected/admin</span>
+      <div class="ep-desc">Admin dashboard. Requires JWT token with role=admin.</div>
+      <button class="btn-blue" style="margin-top:8px;" onclick="doProtected('/api/protected/admin', 'admin-result')">Request Admin Panel</button>
+      <div class="result" id="admin-result"></div>
+    </div>
+  </div>
+
+  <!-- WAF TEST -->
+  <div class="card">
+    <h2>3 — WAF &amp; Rate Limiter Test</h2>
+    <div class="ep-desc" style="margin-bottom:10px;">Send a request with a known attack payload — the WAF should return 403 Forbidden.</div>
+    <div class="waf-options">
+      <button class="waf-btn" onclick="setWafPayload('SELECT * FROM users WHERE 1=1')">SQL Injection</button>
+      <button class="waf-btn" onclick="setWafPayload('&lt;script&gt;alert(1)&lt;/script&gt;')">XSS</button>
+      <button class="waf-btn" onclick="setWafPayload('UNION SELECT password FROM admin')">UNION Attack</button>
+      <button class="waf-btn" onclick="setWafPayload('DROP TABLE users')">DROP TABLE</button>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label>Attack payload (injected into request body)</label>
+        <input id="waf-payload" value="SELECT * FROM users WHERE 1=1">
+      </div>
+      <button class="btn-red" onclick="doWafTest()">Fire WAF Test</button>
+    </div>
+    <div class="result" id="waf-result"></div>
+    <hr class="sep">
+    <div class="ep-desc" style="margin-bottom:8px;">Rate limiter: send 15 rapid requests (limit is 10/sec per IP).</div>
+    <button class="btn-gray" onclick="doRateLimit()">Flood Test (15 requests)</button>
+    <div class="result" id="rate-result"></div>
+  </div>
+
+  <!-- STATUS -->
+  <div class="card">
+    <h2>4 — Server Status</h2>
+    <button class="btn-green" onclick="doStatus()">GET /api/status</button>
+    <div class="result" id="status-result"></div>
+  </div>
+</div>
+
+<script>
+  const BASE = '';
+  let jwtToken = '';
+
+  function fmt(obj) { try { return JSON.stringify(JSON.parse(typeof obj === 'string' ? obj : JSON.stringify(obj)), null, 2); } catch { return obj; } }
+
+  function setResult(id, text, cls) {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.className = 'result ' + (cls || '');
+  }
+
+  async function doLogin() {
+    const u = document.getElementById('username').value;
+    const p = document.getElementById('password').value;
+    try {
+      const r = await fetch(BASE + '/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p })
+      });
+      const data = await r.json();
+      const out = `HTTP ${r.status}\n\n${fmt(data)}`;
+      if (r.ok && data.token) {
+        jwtToken = data.token;
+        document.getElementById('token-display').textContent = jwtToken;
+        setResult('login-result', out, 'ok');
+      } else {
+        jwtToken = '';
+        document.getElementById('token-display').textContent = '— login failed —';
+        setResult('login-result', out, 'err');
+      }
+    } catch(e) { setResult('login-result', 'Error: ' + e.message, 'err'); }
+  }
+
+  async function doProtected(path, resultId) {
+    if (!jwtToken) { setResult(resultId, 'No JWT token — please login first.', 'warn'); return; }
+    try {
+      const r = await fetch(BASE + path, { headers: { 'Authorization': 'Bearer ' + jwtToken } });
+      const data = await r.json();
+      setResult(resultId, `HTTP ${r.status}\n\n${fmt(data)}`, r.ok ? 'ok' : 'err');
+    } catch(e) { setResult(resultId, 'Error: ' + e.message, 'err'); }
+  }
+
+  function setWafPayload(p) { document.getElementById('waf-payload').value = p; }
+
+  async function doWafTest() {
+    const payload = document.getElementById('waf-payload').value;
+    try {
+      const r = await fetch(BASE + '/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: payload, password: 'x' })
+      });
+      const data = await r.json();
+      setResult('waf-result', `HTTP ${r.status}\n\n${fmt(data)}`, r.status === 403 ? 'ok' : 'warn');
+    } catch(e) { setResult('waf-result', 'Error: ' + e.message, 'err'); }
+  }
+
+  async function doRateLimit() {
+    setResult('rate-result', 'Sending 15 rapid requests...', '');
+    const results = [];
+    const promises = Array.from({length:15}, (_, i) =>
+      fetch(BASE + '/api/status').then(r => results.push(`Request ${i+1}: HTTP ${r.status}`)).catch(e => results.push(`Request ${i+1}: Error`))
+    );
+    await Promise.all(promises);
+    const blocked = results.filter(r => r.includes('429')).length;
+    setResult('rate-result', results.join('\n') + `\n\n→ Blocked by rate limiter: ${blocked}/15`, blocked > 0 ? 'ok' : 'warn');
+  }
+
+  async function doStatus() {
+    try {
+      const r = await fetch(BASE + '/api/status');
+      const data = await r.json();
+      setResult('status-result', `HTTP ${r.status}\n\n${fmt(data)}`, r.ok ? 'ok' : 'err');
+    } catch(e) { setResult('status-result', 'Error: ' + e.message, 'err'); }
+  }
+
+  async function checkStatus() {
+    try {
+      const r = await fetch(BASE + '/api/status');
+      if (r.ok) {
+        document.getElementById('dot').className = 'status-dot green';
+        document.getElementById('status-text').textContent = 'Server online — https://localhost:8082';
+      } else throw new Error();
+    } catch {
+      document.getElementById('dot').className = 'status-dot red';
+      document.getElementById('status-text').textContent = 'Server offline or unreachable';
+    }
+  }
+  checkStatus();
+</script>
+</body>
+</html>

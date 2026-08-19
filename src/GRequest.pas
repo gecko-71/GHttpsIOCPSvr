@@ -1,7 +1,7 @@
-﻿{
+{
   MIT License
 
-  Copyright (c) (c) 2025 GECKO-71
+  Copyright (c) (c) 2026 GECKO-71
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -55,12 +55,12 @@ type
     class function IsReserved(C: Char): Boolean;
     class function IsGenDelim(C: Char): Boolean;
     class function IsSubDelim(C: Char): Boolean;
-    class function IsValidPath(const Path: string): Boolean;
-    class function IsValidQuery(const Query: string): Boolean;
     class function IsValidFragment(const Fragment: string): Boolean;
     class function DecodePercentEncoding(const Input: string): string;
     class function IsValidPercentEncoded(const Input: string; Pos: Integer): Boolean;
   public
+    class function IsValidPath(const Path: string): Boolean;
+    class function IsValidQuery(const Query: string): Boolean;
     class function ValidateURI(const URI: string; out ErrorMsg: string): Boolean;
     class function ValidateAbsolutePath(const Path: string; out ErrorMsg: string): Boolean;
     class function SanitizeURI(const URI: string): string;
@@ -78,7 +78,7 @@ type
     class function DetectInjectionAttempt(const Value: string): Boolean;
   public
     class function ValidateHeaderName(const Name: string; out ErrorMsg: string): Boolean;
-    class function ValidateHeaderValue(const Value: string; out ErrorMsg: string): Boolean;
+    class function ValidateHeaderValue(const AHeaderName, Value: string; out ErrorMsg: string): Boolean;
     class function SanitizeHeaderValue(const Value: string): string;
     class function IsSafeHeaderName(const Name: string): Boolean;
     class function DetectRequestSmuggling(const Headers: TStringList): TSecurityThreat;
@@ -119,7 +119,7 @@ type
 
   THttpHeaders = class
   private
-    FHeaders: TDictionary<string, TStringList>;
+    FHeaders: TObjectDictionary<string, TStringList>;
     FValidationLevel: TValidationLevel;
     FContentEncodingHandler: TContentEncodingHandler;
     function NormalizeHeaderName(const HeaderName: string): string;
@@ -164,7 +164,7 @@ type
     property Referer: string read GetReferer;
     property TransferEncoding: string read GetTransferEncoding;
     property Connection: string read GetConnection;
-    property Headers:TDictionary<string, TStringList> read FHeaders;
+    property Headers: TObjectDictionary<string, TStringList> read FHeaders;
   end;
 
   THttpRequestInfo = class
@@ -277,11 +277,6 @@ type
     procedure ProcessBodyData(const Data: array of Byte; Size: Integer);
     procedure ProcessChunkedBody(const Data: array of Byte; Size: Integer);
     procedure ProcessRegularBody(const Data: array of Byte; Size: Integer);
-    function ValidateRequest: Boolean;
-    function DetectRequestSmuggling: Boolean;
-    function ValidateHeaderSecurity: Boolean;
-    function CheckContentLengthConsistency: Boolean;
-    function DetectMaliciousPatterns: Boolean;
     procedure AnalyzeSecurity;
     procedure ApplySecurityMeasures;
     function AttemptRecovery(const Error: string; const Context: string): Boolean;
@@ -362,6 +357,7 @@ type
     function IsBodyComplete: Boolean;
     function HasError: Boolean;
     function CanAcceptMoreData: Boolean;
+    function IsKeepAlive: Boolean;
     function IsSecure: Boolean;
     function IsRecoverable: Boolean;
   end;
@@ -434,7 +430,12 @@ begin
   for I := 1 to Length(Authority) do
   begin
     C := Authority[I];
-    if not (IsUnreserved(C) or IsSubDelim(C) or (C = ':') or (C = '@') or (C = '[') or (C = ']')) then
+    if not (IsUnreserved(C) or
+            IsSubDelim(C) or
+            (C = ':') or
+            (C = '@') or
+            (C = '[') or
+            (C = ']')) then
     begin
       if (C = '%') and (I <= Length(Authority) - 2) then
       begin
@@ -457,18 +458,27 @@ class function TUriValidator.IsValidPath(const Path: string): Boolean;
 var
   I: Integer;
   C: Char;
+  DecodedPath: string;
 begin
   Result := True;
   if Length(Path) = 0 then
   begin
     Exit(True);
   end;
+  DecodedPath := TNetEncoding.URL.Decode(Path);
+  if (Pos('..', DecodedPath) > 0) or THeaderValidator.HasSuspiciousPatterns(DecodedPath) then
+    Exit(False);
+
   try
     I := 1;
     while I <= Length(Path) do
     begin
       C := Path[I];
-      if IsUnreserved(C) or IsSubDelim(C) or (C = ':') or (C = '@') or (C = '/') then
+      if IsUnreserved(C) or
+         IsSubDelim(C) or
+         (C = ':') or
+         (C = '@') or
+         (C = '/') then
       begin
         Inc(I);
         Continue;
@@ -502,12 +512,26 @@ class function TUriValidator.IsValidQuery(const Query: string): Boolean;
 var
   I: Integer;
   C: Char;
+  DecodedQuery: string;
 begin
   Result := True;
+  if Length(Query) > 1000 then
+    Exit(False);
+
+  DecodedQuery := TNetEncoding.URL.Decode(Query);
+  if (Pos('..', DecodedQuery) > 0) or
+      THeaderValidator.HasSuspiciousPatterns(DecodedQuery) then
+    Exit(False);
+
   for I := 1 to Length(Query) do
   begin
     C := Query[I];
-    if not (IsUnreserved(C) or IsSubDelim(C) or (C = ':') or (C = '@') or (C = '/') or (C = '?')) then
+    if not (IsUnreserved(C) or
+            IsSubDelim(C) or
+            (C = ':') or
+            (C = '@') or
+            (C = '/') or
+            (C = '?')) then
     begin
       if (C = '%') and (I <= Length(Query) - 2) then
       begin
@@ -516,11 +540,6 @@ begin
           Result := False;
           Exit;
         end;
-      end
-      else
-      begin
-        Result := False;
-        Exit;
       end;
     end;
   end;
@@ -535,7 +554,12 @@ begin
   for I := 1 to Length(Fragment) do
   begin
     C := Fragment[I];
-    if not (IsUnreserved(C) or IsSubDelim(C) or (C = ':') or (C = '@') or (C = '/') or (C = '?')) then
+    if not (IsUnreserved(C) or
+            IsSubDelim(C) or
+            (C = ':') or
+            (C = '@') or
+            (C = '/') or
+            (C = '?')) then
     begin
       if (C = '%') and (I <= Length(Fragment) - 2) then
       begin
@@ -803,8 +827,10 @@ begin
     Host := LowerCase(Host);
     if ((Scheme = 'http') and (Port = '80')) or ((Scheme = 'https') and (Port = '443')) then Port := '';
     Authority := Host;
-    if Port <> '' then Authority := Authority + ':' + Port;
-    if AtPos > 0 then Authority := Copy(URI, 1, AtPos) + Authority;
+    if Port <> '' then
+       Authority := Authority + ':' + Port;
+    if AtPos > 0 then
+       Authority := Copy(URI, 1, AtPos) + Authority;
   end;
 
   if Path <> '' then
@@ -833,7 +859,8 @@ begin
       NormalizedSegments.Free;
     end;
   end;
-  if Path = '' then Path := '/';
+  if Path = '' then
+     Path := '/';
   Result := '';
   if Scheme <> '' then
     Result := Scheme + '://' + Authority;
@@ -878,10 +905,17 @@ begin
       end;
     end;
   end;
+
   SuspiciousPatterns := [
-    'javascript:', 'data:', 'vbscript:', '<script', '</script>',
+    'javascript:', 'data:', 'vbscript:', '<script', '</script>', '<svg', '<iframe',
     'onload=', 'onerror=', 'onclick=', 'onmouseover=',
-    'x-injected-header', 'x-forwarded-host', 'x-original-host'
+    'x-injected-header', 'x-forwarded-host', 'x-original-host',
+    '../..', '..%2f', '%252e%252e', '%c0%af', '%c0', '%e0%80%af', '%f0%80%80%af',
+    '/etc/passwd', 'win.ini', '\\192.168.',
+    'cat /etc', 'cat /', 'cat$ifs', '*(|', '%s%s%s', '%n%n%n%n', #13#10, '\r\n',
+    '${jndi:', '169.254.169.254', '0x7f000001', '127.0.0.1:22',
+    '{{', '${', 'powershell', '&&', '||', '$(', '`',
+    '''$gt''', '''$ne''', '''$where''', 'this.password'
   ];
   for Pattern in SuspiciousPatterns do
   begin
@@ -891,16 +925,24 @@ begin
       Exit;
     end;
   end;
+
   SQLPatterns := [
-    'union', 'select', 'insert', 'delete', 'update', 'drop',
-    'or 1=1', 'or ''1''=''1''', '; drop',
-    'exec', 'execute', 'sp_', 'xp_'
+    'union', 'select', 'insert', 'delete', 'update', 'drop', 'alter', 'truncate', 'create',
+    'or 1=1', 'or ''1''=''1''', 'or ''1''=''1', 'or ''1'' = ''1''', 'or ''a''=''a',
+    'and 1=1', 'and 1=2', '1''=''1', '1=1--', ''' or ''=''',
+    'waitfor', 'waitfor delay', 'sleep(', 'pg_sleep(', 'benchmark(', 'dbms_pipe.receive_message',
+    'exec', 'execute', 'sp_', 'xp_', 'sp_executesql', 'xp_cmdshell', '; shutdown', '; drop',
+    'information_schema', 'sys.tables', 'sys.objects', 'sys.user_tables', 'all_tables',
+    'extractvalue(', 'updatexml(', 'utl_inaddr.', 'ctxsys.driths.',
+    '/*', '*/', '/*!', '1;--', 'admin''--', 'admin''#', 'admin''/*'
   ];
   for Pattern in SQLPatterns do
   begin
     if Pos(Pattern, LowerValue) > 0 then
     begin
       if (Pattern = 'select') and (Pos('user-agent', LowerValue) > 0) then
+        Continue;
+      if ((Pattern = '/*') or (Pattern = '*/')) and (Pos('*/*', LowerValue) > 0) then
         Continue;
       Result := True;
       Exit;
@@ -1077,15 +1119,32 @@ begin
   HasContentLength := False;
   ContentLengthValues := TStringList.Create;
   try
+    var HostCount := 0;
     for I := 0 to Headers.Count - 1 do
     begin
       Line := Headers[I];
       ColonPos := Pos(':', Line);
       if ColonPos > 0 then
       begin
+        if (ColonPos > 1) and (Line[ColonPos - 1] = ' ') then
+        begin
+          Result := stRequestSmuggling;
+          Exit;
+        end;
+
         Name := LowerCase(Trim(Copy(Line, 1, ColonPos - 1)));
         Value := Trim(Copy(Line, ColonPos + 1, Length(Line)));
-        if Name = 'content-length' then
+
+        if Name = 'host' then
+        begin
+          Inc(HostCount);
+          if HostCount > 1 then
+          begin
+            Result := stRequestSmuggling;
+            Exit;
+          end;
+        end
+        else if Name = 'content-length' then
         begin
           Inc(ContentLengthCount);
           ContentLengthValues.Add(Value);
@@ -1094,21 +1153,23 @@ begin
         else if Name = 'transfer-encoding' then
         begin
           Inc(TransferEncodingCount);
-          if Pos('chunked', LowerCase(Value)) > 0 then
+          var LowerVal := LowerCase(Value);
+          if Pos('chunked', LowerVal) > 0 then
             HasChunked := True;
+
+          if (Pos(',', LowerVal) > 0) and (Pos('chunked', LowerVal) > 0) then
+          begin
+            Result := stRequestSmuggling;
+            Exit;
+          end;
         end;
       end;
     end;
+
     if ContentLengthCount > 1 then
     begin
-      for I := 1 to ContentLengthValues.Count - 1 do
-      begin
-        if ContentLengthValues[I] <> ContentLengthValues[0] then
-        begin
-          Result := stRequestSmuggling;
-          Exit;
-        end;
-      end;
+      Result := stRequestSmuggling;
+      Exit;
     end;
     if HasContentLength and HasChunked then
     begin
@@ -1141,12 +1202,18 @@ var
   LowerEncoding: string;
 begin
   LowerEncoding := LowerCase(Trim(EncodingStr));
-  if LowerEncoding = 'gzip' then Result := ceGzip
-  else if LowerEncoding = 'deflate' then Result := ceDeflate
-  else if LowerEncoding = 'compress' then Result := ceCompress
-  else if LowerEncoding = 'br' then Result := ceBrotli
-  else if LowerEncoding = 'identity' then Result := ceIdentity
-  else Result := ceNone;
+  if LowerEncoding = 'gzip' then
+    Result := ceGzip
+  else if LowerEncoding = 'deflate' then
+    Result := ceDeflate
+  else if LowerEncoding = 'compress' then
+    Result := ceCompress
+  else if LowerEncoding = 'br' then
+    Result := ceBrotli
+  else if LowerEncoding = 'identity' then
+    Result := ceIdentity
+  else
+    Result := ceNone;
 end;
 
 function TContentEncodingHandler.ParseContentEncoding(const EncodingHeader: string): TArray<TContentEncoding>;
@@ -1345,7 +1412,8 @@ begin
     FErrorLog.Add(LogEntry);
     FRecoveryActions.Add(Action);
   except
-
+    on E: Exception do
+      Logger.Warn('Failed to log recovery attempt: ' + E.Message);
   end;
 end;
 
@@ -1361,31 +1429,31 @@ end;
 procedure TRequestRecovery.Clear;
 begin
   try
-    FRecoveryActions.Clear;
-    FErrorLog.Clear;
+    if Assigned(FRecoveryActions) then
+      FRecoveryActions.Clear;
+    if Assigned(FErrorLog) then
+      FErrorLog.Clear;
     FRecoveryAttempts := 0;
   except
-
+    on E: Exception do
+      Logger.Warn('Failed to clear request recovery: ' + E.Message);
   end;
 end;
 
 constructor THttpHeaders.Create(ValidationLevel: TValidationLevel);
 begin
   inherited Create;
-  FHeaders := TDictionary<string, TStringList>.Create;
+
+  FHeaders := TObjectDictionary<string, TStringList>.Create([doOwnsValues]);
   FValidationLevel := ValidationLevel;
   FContentEncodingHandler := TContentEncodingHandler.Create;
 end;
 
 destructor THttpHeaders.Destroy;
-var
-  HeaderValues: TStringList;
 begin
   try
-    for HeaderValues in FHeaders.Values do
-        HeaderValues.Free;
-    FHeaders.Free;
-    FContentEncodingHandler.Free;
+    FreeAndNil(FHeaders);
+    FreeAndNil(FContentEncodingHandler);
   finally
     inherited Destroy;
   end;
@@ -1396,7 +1464,8 @@ begin
   Result := LowerCase(Trim(HeaderName));
 end;
 
-function THttpHeaders.ParseFoldedHeader(const Lines: TStringList; StartIndex: Integer; out EndIndex: Integer): string;
+function THttpHeaders.ParseFoldedHeader(const Lines: TStringList; StartIndex: Integer;
+                                        out EndIndex: Integer): string;
 var
   I: Integer;
   Line: string;
@@ -1505,11 +1574,9 @@ begin
         vlStrict:
           raise Exception.Create('Invalid header name: ' + ErrorMsg);
         vlModerate:
-          begin
             raise Exception.Create('Invalid header name rejected: ' + ErrorMsg);
-          end;
         vlPermissive:
-          ;
+          Logger.Info('  -> Permissive: Accepting invalid header name: ' + Name + ' (' + ErrorMsg + ')');
       end;
     end;
     if IsKnownSafeHeader then
@@ -1535,6 +1602,11 @@ begin
           Exit;
         end;
       end
+      else if SameText(Name, 'Authorization') then
+      begin
+        AddHeader(Name, Value);
+        Exit;
+      end
       else
       begin
         if not THeaderValidator.HasSuspiciousPatterns(Value) then
@@ -1545,7 +1617,7 @@ begin
       end;
     end;
 
-    if THeaderValidator.HasSuspiciousPatterns(Value) then
+    if not SameText(Name, 'Authorization') and THeaderValidator.HasSuspiciousPatterns(Value) then
     begin
       case FValidationLevel of
         vlStrict:
@@ -1574,7 +1646,7 @@ begin
       end;
     end;
     SanitizedValue := ProcessInternationalHeader(Value);
-    if not THeaderValidator.ValidateHeaderValue(SanitizedValue, ErrorMsg) then
+    if not THeaderValidator.ValidateHeaderValue(Name, SanitizedValue, ErrorMsg) then
     begin
       case FValidationLevel of
         vlStrict:
@@ -1584,7 +1656,7 @@ begin
             SanitizedValue := THeaderValidator.SanitizeHeaderValue(SanitizedValue);
           end;
         vlPermissive:
-          ;
+          Logger.Info('  -> Permissive: Accepting invalid header value for: ' + Name + ' (' + ErrorMsg + ')');
       end;
     end;
     AddHeader(Name, SanitizedValue);
@@ -1669,9 +1741,7 @@ begin
     begin
       SetLength(Result, HeaderValues.Count);
       for I := 0 to HeaderValues.Count - 1 do
-      begin
         Result[I] := HeaderValues[I];
-      end;
     end;
   except
     SetLength(Result, 0);
@@ -1722,18 +1792,14 @@ begin
 end;
 
 procedure THttpHeaders.Clear;
-var
-  HeaderValues: TStringList;
 begin
   try
-    for HeaderValues in FHeaders.Values do
-      HeaderValues.Free;
-    FHeaders.Clear;
+    if Assigned(FHeaders) then
+      FHeaders.Clear;
   except
 
   end;
 end;
-
 
 function THttpHeaders.GetHeaderNames: TArray<string>;
 begin
@@ -1953,16 +2019,26 @@ var
 begin
   try
     UpperMethod := UpperCase(Trim(MethodStr));
-    if UpperMethod = 'GET' then Result := hmGET
-    else if UpperMethod = 'POST' then Result := hmPOST
-    else if UpperMethod = 'PUT' then Result := hmPUT
-    else if UpperMethod = 'DELETE' then Result := hmDELETE
-    else if UpperMethod = 'HEAD' then Result := hmHEAD
-    else if UpperMethod = 'OPTIONS' then Result := hmOPTIONS
-    else if UpperMethod = 'PATCH' then Result := hmPATCH
-    else if UpperMethod = 'TRACE' then Result := hmTRACE
-    else if UpperMethod = 'CONNECT' then Result := hmCONNECT
-    else Result := hmUnknown;
+    if UpperMethod = 'GET' then
+      Result := hmGET
+    else if UpperMethod = 'POST' then
+      Result := hmPOST
+    else if UpperMethod = 'PUT' then
+      Result := hmPUT
+    else if UpperMethod = 'DELETE' then
+      Result := hmDELETE
+    else if UpperMethod = 'HEAD' then
+      Result := hmHEAD
+    else if UpperMethod = 'OPTIONS' then
+      Result := hmOPTIONS
+    else if UpperMethod = 'PATCH' then
+      Result := hmPATCH
+    else if UpperMethod = 'TRACE' then
+      Result := hmTRACE
+    else if UpperMethod = 'CONNECT' then
+      Result := hmCONNECT
+    else
+      Result := hmUnknown;
   except
     Result := hmUnknown;
   end;
@@ -1974,10 +2050,14 @@ var
 begin
   try
     UpperVersion := UpperCase(Trim(VersionStr));
-    if UpperVersion = 'HTTP/1.0' then Result := hvHTTP10
-    else if UpperVersion = 'HTTP/1.1' then Result := hvHTTP11
-    else if UpperVersion = 'HTTP/2.0' then Result := hvHTTP20
-    else if UpperVersion = 'HTTP/2' then Result := hvHTTP20
+    if UpperVersion = 'HTTP/1.0' then
+      Result := hvHTTP10
+    else if UpperVersion = 'HTTP/1.1' then
+      Result := hvHTTP11
+    else if UpperVersion = 'HTTP/2.0' then
+      Result := hvHTTP20
+    else if UpperVersion = 'HTTP/2' then
+      Result := hvHTTP20
     else Result := hvUnknown;
   except
     Result := hvUnknown;
@@ -1990,12 +2070,18 @@ var
 begin
   try
     LowerEncoding := LowerCase(Trim(EncodingStr));
-    if LowerEncoding = 'chunked' then Result := teChunked
-    else if LowerEncoding = 'compress' then Result := teCompress
-    else if LowerEncoding = 'deflate' then Result := teDeflate
-    else if LowerEncoding = 'gzip' then Result := teGzip
-    else if LowerEncoding = 'identity' then Result := teIdentity
-    else Result := teNone;
+    if LowerEncoding = 'chunked' then
+      Result := teChunked
+    else if LowerEncoding = 'compress' then
+      Result := teCompress
+    else if LowerEncoding = 'deflate' then
+      Result := teDeflate
+    else if LowerEncoding = 'gzip' then
+      Result := teGzip
+    else if LowerEncoding = 'identity' then
+      Result := teIdentity
+    else
+      Result := teNone;
   except
     Result := teNone;
   end;
@@ -2007,9 +2093,12 @@ var
 begin
   try
     LowerConnection := LowerCase(Trim(ConnectionStr));
-    if LowerConnection = 'close' then Result := ctClose
-    else if LowerConnection = 'upgrade' then Result := ctUpgrade
-    else Result := ctKeepAlive;
+    if LowerConnection = 'close' then
+      Result := ctClose
+    else if LowerConnection = 'upgrade' then
+      Result := ctUpgrade
+    else
+      Result := ctKeepAlive;
   except
     Result := ctKeepAlive;
   end;
@@ -2042,13 +2131,12 @@ begin
     end
     else
     begin
-       Key := TNetEncoding.URL.Decode(Copy(AQueryString, StartIndex, PairEndIndex - StartIndex));
+      Key := TNetEncoding.URL.Decode(Copy(AQueryString, StartIndex, PairEndIndex - StartIndex));
       Value := '';
     end;
     if Key <> '' then
-    begin
       ADictionary.Add(Key, Value);
-    end;
+
     StartIndex := PairEndIndex + 1;
   end;
 end;
@@ -2710,54 +2798,6 @@ begin
   Result := FEnableRecovery and Assigned(FRecovery) and (FRecovery.RecoveryAttempts < FRecovery.MaxRecoveryAttempts);
 end;
 
-function TRequest.ValidateRequest: Boolean;
-begin
-  Result := True;
-  try
-
-  except
-    Result := False;
-  end;
-end;
-
-function TRequest.DetectRequestSmuggling: Boolean;
-begin
-  try
-    Result := THeaderValidator.DetectRequestSmuggling(TStringList.Create) = stRequestSmuggling;
-  except
-    Result := False;
-  end;
-end;
-
-function TRequest.ValidateHeaderSecurity: Boolean;
-begin
-  Result := True;
-  try
-  except
-    Result := False;
-  end;
-end;
-
-function TRequest.CheckContentLengthConsistency: Boolean;
-begin
-  Result := True;
-  try
-
-  except
-    Result := False;
-  end;
-end;
-
-function TRequest.DetectMaliciousPatterns: Boolean;
-begin
-  Result := False;
-  try
-
-  except
-    Result := True;
-  end;
-end;
-
 procedure TRequest.AnalyzeSecurity;
 const
   SafeHeaders: array[0..8] of string =
@@ -2771,6 +2811,15 @@ var
   I: Integer;
 begin
   SetLength(FSecurityThreats, 0);
+
+  if Length(FHeaders.GetHeaderNames) > FMaxHeaderCount then
+  begin
+    if not HasExistingThreat(stOversizeAttack) then
+      FSecurityThreats := FSecurityThreats + [stOversizeAttack];
+    if FErrorMessage = '' then
+      FErrorMessage := Format('Too many headers: %d exceeds maximum of %d', [Length(FHeaders.GetHeaderNames), FMaxHeaderCount]);
+  end;
+
   AllHeaders := TStringList.Create;
   try
     for HeaderName in FHeaders.GetHeaderNames do
@@ -2803,7 +2852,7 @@ begin
          FSecurityThreats := FSecurityThreats + [stSuspiciousHeaders];
     end;
 
-    if THeaderValidator.HasSuspiciousPatterns(Value) then
+    if not SameText(HeaderName, 'Authorization') and THeaderValidator.HasSuspiciousPatterns(Value) then
     begin
         if not ((LowerCase(HeaderName) = 'content-type') and (Pos('boundary=', LowerCase(Value)) > 0)) then
         begin
@@ -3124,11 +3173,11 @@ function TRequest.GetBodyString: string;
 var
   SavedPosition: Int64;
   BodyBytes: TBytes;
-  LastBytes: TBytes;
-  LastString: string;
 begin
   try
-    if Assigned(FBodyStream) and (FBodyStream.Size > 0) then
+    if Assigned(FBodyParser) then
+      Result := FBodyParser.GetMainPartAsString
+    else if Assigned(FBodyStream) and (FBodyStream.Size > 0) then
     begin
       SavedPosition := FBodyStream.Position;
       try
@@ -3152,7 +3201,9 @@ var
   SavedPosition: Int64;
 begin
   try
-    if Assigned(FBodyStream) and (FBodyStream.Size > 0) then
+    if Assigned(FBodyParser) then
+      Result := FBodyParser.GetMainPartAsBytes
+    else if Assigned(FBodyStream) and (FBodyStream.Size > 0) then
     begin
       SavedPosition := FBodyStream.Position;
       try
@@ -3205,8 +3256,10 @@ begin
     FHeadersEndPos := FindHeadersEnd(FRawBuffer, FRawBufferSize);
     if FHeadersEndPos = -1 then
     begin
-      if FRawBufferSize >= FMaxHeaderSize then SetError('Headers block size limit exceeded.', stOversizeAttack)
-      else FState := rsWaitingHeaders;
+      if FRawBufferSize >= FMaxHeaderSize then
+        SetError('Headers block size limit exceeded.', stOversizeAttack)
+      else
+        FState := rsWaitingHeaders;
       Exit;
     end;
     var HeadersBlockSize := FHeadersEndPos - 4;
@@ -3288,7 +3341,7 @@ begin
   end;
 end;
 
-class function THeaderValidator.ValidateHeaderValue(const Value: string; out ErrorMsg: string): Boolean;
+class function THeaderValidator.ValidateHeaderValue(const AHeaderName, Value: string; out ErrorMsg: string): Boolean;
 var
   I: Integer;
   C: Char;
@@ -3304,7 +3357,8 @@ begin
     ErrorMsg := 'Invalid character (NULL) found in header value.';
     Exit(False);
   end;
-  if HasSuspiciousPatterns(Value) then
+
+  if not SameText(AHeaderName, 'Authorization') and HasSuspiciousPatterns(Value) then
   begin
     ErrorMsg := 'Suspicious patterns (potential XSS, SQLi) detected in header value.';
     Exit(False);
@@ -3459,7 +3513,7 @@ begin
         end;
       end;
     end
-    else if FRequestInfo.HasBody then
+    else if FRequestInfo.HasBody and (FRequestInfo.ContentLength > 0) then
     begin
       FExpectedBodySize := -1;
       FState := rsWaitingBody;
@@ -3485,6 +3539,7 @@ begin
       FExpectedBodySize := 0;
       FState := rsComplete;
     end;
+
   except
     on E: Exception do
       SetError(Format('Body size determination error: %s', [E.Message]));
@@ -3811,9 +3866,7 @@ begin
               I := ChunkHeaderEnd + 2;
             end
             else
-            begin
               Break;
-            end;
           end;
         1:
           begin
@@ -3887,9 +3940,7 @@ begin
   Result := False;
   try
     if FRawBufferSize = 0 then
-    begin
       Exit;
-    end;
     HeadersStr := TEncoding.UTF8.GetString(FRawBuffer, 0, FRawBufferSize);
     if (Pos('HTTP/1.', HeadersStr) = 0) then
     begin
@@ -3897,17 +3948,13 @@ begin
       Exit;
     end;
     if Pos(DOUBLE_CRLF, HeadersStr) > 0 then
-    begin
       Exit;
-    end;
     Lines := TStringList.Create;
     try
       Lines.Text := StringReplace(HeadersStr, CRLF, sLineBreak, [rfReplaceAll]);
       LineCount := Lines.Count;
       if LineCount < 2 then
-      begin
         Exit;
-      end;
       if (Pos('GET ', Lines[0]) = 0) and (Pos('POST ', Lines[0]) = 0) and
          (Pos('PUT ', Lines[0]) = 0) and (Pos('HEAD ', Lines[0]) = 0) then
       begin
@@ -3923,13 +3970,9 @@ begin
       LastLine := Lines[LineCount - 1];
       HasIncompleteHeader := False;
       if (Pos(':', LastLine) > 0) and (Trim(Copy(LastLine, Pos(':', LastLine) + 1, Length(LastLine))) = '') then
-      begin
         HasIncompleteHeader := True;
-      end;
       if (Pos(':', LastLine) = 0) and (LastLine <> '') and not LastLine.StartsWith('HTTP/') then
-      begin
         HasIncompleteHeader := True;
-      end;
       if (HeaderCount >= 2) and HasIncompleteHeader then
       begin
         Logger.Warn('DETECTED: Slowloris Attack - incomplete headers!');
@@ -3937,10 +3980,6 @@ begin
         Logger.Warn(' - HasIncompleteHeader: %s', [BoolToStr(HasIncompleteHeader, True)]);
         Logger.Warn(' - Last line: "%s"', [LastLine]);
         Result := True;
-      end
-      else
-      begin
-
       end;
     finally
       Lines.Free;
@@ -3982,24 +4021,44 @@ begin
         Logger.Error('DEBUG: Too few lines');
         Exit;
       end;
-      if (Pos('GET ', Lines[0]) = 0) and (Pos('POST ', Lines[0]) = 0) and
-         (Pos('PUT ', Lines[0]) = 0) and (Pos('HEAD ', Lines[0]) = 0) then
+      var RequestLine := Lines[0];
+      if (Pos('get ', RequestLine) = 1) or (Pos('post ', RequestLine) = 1) or
+         (Pos('HTTP/2.0', RequestLine) > 0) then
       begin
-        Logger.Warn('DEBUG: No valid request line');
+        Logger.Warn('RFC 9112 Violation in Request Line: %s', [RequestLine]);
+        Result := True;
         Exit;
       end;
+
       HeaderCount := 0;
       SuspiciousHeaderCount := 0;
       HasSlowlorisPatterns := False;
       for I := 1 to LineCount - 1 do
       begin
         var Line := Lines[I];
+        if (Length(Line) > 0) and ((Line[1] = ' ') or (Line[1] = #9)) then
+        begin
+          Logger.Warn('RFC 7230 Obsolete Line Folding detected: %s', [Line]);
+          Result := True;
+          Exit;
+        end;
+
+        var ColonPos := Pos(':', Line);
+        if ColonPos > 1 then
+        begin
+          if Line[ColonPos - 1] = ' ' then
+          begin
+            Logger.Warn('RFC 9112 Space before colon detected: %s', [Line]);
+            Result := True;
+            Exit;
+          end;
+        end;
+
         if (Trim(Line) <> '') and (Pos(':', Line) > 0) then
         begin
           Inc(HeaderCount);
           if (Pos('X-Slowloris', Line) > 0) or
              (Pos('X-a:', Line) > 0) or
-             (Pos('X-Real-IP:', Line) > 0) or
              (LowerCase(Line).Contains('slowloris')) then
           begin
             Logger.Warn('Slowloris pattern FOUND: %s', [Line]);
@@ -4014,9 +4073,6 @@ begin
         Logger.Warn(' - HeaderCount: %d', [HeaderCount]);
         Logger.Warn(' - SuspiciousHeaderCount: %d', [SuspiciousHeaderCount]);
         Result := True;
-      end
-      else
-      begin
       end;
     finally
       Lines.Free;
@@ -4041,6 +4097,23 @@ var
 begin
   UpperValue := UpperCase(Value);
   Result := TEqualityComparer<string>.Default.GetHashCode(UpperValue);
+end;
+
+function TRequest.IsKeepAlive: Boolean;
+var
+  Conn: string;
+begin
+  Result := True;
+  if Assigned(FHeaders) then
+  begin
+    Conn := LowerCase(Trim(FHeaders.Connection));
+    if Conn = 'close' then
+      Result := False
+    else if Conn = 'keep-alive' then
+      Result := True
+    else if Assigned(FRequestInfo) and (FRequestInfo.Version = hvHTTP10) then
+      Result := False;
+  end;
 end;
 
 end.

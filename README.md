@@ -1,129 +1,160 @@
-# GHttpsServerIOCP - A HTTPS Server in Delphi
+# GHttpsServerIOCP - A Multi-Protocol HTTP, HTTPS, WebSocket & HTTP/3 Server in Delphi
 
-This HTTPS server built in Delphi using asynchronous and multithreaded methods. The server utilizes I/O Completion Ports (IOCP) and the native Windows TLS/SSL stack (SChannel), ensuring high performance, scalability, and security.
+This server is built in Delphi using asynchronous and multithreaded methods. The server utilizes I/O Completion Ports (IOCP), the native Windows TLS/SSL stack (SChannel), Microsoft MsQuic, and RFC 6455 WebSockets, ensuring high performance, scalability, and security.
 
-It can be used to build efficient REST APIs, web services, and other applications that handle many simultaneous HTTPS connections..
+It can be used to build efficient REST APIs, web services, real-time WebSocket applications, and modern systems that handle many simultaneous HTTP, HTTPS, and HTTP/3 connections.
+
+---
 
 ## Key Features
 
-*   **High Performance and Scalability:** Built on I/O Completion Ports (IOCP), allowing for the efficient handling of thousands of concurrent connections using a small pool of worker threads.
-*   **Native Windows SSL/TLS:** Uses SChannel, eliminating the need for external libraries like OpenSSL. It supports modern protocols (TLS 1.2, TLS 1.3) and ciphers.
-*   **Security:**
-    *   Integrated **JWT (JSON Web Token)** manager for endpoint authorization (Bearer Token).
-    *   Advanced request parsing with built-in validation mechanisms to protect against attacks.
-*   **Modern API:**
-    *   Support for large file uploads (`multipart/form-data`).
-    *   Streaming of large file downloads.
-    *   A simple routing system for registering endpoints.
-*   **Resource Management:**
-    *   A built-in monitor thread that protects the server from overload (CPU, memory, requests per second).
-    *   A pool of `OverlappedEx` objects to minimize memory allocation.
-    *   Utilizes the **FastMM5** memory manager.
-*   **Logging:** Integrated logging system based on `Quick.Logger` with output to the console and files.
+*   **Hybrid Multi-Protocol Architecture:**
+    *   **HTTP/1.1 (TCP):** Ultra-fast plaintext HTTP engine with zero-cost SChannel bypass.
+    *   **HTTPS (TLS 1.3 / 1.2):** Secure SChannel SSPI integration with ALPN negotiation, zero OpenSSL dependencies, and native Windows CNG certificate store integration.
+    *   **WebSocket (`ws://` and `wss://`):** Fully asynchronous RFC 6455 implementation with framing, ping/pong heartbeats, fragmentation support, and custom route handlers.
+    *   **HTTP/3 over QUIC (UDP):** Next-gen HTTP/3 engine powered by Microsoft `msquic.dll` and QPACK header compression. Seamless `Alt-Svc` header advertisement for automatic browser upgrades.
+*   **Flexible Protocol Operating Modes:**
+    *   **Dual-Stack Mode (`-mode:dual`):** Simultaneous listening on plaintext HTTP (default: `8080`) and encrypted HTTPS (default: `8443`) within a unified IOCP completion engine. Supports optional automatic `301 Moved Permanently` redirects (`-redirect`).
+    *   **HTTP-Only Mode (`-mode:http`):** Operates without any SSL/TLS certificates or SChannel overhead. Ideal for internal microservices, proxies, or reverse-proxy backends.
+    *   **HTTPS-Only Mode (`-mode:https`):** Purely encrypted TLS 1.3/1.2 SChannel on port `8443` + HTTP/3 (UDP `8443`). Plaintext HTTP requests are rejected with `400 Bad Request`.
+*   **Persistent Connections (Keep-Alive):**
+    *   Full HTTP/1.1 Keep-Alive pipelining with zero-allocation buffer reuse.
+    *   Configurable idle-timeout sweeper in a dedicated monitor thread.
+*   **Enterprise Security & Web Application Firewall (WAF):**
+    *   Built-in **JWT (JSON Web Token)** Manager with HMAC-SHA256 verification for Bearer-token protected routes (`atJWTBearer`).
+    *   Zero-day request sanitization: Protection against path traversal (`..`), HTTP Request Smuggling, header injection, and malformed chunk framing.
+*   **Advanced Content & Streaming:**
+    *   High-speed file streaming via IOCP chunking (`otWriteChunk`) for multi-gigabyte downloads.
+    *   Asynchronous multipart form data uploads (`multipart/form-data`) with disk streaming.
 
-## Requirements
+---
 
-*   **Delphi:** Version 10.4 Sydney or newer.
-*   **Operating System:** Windows.
-*   **Dependencies:**
-    *   [QuickLogger](https://github.com/exilon/QuickLogger)
-    *   [FastMM5](https://github.com/pleriche/FastMM5)
+## Requirements & Dependencies
 
-## Getting Started: How to Run
+*   **Architecture:** 64-bit only.
+*   **Delphi:** Version 10.4 Sydney, 11 Alexandria, 12 Athens (or newer) - 64-bit Windows compiler.
+*   **Operating System:** 64-bit Windows 10 / 11, Windows Server 2019 / 2022.
+*   **Delphi Libraries (Included in repository / Add to Library Path):**
+    *   [FastMM5](https://github.com/pleriche/FastMM5) - High-performance memory manager.
+    *   [QuickLib](https://github.com/exilon/QuickLib) (`./QuickLib`) - Core utilities, threading helpers, collections, and base types.
+    *   [QuickLogger](https://github.com/exilon/QuickLogger) (`./QuickLogger`) - High-performance asynchronous structured logging framework.
+*   **Runtime Binary:**
+    *   [MsQuic Official Repository](https://github.com/microsoft/msquic) & [MsQuic x64 Releases](https://github.com/microsoft/msquic/releases) (`msquic.dll` 64-bit - precompiled binary included in project directory for HTTP/3 QUIC support).
 
-Follow these steps to get the server up and running on your local machine.
+---
 
-### 1. Clone the Repository
-```bash
-git clone [YOUR_REPOSITORY_URL]
-cd [DIRECTORY_NAME]
+## Getting Started: Running the Server
+
+### 1. SSL Certificates Management (Required for HTTPS / HTTP/3)
+
+#### Generate SSL Certificate:
+To enable TLS and HTTP/3 on localhost, generate a self-signed CNG certificate:
+```powershell
+# Run PowerShell as Administrator
+.\gen_quic_cert.ps1
 ```
 
-### 2. Configure Dependencies in Delphi
-1.  Open Delphi.
-2.  Go to `Tools > Options > Language > Delphi > Library`.
-3.  In the "Library path" field, add the paths to the source directories of `QuickLogger` and `FastMM5`.
+*   **Certificate Storage & Key Security:**
+    *   **Certificate Store:** The certificate is installed into a dedicated Windows machine store: `Cert:\LocalMachine\GHttpsIOCPSvr`. This ensures server certificates remain isolated from the default `Personal/My` store.
+    *   **Private Key (CNG):** The RSA 2048 / SHA-256 private key is stored securely in the Windows Cryptography Next Generation (CNG) machine key directory (`%ProgramData%\Microsoft\Crypto\Keys\`). The generation script automatically configures Access Control Lists (ACLs) to grant Read permissions to service accounts and the `Users` group.
 
-### 3. Generate a Self-Signed SSL Certificate
-The server requires an SSL certificate for HTTPS. For local development, you can generate a self-signed one.
+#### Remove / Clean Certificates:
+To remove and clean up all generated test certificates from Windows Certificate Stores (`LocalMachine\GHttpsIOCPSvr`, `CurrentUser\GHttpsIOCPSvr`, `LocalMachine\My`):
+```powershell
+# Run PowerShell as Administrator
+.\remove_certs.ps1
+```
+*(Note: If you run the server in `-mode:http`, no certificates are needed!)*
 
-1.  Open a Command Prompt (CMD) **as an Administrator**.
-2.  Run the following command:
-    ```bash
-    MakeCert.exe -r -pe -n "CN=localhost" -ss GHttpsIOCPSvr -a sha256 -sky exchange -sp "Microsoft Enhanced RSA and AES Cryptographic Provider" -sy 24
-    ```
-    **Note:** The certificate store name (`-ss GHttpsIOCPSvr`) **must** match the name specified in the server's code (`'GHttpsIOCPSvr'`).
+### 2. Build & Launch
+Open and build `GHttpsIOCPSvrWebSocket.dpr` or `GHttpsIOCPSvr.dpr`.
 
-### 4. Build and Run the Project
-1.  Open the `GHttpsIOCPSvr.dpr` file in Delphi.
-2.  Build the project (`Ctrl+F9`).
-3.  Run the project (`F9`).
+### 3. Command-Line Options (CLI)
+You can customize the server execution directly from the command line:
 
-The server will start on port **8443**. The console will display logs indicating the server's status.
+```bash
+# Run in Dual-Stack mode (HTTP: 8080 + HTTPS: 8443 + HTTP/3: 8443)
+GHttpsIOCPSvrWebSocket.exe -mode:dual -httpport:8080 -httpsport:8443
 
-## Building Your Application: The Core Structure
+# Run in HTTP-Only mode (No certificate required, pure plaintext & ws://)
+GHttpsIOCPSvrWebSocket.exe -mode:http -httpport:8080
 
-All server logic resides within the main `program` block. Here is the fundamental structure for creating, configuring, and running the server, as seen in `GHttpsIOCPSvr.dpr`.
+# Run in HTTPS-Only mode with Keep-Alive disabled
+GHttpsIOCPSvrWebSocket.exe -mode:https -httpsport:8443 -nokeepalive
 
-```delphi
-program GHttpsIOCPSvr;
+# Dual-Stack with automatic 301 Redirect from HTTP to HTTPS
+GHttpsIOCPSvrWebSocket.exe -mode:dual -redirect
+
+# Maximum performance benchmark mode (Disable console/file logging)
+GHttpsIOCPSvrWebSocket.exe -mode:dual -nolog
+
+# View CLI Help
+GHttpsIOCPSvrWebSocket.exe -help
+```
+
+---
+
+## Code Examples: Building Applications
+
+### 1. Initializing the Server (Dual-Stack with Keep-Alive)
+```pascal
+program MyServerApp;
 
 {$APPTYPE CONSOLE}
 
+uses
+  FASTMM5,
+  Quick.Logger,
+  System.SysUtils,
+  GHttpsServerIOCP in 'src\GHttpsServerIOCP.pas',
+  GRequest in 'src\GRequest.pas',
+  GResponse in 'src\GResponse.pas';
+
+var
+  Server: TGHttpsServerIOCP;
 begin
+  // Create server: HTTPS: 8443, HTTP: 8080, Dual-Stack mode
+  Server := TGHttpsServerIOCP.Create(
+    8443, 'localhost', 'GHttpsIOCPSvr',
+    'MySecretJwtKey1234567890!',
+    2000, 1000000,
+    DEFAULT_MAX_REQUEST_HEDER_SIZE,
+    DEFAULT_MAX_REQUEST_SIZE,
+    DEFAULT_MAX_RESPONSE_SIZE,
+    DEFAULT_CHUNK_SIZE,
+    50, 85, True, True,
+    8080, haServeNormally
+  );
   try
-    var Server := TGHttpsServerIOCP.Create(8443, 'localhost', 'GHttpsIOCPSvr');
-    try
-      Server.Start;
-      Logger.Info('Server running. Press Enter to stop...');
-      Readln;
-      Server.Stop;
-    finally
-      Server.Free;
-    end;
-  except
-    on E: Exception do
-    begin
-      Logger.Error('Fatal Error: ' + E.Message);
-      Readln;
-    end;
+    Server.EnableHttp3 := True;
+    Server.EnableKeepAlive := True;
+
+    // Register endpoints here...
+    Server.Start;
+    Writeln('Server running. Press Enter to stop...');
+    Readln;
+    Server.Stop;
+  finally
+    Server.Free;
   end;
 end.
 ```
 
-## How to Add Your Own Endpoints (Code Examples)
+---
 
-You register your endpoints inside the `try...finally` block, after creating the server instance and before calling `Server.Start`. Here are common patterns.
+### 2. Registering REST Endpoints
 
-### Example 1: Simple Text Response
-A basic "Hello, World!" endpoint.
-
-**Delphi Code:**
-```delphi
-Server.RegisterEndpointProc('/hello', hmGET,
-  procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
-  begin
-    AResponse.AddTextContent('text/plain', 'Hello, World!');
-  end
-);
-```
-**Test with curl:** `curl -k https://localhost:8443/hello`
-
-### Example 2: Returning JSON Content
-Creates and returns a `TJSONObject`.
-
-**Delphi Code:**
-```delphi
-...
-Server.RegisterEndpointProc('/api/data', hmGET,
+#### Simple JSON API:
+```pascal
+Server.RegisterEndpointProc('/api/status', hmGET,
   procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
   var
     Json: TJSONObject;
   begin
     Json := TJSONObject.Create;
     try
-      Json.AddPair('id', TJSONNumber.Create(123));
-      Json.AddPair('name', TJSONString.Create('Test Product'));
+      Json.AddPair('status', 'online');
+      Json.AddPair('time', FormatDateTime('yyyy-mm-dd hh:nn:ss', Now));
       AResponse.AddJSONContent(Json.ToJSON);
     finally
       Json.Free;
@@ -131,124 +162,65 @@ Server.RegisterEndpointProc('/api/data', hmGET,
   end
 );
 ```
-**Test with curl:** `curl -k https://localhost:8443/api/data`
 
-### Example 3: Reading Query Parameters
-Reads an `id` parameter from the URL query string.
-
-**Delphi Code:**
-```delphi
-Server.RegisterEndpointProc('/api/user', hmGET,
-  procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
-  var
-    UserId: string;
-  begin
-    UserId := ARequest.RequestInfo.QueryParameters.GetValueOrDefault('id', 'not_found');
-    AResponse.AddTextContent('text/plain', 'User ID requested: ' + UserId);
-  end
-);
-```
-**Test with curl:** `curl -k "https://localhost:8443/api/user?id=456"`
-
-### Example 4: Handling POST with a JSON Body
-Reads a JSON body from a POST request.
-
-**Delphi Code:**
-```delphi
-Server.RegisterEndpointProc('/api/submit', hmPOST,
-  procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
-  var
-    JsonRequest: TJSONObject;
-    Name: string;
-  begin
-    JsonRequest := TJSONObject.ParseJSONValue(ARequest.BodyAsString) as TJSONObject;
-    if Assigned(JsonRequest) then
-    try
-      Name := JsonRequest.GetValue<string>('name', 'Unknown');
-      AResponse.AddTextContent('text/plain', 'Received name: ' + Name);
-    finally
-      JsonRequest.Free;
-    end;
-  end
-);
-```
-**Test with curl:** `curl -k -X POST https://localhost:8443/api/submit -H "Content-Type: application/json" -d "{\"name\":\"John Doe\"}"`
-
-### Example 5: Creating a Protected Endpoint (JWT)
-To protect an endpoint, add `atJWTBearer` as the final parameter.
-
-**Delphi Code:**
-```delphi
-Server.RegisterEndpointProc('/api/secure/data', hmGET,
+#### JWT Protected Route:
+```pascal
+Server.RegisterEndpointProc('/api/admin/data', hmGET,
   procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
   begin
-    AResponse.AddTextContent('text/plain', 'This is a secret message!');
+    AResponse.AddTextContent('text/plain', 'Welcome, authorized administrator!');
   end,
-  atJWTBearer
+  atJWTBearer // Enforces Authorization: Bearer <Token>
 );
 ```
-**Test with curl:**
-```bash
-# First, get a token from /login. Then, use the access_token here.
-TOKEN="YOUR_TOKEN"
-curl -k -H "Authorization: Bearer $TOKEN" https://localhost:8443/api/secure/data
-```
 
-### Example 6: Generating a JWT Token (Login Logic)
-This example shows the full logic for a login endpoint: validating credentials, adding custom claims, and creating a token.
+---
 
-**Delphi Code:**
-```delphi
-Server.RegisterEndpointProc('/login', hmPOST,
-  procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
-  var
-    JsonRequest: TJSONObject;
-    Username, Password, Token: string;
-    CustomClaims, JsonResponse: TJSONObject;
+### 3. Registering WebSockets (`ws://` & `wss://`)
+
+```pascal
+// 1. Register WebSocket route
+Server.RegisterWebSocketRoute('/chat', True);
+
+// 2. Handle incoming WebSocket frames
+Server.OnWebSocketFrame := procedure(AServer: TObject; ASession: TWebSocketSession; const AFrame: TWebSocketFrame)
+begin
+  if AFrame.OpCode = wsOpText then
   begin
-    JsonRequest := TJSONObject.ParseJSONValue(ARequest.BodyAsString) as TJSONObject;
-    if not Assigned(JsonRequest) then Exit; // Basic validation
-    try
-      Username := JsonRequest.GetValue<string>('username', '');
-      Password := JsonRequest.GetValue<string>('password', '');
-      if (Username = 'admin') and (Password = 'password123') then
-      begin
-        CustomClaims := TJSONObject.Create;
-        try
-          CustomClaims.AddPair('role', 'administrator');
-          CustomClaims.AddPair('department', 'IT');
-          Token := AServer.JWTManager.CreateToken(Username, CustomClaims);
-          JsonResponse := TJSONObject.Create;
-          try
-            JsonResponse.AddPair('token_type', 'Bearer');
-            JsonResponse.AddPair('access_token', Token);
-            AResponse.AddJSONContent(JsonResponse.ToJSON);
-          finally
-            JsonResponse.Free;
-          end;
-        finally
-          CustomClaims.Free;
-        end;
-      end
-      else
-      begin
-        AResponse.SetUnauthorized('Invalid username or password.');
-      end;
-    finally
-      JsonRequest.Free;
-    end;
-  end
-);
+    var Msg := TEncoding.UTF8.GetString(AFrame.Payload);
+    Writeln('Received WS message: ' + Msg);
+
+    // Echo back or broadcast to other clients
+    ASession.QueueSendTextFrame('Echo: ' + Msg);
+    Server.TriggerWebSocketWrite(ASession);
+  end;
+end;
 ```
-**Test with curl:**
+
+---
+
+### 4. Testing Endpoints with cURL
+
 ```bash
+# 1. Test Plaintext HTTP (Port 8080)
+curl -i http://localhost:8080/status
+
+# 2. Test Secure HTTPS TLS 1.3 (Port 8443)
+curl -k -i https://localhost:8443/status
+
+# 3. Test HTTP/3 (QUIC / UDP) using h3bench
+.\h3bench.exe -u https://localhost:8443/api/protocol -c 10 -n 100 -k
+
+# 4. Authenticate & Obtain JWT Bearer Token
 curl -k -X POST https://localhost:8443/login \
--H "Content-Type: application/json" \
--d "{\"username\":\"admin\",\"password\":\"password123\"}"
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin\",\"password\":\"password123\"}"
 ```
+
+---
 
 ## License
 
-This project is licensed under the **MIT License**. Details can be found in the source files.
+This project is licensed under the **MIT License**. See source headers for details.
 
-Copyright (c) 2025 GECKO-71
+Copyright (c) 2026 GECKO-71.

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DEMO 11: Tri-Protocol Hybrid Server (HTTP/1.1 + HTTP/3 + WebSocket)</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo">GHttpsIOCP Tri-Protocol Engine</div>
+      <div class="status-badge" id="wsBadge">WS Disconnected</div>
+    </header>
+
+    <main class="main-card">
+      <div class="card">
+        <h2>Multi-Protocol Control Hub</h2>
+        <div class="button-grid">
+          <button id="btnProtocol" class="btn btn-primary">1. Test GET /api/protocol</button>
+          <button id="btnBroadcast" class="btn btn-success">2. Test POST /api/broadcast</button>
+        </div>
+      </div>
+
+      <div class="card full-width">
+        <h2>Tri-Protocol Log & Stream Output</h2>
+        <pre id="outputLog">System initialized. Testing HTTP/1.1, HTTP/3, and WebSocket simultaneously.</pre>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div>GHttpsIOCPSvr DEMO 11 &copy; 2026 GECKO-71</div>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

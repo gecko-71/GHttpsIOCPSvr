@@ -1,0 +1,410 @@
+// ==============================================================================
+// DEMO 09: Profesjonalny Odtwarzacz HLS (Live TV) z Niezależną Telemetrią WebSocket
+// Pełna implementacja wytycznych: dedykowane przyciski Start i Pause
+// ==============================================================================
+
+// Stan centralny aplikacji (State Machine)
+let streamState = 'offline';       // 'offline' | 'loading' | 'live' | 'error'
+let telemetryState = 'disconnected'; // 'disconnected' | 'connecting' | 'connected'
+
+// Referencje obiektów
+let hls = null;
+let ws = null;
+
+// Pojedyncze referencje do timerów (Brak wycieków timerów)
+let sessionTimer = null;
+let sessionStartTimestamp = null;
+let hlsReconnectTimer = null;
+let hlsRetryCount = 0;
+let wsReconnectTimer = null;
+let wsRetryCount = 0;
+
+// Elementy DOM interfejsu użytkownika
+const video = document.getElementById('moviePlayer');
+const offlineOverlay = document.getElementById('offlineOverlay');
+const activeViewers = document.getElementById('activeViewers');
+const streamStateVal = document.getElementById('streamStateVal');
+const uptimeVal = document.getElementById('uptimeVal');
+const sessionTimeDisplay = document.getElementById('sessionTimeDisplay');
+const btnStart = document.getElementById('btnStart');
+const btnPause = document.getElementById('btnPause');
+const btnFullscreen = document.getElementById('btnFullscreen');
+
+// ==============================================================================
+// 1. ZARZĄDZANIE CZASEM I FORMATOWANIE
+// ==============================================================================
+
+function formatTime(seconds) {
+  if (isNaN(seconds) || seconds < 0) seconds = 0;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function startSessionTimer() {
+  if (sessionTimer) return;
+  if (!sessionStartTimestamp) {
+    sessionStartTimestamp = Date.now();
+  }
+  sessionTimer = setInterval(() => {
+    if (!sessionStartTimestamp || streamState !== 'live') return;
+    const elapsedSec = Math.floor((Date.now() - sessionStartTimestamp) / 1000);
+    const formatted = formatTime(elapsedSec);
+    if (sessionTimeDisplay) sessionTimeDisplay.innerText = formatted;
+  }, 1000);
+}
+
+function stopSessionTimer() {
+  if (sessionTimer) {
+    clearInterval(sessionTimer);
+    sessionTimer = null;
+  }
+}
+
+function resetSessionTimer() {
+  stopSessionTimer();
+  sessionStartTimestamp = null;
+  if (sessionTimeDisplay) sessionTimeDisplay.innerText = '00:00:00';
+}
+
+// ==============================================================================
+// 2. KONTROLA PRZYCISKÓW START I PAUSE
+// ==============================================================================
+
+function updateControls(isPlaying) {
+  if (isPlaying) {
+    // Gdy trwa transmisja: Start jest nieaktywny (disabled), Pause jest aktywny
+    if (btnStart) {
+      btnStart.disabled = true;
+      btnStart.classList.remove('active');
+    }
+    if (btnPause) {
+      btnPause.disabled = false;
+      btnPause.classList.add('active');
+    }
+  } else {
+    // Gdy nie ma transmisji / pauza: Start jest aktywny, Pause jest nieaktywny (disabled)
+    if (btnStart) {
+      btnStart.disabled = false;
+      btnStart.classList.add('active');
+    }
+    if (btnPause) {
+      btnPause.disabled = true;
+      btnPause.classList.remove('active');
+    }
+  }
+}
+
+// ==============================================================================
+// 3. CENTRALNY STATE MACHINE DLA STRUMIENIA WIDEO (HLS)
+// ==============================================================================
+
+function setStreamState(newState) {
+  if (streamState === newState) return;
+  console.log(`[HLS State Machine] Przejście stanu wideo: ${streamState} -> ${newState}`);
+  streamState = newState;
+
+  switch (streamState) {
+    case 'live':
+      if (offlineOverlay) offlineOverlay.classList.add('hidden');
+      if (streamStateVal) {
+        streamStateVal.innerText = 'LIVE HLS BROADCAST';
+        streamStateVal.className = 'm-val highlight-green';
+      }
+      updateControls(true);
+      startSessionTimer();
+      hlsRetryCount = 0; // Reset licznika prób po udanym odtworzeniu
+      break;
+
+    case 'loading':
+      if (streamStateVal) {
+        streamStateVal.innerText = 'BUFFERING LIVE EDGE...';
+        streamStateVal.className = 'm-val highlight-yellow';
+      }
+      break;
+
+    case 'error':
+    case 'offline':
+    default:
+      if (offlineOverlay) offlineOverlay.classList.remove('hidden');
+      if (streamStateVal) {
+        streamStateVal.innerText = 'OFFLINE (NO SIGNAL)';
+        streamStateVal.className = 'm-val highlight';
+      }
+      updateControls(false);
+      stopSessionTimer();
+      break;
+  }
+}
+
+// ==============================================================================
+// 4. SILNIK HLS: INICJALIZACJA, RECONNECT I OBSŁUGA BŁĘDÓW
+// ==============================================================================
+
+function stopPlayer() {
+  if (hlsReconnectTimer) {
+    clearTimeout(hlsReconnectTimer);
+    hlsReconnectTimer = null;
+  }
+  if (hls) {
+    try {
+      hls.destroy();
+    } catch (e) {
+      console.error('[HLS] Błąd przy niszczeniu instancji:', e);
+    }
+    hls = null;
+  }
+  if (video) {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  }
+  setStreamState('offline');
+}
+
+function schedulePlayerReconnect() {
+  if (hlsReconnectTimer) return;
+  const delay = Math.min(15000, 1000 * Math.pow(2, hlsRetryCount));
+  console.log(`[HLS] Zaplanowano ponowne połączenie (próba ${hlsRetryCount + 1}) za ${delay} ms`);
+  hlsRetryCount++;
+  hlsReconnectTimer = setTimeout(() => {
+    hlsReconnectTimer = null;
+    startPlayer();
+  }, delay);
+}
+
+function startPlayer() {
+  stopPlayer();
+  setStreamState('loading');
+
+  const streamUrl = '/live/stream.m3u8';
+
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 6,
+      enableWorker: true,
+      lowLatencyMode: true,
+      backBufferLength: 12,
+      manifestLoadingTimeOut: 5000,
+      manifestLoadingMaxRetry: 3
+    });
+
+    hls.loadSource(streamUrl);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      console.log('[HLS] Manifest załadowany poprawnie.');
+      if (video) {
+        // Skok do aktualnej krawędzi live przed startem
+        if (video.seekable && video.seekable.length > 0) {
+          video.currentTime = Math.max(0, video.seekable.end(video.seekable.length - 1) - 0.5);
+        }
+        video.play().then(() => {
+          updateControls(true);
+        }).catch(err => {
+          console.warn('[HLS] Autoplay zablokowany przez przeglądarkę:', err);
+          updateControls(false);
+        });
+      }
+    });
+
+    // Prawdziwe przejście w stan LIVE następuje przy faktycznym odtwarzaniu klatek
+    hls.on(Hls.Events.FRAG_CHANGED, () => {
+      setStreamState('live');
+    });
+
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      console.warn(`[HLS Event Error] Typ: ${data.type}, Fatal: ${data.fatal}, Szczegóły: ${data.details}`);
+      if (data.fatal) {
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            console.log('[HLS] Próba ponownego załadowania sieci...');
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            console.log('[HLS] Próba naprawy błędu mediów (recoverMediaError)...');
+            hls.recoverMediaError();
+            break;
+          default:
+            console.error('[HLS] Krytyczny błąd playera. Restartuję...');
+            stopPlayer();
+            schedulePlayerReconnect();
+            break;
+        }
+      }
+    });
+
+  } else if (video && video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Natywny HLS dla Safari i urządzeń iOS
+    video.src = streamUrl;
+    video.addEventListener('loadedmetadata', () => {
+      video.play().catch(() => {});
+    });
+    video.addEventListener('playing', () => {
+      setStreamState('live');
+      updateControls(true);
+    });
+    video.addEventListener('error', () => {
+      stopPlayer();
+      schedulePlayerReconnect();
+    });
+  }
+}
+
+// Zdarzenia odtwarzacza HTML5 Video
+if (video) {
+  video.addEventListener('playing', () => {
+    setStreamState('live');
+    updateControls(true);
+  });
+  video.addEventListener('pause', () => {
+    updateControls(false);
+  });
+  video.addEventListener('waiting', () => {
+    if (streamState === 'live') {
+      setStreamState('loading');
+    }
+  });
+  video.addEventListener('ended', () => {
+    // W streamingu Live zakończenie oznacza utratę sygnału
+    updateControls(false);
+    schedulePlayerReconnect();
+  });
+}
+
+// ==============================================================================
+// 5. NIEZALEŻNA TELEMETRIA WEBSOCKET (/status-ws)
+// ==============================================================================
+
+function setTelemetryState(newState) {
+  telemetryState = newState;
+  console.log(`[WebSocket Telemetria] Stan połączenia: ${telemetryState}`);
+}
+
+function connectTelemetryWebSocket() {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  if (ws) {
+    try {
+      ws.close();
+    } catch (e) {}
+    ws = null;
+  }
+
+  setTelemetryState('connecting');
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsProtocol}//${window.location.host}/status-ws`;
+
+  try {
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      setTelemetryState('connected');
+      wsRetryCount = 0;
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.active_viewers !== undefined && activeViewers) {
+          activeViewers.innerText = data.active_viewers;
+        }
+        if (data.uptime_sec !== undefined && uptimeVal) {
+          uptimeVal.innerText = formatTime(data.uptime_sec);
+        }
+      } catch (e) {
+        console.error('[WebSocket] Błąd parsowania JSON:', e);
+      }
+    };
+
+    ws.onclose = () => {
+      setTelemetryState('disconnected');
+      // Utrata połączenia WebSocket NIE wpływa na strumień wideo!
+      const delay = Math.min(15000, 1000 * Math.pow(2, wsRetryCount));
+      wsRetryCount++;
+      wsReconnectTimer = setTimeout(connectTelemetryWebSocket, delay);
+    };
+
+    ws.onerror = (err) => {
+      console.warn('[WebSocket] Błąd połączenia telemetrii:', err);
+    };
+
+  } catch (e) {
+    setTelemetryState('disconnected');
+    wsReconnectTimer = setTimeout(connectTelemetryWebSocket, 3000);
+  }
+}
+
+// ==============================================================================
+// 6. OBSŁUGA PRZYCISKÓW START, PAUSE I SYNCHRONIZACJI
+// ==============================================================================
+
+if (btnStart) {
+  btnStart.addEventListener('click', () => {
+    if (!video) return;
+    console.log('[Controls] Kliknięto START: uruchamianie od aktualnej pozycji live...');
+    
+    if (!hls && !video.src) {
+      startPlayer();
+      return;
+    }
+
+    // Skok do aktualnej pozycji krawędzi na żywo
+    if (video.seekable && video.seekable.length > 0) {
+      const liveEdge = video.seekable.end(video.seekable.length - 1);
+      video.currentTime = Math.max(0, liveEdge - 0.5);
+    }
+
+    video.play().then(() => {
+      updateControls(true);
+    }).catch(err => {
+      console.warn('[Controls] Nie udało się wystartować wideo:', err);
+    });
+  });
+}
+
+if (btnPause) {
+  btnPause.addEventListener('click', () => {
+    if (!video) return;
+    console.log('[Controls] Kliknięto PAUSE: wstrzymywanie transmisji...');
+    video.pause();
+    updateControls(false);
+  });
+}
+
+
+if (btnFullscreen) {
+  btnFullscreen.addEventListener('click', () => {
+    const container = document.querySelector('.video-container');
+    if (!container) return;
+    if (!document.fullscreenElement) {
+      container.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+    }
+  });
+}
+
+// ==============================================================================
+// 7. CZYSZCZENIE ZASOBÓW (CLEANUP NA BEFOREUNLOAD)
+// ==============================================================================
+
+window.addEventListener('beforeunload', () => {
+  stopSessionTimer();
+  if (hlsReconnectTimer) clearTimeout(hlsReconnectTimer);
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+  if (hls) hls.destroy();
+  if (ws) ws.close();
+});
+
+// Inicjalizacja aplikacji po załadowaniu drzewa DOM
+window.addEventListener('DOMContentLoaded', () => {
+  resetSessionTimer();
+  updateControls(false);
+  startPlayer();
+  connectTelemetryWebSocket();
+});

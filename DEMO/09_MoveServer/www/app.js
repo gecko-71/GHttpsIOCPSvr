@@ -1,0 +1,358 @@
+let streamState = 'offline';
+let telemetryState = 'disconnected';
+
+let hls = null;
+let ws = null;
+
+let sessionTimer = null;
+let sessionStartTimestamp = null;
+let hlsReconnectTimer = null;
+let hlsRetryCount = 0;
+let wsReconnectTimer = null;
+let wsRetryCount = 0;
+
+const video = document.getElementById('moviePlayer');
+const offlineOverlay = document.getElementById('offlineOverlay');
+const streamStateVal = document.getElementById('streamStateVal');
+const uptimeVal = document.getElementById('uptimeVal');
+const sessionTimeDisplay = document.getElementById('sessionTimeDisplay');
+const btnStart = document.getElementById('btnStart');
+const btnPause = document.getElementById('btnPause');
+const btnFullscreen = document.getElementById('btnFullscreen');
+
+function formatTime(seconds) {
+  if (isNaN(seconds) || seconds < 0) seconds = 0;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function startSessionTimer() {
+  if (sessionTimer) return;
+  if (!sessionStartTimestamp) {
+    sessionStartTimestamp = Date.now();
+  }
+  sessionTimer = setInterval(() => {
+    if (!sessionStartTimestamp || streamState !== 'live') return;
+    const elapsedSec = Math.floor((Date.now() - sessionStartTimestamp) / 1000);
+    const formatted = formatTime(elapsedSec);
+    if (sessionTimeDisplay) sessionTimeDisplay.innerText = formatted;
+  }, 1000);
+}
+
+function stopSessionTimer() {
+  if (sessionTimer) {
+    clearInterval(sessionTimer);
+    sessionTimer = null;
+  }
+}
+
+function resetSessionTimer() {
+  stopSessionTimer();
+  sessionStartTimestamp = null;
+  if (sessionTimeDisplay) sessionTimeDisplay.innerText = '00:00:00';
+}
+
+function updateControls(isPlaying) {
+  if (isPlaying) {
+    if (btnStart) {
+      btnStart.disabled = true;
+      btnStart.classList.remove('active');
+    }
+    if (btnPause) {
+      btnPause.disabled = false;
+      btnPause.classList.add('active');
+    }
+  } else {
+    if (btnStart) {
+      btnStart.disabled = false;
+      btnStart.classList.add('active');
+    }
+    if (btnPause) {
+      btnPause.disabled = true;
+      btnPause.classList.remove('active');
+    }
+  }
+}
+
+function setStreamState(newState) {
+  if (streamState === newState) return;
+  console.log(`[HLS State Machine] Video stream transition: ${streamState} -> ${newState}`);
+  streamState = newState;
+
+  switch (streamState) {
+    case 'live':
+      if (offlineOverlay) offlineOverlay.classList.add('hidden');
+      if (streamStateVal) {
+        streamStateVal.innerText = 'LIVE HLS BROADCAST';
+        streamStateVal.className = 'm-val highlight-green';
+      }
+      updateControls(true);
+      startSessionTimer();
+      hlsRetryCount = 0;
+      break;
+
+    case 'loading':
+      if (streamStateVal) {
+        streamStateVal.innerText = 'BUFFERING LIVE EDGE...';
+        streamStateVal.className = 'm-val highlight-yellow';
+      }
+      break;
+
+    case 'error':
+    case 'offline':
+    default:
+      if (offlineOverlay) offlineOverlay.classList.remove('hidden');
+      if (streamStateVal) {
+        streamStateVal.innerText = 'OFFLINE (NO SIGNAL)';
+        streamStateVal.className = 'm-val highlight';
+      }
+      updateControls(false);
+      stopSessionTimer();
+      break;
+  }
+}
+
+function stopPlayer() {
+  if (hlsReconnectTimer) {
+    clearTimeout(hlsReconnectTimer);
+    hlsReconnectTimer = null;
+  }
+  if (hls) {
+    try {
+      hls.destroy();
+    } catch (e) {
+      console.error('[HLS] Error destroying instance:', e);
+    }
+    hls = null;
+  }
+  if (video) {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  }
+  setStreamState('offline');
+}
+
+function schedulePlayerReconnect() {
+  if (hlsReconnectTimer) return;
+  const delay = Math.min(15000, 1000 * Math.pow(2, hlsRetryCount));
+  console.log(`[HLS] Scheduled reconnect (attempt ${hlsRetryCount + 1}) in ${delay} ms`);
+  hlsRetryCount++;
+  hlsReconnectTimer = setTimeout(() => {
+    hlsReconnectTimer = null;
+    startPlayer();
+  }, delay);
+}
+
+function startPlayer() {
+  stopPlayer();
+  setStreamState('loading');
+
+  const streamUrl = '/live/stream.m3u8';
+
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 6,
+      enableWorker: true,
+      lowLatencyMode: true,
+      backBufferLength: 12,
+      manifestLoadingTimeOut: 5000,
+      manifestLoadingMaxRetry: 3
+    });
+
+    hls.loadSource(streamUrl);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      console.log('[HLS] Manifest loaded successfully.');
+      if (video) {
+        if (video.seekable && video.seekable.length > 0) {
+          video.currentTime = Math.max(0, video.seekable.end(video.seekable.length - 1) - 0.5);
+        }
+        video.play().then(() => {
+          updateControls(true);
+        }).catch(err => {
+          console.warn('[HLS] Autoplay blocked by browser policy:', err);
+          updateControls(false);
+        });
+      }
+    });
+
+    hls.on(Hls.Events.FRAG_CHANGED, () => {
+      setStreamState('live');
+    });
+
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      console.warn(`[HLS Event Error] Type: ${data.type}, Fatal: ${data.fatal}, Details: ${data.details}`);
+      if (data.fatal) {
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            console.log('[HLS] Attempting network reload...');
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            console.log('[HLS] Attempting media error recovery (recoverMediaError)...');
+            hls.recoverMediaError();
+            break;
+          default:
+            console.error('[HLS] Critical player error. Restarting...');
+            stopPlayer();
+            schedulePlayerReconnect();
+            break;
+        }
+      }
+    });
+
+  } else if (video && video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = streamUrl;
+    video.addEventListener('loadedmetadata', () => {
+      video.play().catch(() => {});
+    });
+    video.addEventListener('playing', () => {
+      setStreamState('live');
+      updateControls(true);
+    });
+    video.addEventListener('error', () => {
+      stopPlayer();
+      schedulePlayerReconnect();
+    });
+  }
+}
+
+if (video) {
+  video.addEventListener('playing', () => {
+    setStreamState('live');
+    updateControls(true);
+  });
+  video.addEventListener('pause', () => {
+    updateControls(false);
+  });
+  video.addEventListener('waiting', () => {
+    if (streamState === 'live') {
+      setStreamState('loading');
+    }
+  });
+  video.addEventListener('ended', () => {
+    updateControls(false);
+    schedulePlayerReconnect();
+  });
+}
+
+function setTelemetryState(newState) {
+  telemetryState = newState;
+  console.log(`[WebSocket Telemetry] Connection state: ${telemetryState}`);
+}
+
+function connectTelemetryWebSocket() {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  if (ws) {
+    try {
+      ws.close();
+    } catch (e) {}
+    ws = null;
+  }
+
+  setTelemetryState('connecting');
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsProtocol}//${window.location.host}/status-ws`;
+
+  try {
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      setTelemetryState('connected');
+      wsRetryCount = 0;
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.uptime_sec !== undefined && uptimeVal) {
+          uptimeVal.innerText = formatTime(data.uptime_sec);
+        }
+      } catch (e) {
+        console.error('[WebSocket] JSON parse error:', e);
+      }
+    };
+
+    ws.onclose = () => {
+      setTelemetryState('disconnected');
+      const delay = Math.min(15000, 1000 * Math.pow(2, wsRetryCount));
+      wsRetryCount++;
+      wsReconnectTimer = setTimeout(connectTelemetryWebSocket, delay);
+    };
+
+    ws.onerror = (err) => {
+      console.warn('[WebSocket] Telemetry connection error:', err);
+    };
+
+  } catch (e) {
+    setTelemetryState('disconnected');
+    wsReconnectTimer = setTimeout(connectTelemetryWebSocket, 3000);
+  }
+}
+
+if (btnStart) {
+  btnStart.addEventListener('click', () => {
+    if (!video) return;
+    console.log('[Controls] START clicked: starting from current live edge...');
+    
+    if (!hls && !video.src) {
+      startPlayer();
+      return;
+    }
+
+    if (video.seekable && video.seekable.length > 0) {
+      const liveEdge = video.seekable.end(video.seekable.length - 1);
+      video.currentTime = Math.max(0, liveEdge - 0.5);
+    }
+
+    video.play().then(() => {
+      updateControls(true);
+    }).catch(err => {
+      console.warn('[Controls] Failed to start video playback:', err);
+    });
+  });
+}
+
+if (btnPause) {
+  btnPause.addEventListener('click', () => {
+    if (!video) return;
+    console.log('[Controls] PAUSE clicked: pausing live playback...');
+    video.pause();
+    updateControls(false);
+  });
+}
+
+if (btnFullscreen) {
+  btnFullscreen.addEventListener('click', () => {
+    const container = document.querySelector('.video-container');
+    if (!container) return;
+    if (!document.fullscreenElement) {
+      container.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+    }
+  });
+}
+
+window.addEventListener('beforeunload', () => {
+  stopSessionTimer();
+  if (hlsReconnectTimer) clearTimeout(hlsReconnectTimer);
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+  if (hls) hls.destroy();
+  if (ws) ws.close();
+});
+
+window.addEventListener('DOMContentLoaded', () => {
+  resetSessionTimer();
+  updateControls(false);
+  startPlayer();
+  connectTelemetryWebSocket();
+});

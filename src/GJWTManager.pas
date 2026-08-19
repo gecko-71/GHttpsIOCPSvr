@@ -1,7 +1,7 @@
 {
   MIT License
 
-  Copyright (c) (c) 2025 GECKO-71
+  Copyright (c) (c) 2026 GECKO-71
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -144,6 +144,8 @@ type
 
 implementation
 
+uses Quick.Logger;
+
 { TJWTToken }
 
 constructor TJWTToken.Create;
@@ -170,7 +172,7 @@ begin
     begin
       Value := FDecoded.FindValue(Name);
       if Assigned(Value) then
-        Result := Value.Value;
+         Result := Value.Value;
     end;
   except
     on E: Exception do
@@ -273,8 +275,10 @@ var
   CharSet: set of AnsiChar;
 begin
   Result := False;
-  if Length(Key) < 32 then Exit;
-  if Trim(Key) = '' then Exit;
+  if Length(Key) < 32 then
+    Exit;
+  if Trim(Key) = '' then
+    Exit;
 
   UniqueChars := 0;
   CharSet := [];
@@ -328,8 +332,10 @@ begin
   begin
     var aChar: Word := 0;
     var bChar: Word := 0;
-    if i <= Length(A) then aChar := Ord(A[i]);
-    if i <= Length(B) then bChar := Ord(B[i]);
+    if i <= Length(A) then
+      aChar := Ord(A[i]);
+    if i <= Length(B) then
+      bChar := Ord(B[i]);
     Diff := Diff or (aChar xor bChar);
   end;
   Result := Diff = 0;
@@ -356,7 +362,7 @@ function TJWTManager.EncodeBase64Url(const Input: TBytes): string;
 begin
   Result := '';
   try
-    Result := TNetEncoding.Base64Url.EncodeBytesToString(Input);
+    Result := Trim(TNetEncoding.Base64Url.EncodeBytesToString(Input)).Replace('=', '').Replace(#13, '').Replace(#10, '');
   except
     on E: Exception do
     begin
@@ -398,6 +404,8 @@ begin
   DataBytes := TEncoding.UTF8.GetBytes(HeaderPayload);
   KeyBytes := TEncoding.UTF8.GetBytes(FSecretKey);
   SetLength(PaddedKey, BlockSize);
+  FillChar(PaddedKey[0], BlockSize, 0);
+
   if Length(KeyBytes) > BlockSize then
   begin
     SetString(KeyAnsi, PAnsiChar(KeyBytes), Length(KeyBytes));
@@ -405,9 +413,8 @@ begin
     Move(HashedKey[0], PaddedKey[0], Length(HashedKey));
   end
   else
-  begin
     Move(KeyBytes[0], PaddedKey[0], Length(KeyBytes));
-  end;
+
   SetLength(o_key_pad, BlockSize);
   SetLength(i_key_pad, BlockSize);
   for i := 0 to BlockSize - 1 do
@@ -415,13 +422,24 @@ begin
     i_key_pad[i] := PaddedKey[i] xor $36;
     o_key_pad[i] := PaddedKey[i] xor $5C;
   end;
-  var InnerDataBytes := i_key_pad + DataBytes;
-  SetString(InnerDataAnsi, PAnsiChar(InnerDataBytes), Length(InnerDataBytes));
-  InnerHash := THashSHA2.GetHashBytes(string(InnerDataAnsi), THashSHA2.TSHA2Version.SHA256);
-  var OuterDataBytes := o_key_pad + InnerHash;
-  SetString(OuterDataAnsi, PAnsiChar(OuterDataBytes), Length(OuterDataBytes));
-  OuterHash := THashSHA2.GetHashBytes(string(OuterDataAnsi), THashSHA2.TSHA2Version.SHA256);
+  var InnerData := i_key_pad + DataBytes;
+  var InStream := TBytesStream.Create(InnerData);
+  try
+    InnerHash := THashSHA2.GetHashBytes(InStream, THashSHA2.TSHA2Version.SHA256);
+  finally
+    InStream.Free;
+  end;
+
+  var OuterData := o_key_pad + InnerHash;
+  var OutStream := TBytesStream.Create(OuterData);
+  try
+    OuterHash := THashSHA2.GetHashBytes(OutStream, THashSHA2.TSHA2Version.SHA256);
+  finally
+    OutStream.Free;
+  end;
+
   Result := EncodeBase64Url(OuterHash);
+
 end;
 
 function TJWTManager.VerifySignature(const HeaderPayload, Signature: string): Boolean;
@@ -431,9 +449,11 @@ begin
   Result := False;
   try
     ExpectedSignature := CreateSignature(HeaderPayload);
+    Logger.Info(Format('[LOG-SIG-COMPARE] Expected="%s", Got="%s"', [ExpectedSignature, Signature]));
     Result := (ExpectedSignature <> '') and SecureCompare(ExpectedSignature, Signature);
     if not Result then
       LogSecurityEvent('Invalid signature detected.');
+
   except
     on E: Exception do
     begin
@@ -452,7 +472,8 @@ begin
   Result := False;
   Error := jeNone;
   ErrorMsg := '';
-  CurrentTime := Now;
+  CurrentTime := TTimeZone.Local.ToUniversalTime(Now);
+
   try
     if PayloadObj.TryGetValue<Int64>('exp', ExpTime) then
     begin
@@ -614,6 +635,13 @@ end;
 
 procedure TJWTManager.LogSecurityEvent(const Event: string; const Details: string);
 begin
+  if FEnableSecurityLogging then
+  begin
+    if Details <> '' then
+      Logger.Warn(Format('[SECURITY-JWT] %s: %s', [Event, Details]))
+    else
+      Logger.Warn(Format('[SECURITY-JWT] %s', [Event]));
+  end;
 end;
 
 function TJWTManager.GenerateSecureJti: string;
@@ -695,11 +723,16 @@ begin
     JWT.Payload := TokenParts[1];
     JWT.Signature := TokenParts[2];
 
-    HeaderObj := ParseJsonSafely(DecodeBase64Url(JWT.Header));
+    Logger.Info(Format('[LOG-JWT-STEP] SecretKeyLen=%d, HeaderBase64="%s", PayloadBase64="%s", Sig="%s"', [Length(FSecretKey), JWT.Header, JWT.Payload, JWT.Signature]));
+
+    var DecHeaderStr := DecodeBase64Url(JWT.Header);
+    Logger.Info('[LOG-JWT-STEP] Decoded Header JSON=' + DecHeaderStr);
+    HeaderObj := ParseJsonSafely(DecHeaderStr);
     if not Assigned(HeaderObj) then
     begin
       JWT.LastError := jeInvalidHeader;
-      JWT.ErrorMessage := 'Cannot decode or parse token header JSON.';
+      JWT.ErrorMessage := 'Cannot decode or parse token header JSON: ' + DecHeaderStr;
+      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
       Exit;
     end;
 
@@ -707,6 +740,7 @@ begin
     begin
       JWT.LastError := jeInvalidHeader;
       JWT.ErrorMessage := 'Invalid header content (e.g., algorithm not allowed).';
+      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
       raise Exception.Create(JWT.ErrorMessage);
     end;
 
@@ -714,16 +748,21 @@ begin
     begin
       JWT.LastError := jeInvalidSignature;
       JWT.ErrorMessage := 'Invalid token signature.';
+      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
       raise Exception.Create(JWT.ErrorMessage);
     end;
 
-    PayloadObj := ParseJsonSafely(DecodeBase64Url(JWT.Payload));
+    var DecPayloadStr := DecodeBase64Url(JWT.Payload);
+    Logger.Info('[LOG-JWT-STEP] Decoded Payload JSON=' + DecPayloadStr);
+    PayloadObj := ParseJsonSafely(DecPayloadStr);
     if not Assigned(PayloadObj) then
     begin
       JWT.LastError := jeInvalidPayload;
-      JWT.ErrorMessage := 'Cannot decode or parse token payload JSON.';
+      JWT.ErrorMessage := 'Cannot decode or parse token payload JSON: ' + DecPayloadStr;
+      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
       raise Exception.Create(JWT.ErrorMessage);
     end;
+
     if not ValidateStandardClaims(PayloadObj, Error, ErrorMsg) then
     begin
       JWT.LastError := Error;
@@ -745,9 +784,6 @@ begin
        JWT.Audience := AudValue;
     if PayloadObj.TryGetValue<string>('jti', JtiValue) then
        JWT.JwtId := JtiValue;
-    //PayloadObj.Free;
-    //HeaderObj.Free;
-
 
     JWT.HeaderDecoded := HeaderObj;
     JWT.Decoded := PayloadObj;
@@ -762,7 +798,9 @@ begin
         JWT.ErrorMessage := 'Unexpected error during token validation: ' + E.Message;
       end;
       LogSecurityEvent('Token validation failed', JWT.ErrorMessage);
+      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
       Result := False;
+
       if Assigned(HeaderObj) then HeaderObj.Free;
       if Assigned(PayloadObj) then PayloadObj.Free;
     end;
@@ -781,15 +819,20 @@ begin
   Header := nil;
   Payload := nil;
   try
-    CurrentTime := Now;
+    CurrentTime := TTimeZone.Local.ToUniversalTime(Now);
+
     Header := TJSONObject.Create;
     Header.AddPair('alg', 'HS256');
     Header.AddPair('typ', 'JWT');
 
     Payload := TJSONObject.Create;
     Payload.AddPair('sub', Subject);
-    if FIssuer <> '' then Payload.AddPair('iss', FIssuer);
-    if FAudience <> '' then Payload.AddPair('aud', FAudience);
+
+    if FIssuer <> '' then
+       Payload.AddPair('iss', FIssuer);
+    if FAudience <> '' then
+       Payload.AddPair('aud', FAudience);
+
     Payload.AddPair('iat', TJSONNumber.Create(DateTimeToUnix(CurrentTime)));
     Payload.AddPair('exp', TJSONNumber.Create(DateTimeToUnix(IncMinute(CurrentTime, FTokenExpiration))));
 
@@ -799,9 +842,12 @@ begin
     begin
       for var Pair in CustomClaims do
       begin
-        if not (SameText(Pair.JsonString.Value, 'sub') or SameText(Pair.JsonString.Value, 'iss') or
-                SameText(Pair.JsonString.Value, 'aud') or SameText(Pair.JsonString.Value, 'iat') or
-                SameText(Pair.JsonString.Value, 'exp') or SameText(Pair.JsonString.Value, 'nbf') or
+        if not (SameText(Pair.JsonString.Value, 'sub') or
+                SameText(Pair.JsonString.Value, 'iss') or
+                SameText(Pair.JsonString.Value, 'aud') or
+                SameText(Pair.JsonString.Value, 'iat') or
+                SameText(Pair.JsonString.Value, 'exp') or
+                SameText(Pair.JsonString.Value, 'nbf') or
                 SameText(Pair.JsonString.Value, 'jti')) then
           Payload.AddPair(Pair.JsonString.Value, Pair.JsonValue.Clone as TJSONValue);
       end;
@@ -825,8 +871,10 @@ begin
     Result := HeaderBase64 + '.' + PayloadBase64 + '.' + Signature;
     LogSecurityEvent('Token created successfully', Format('Subject: %s, JTI: %s', [Subject, GeneratedJti]));
   finally
-    if Assigned(Header) then Header.Free;
-    if Assigned(Payload) then Payload.Free;
+    if Assigned(Header) then
+      Header.Free;
+    if Assigned(Payload) then
+       Payload.Free;
   end;
 end;
 
@@ -853,9 +901,12 @@ begin
     CustomClaims := TJSONObject.Create;
     if Assigned(JWT.Decoded) then
       for var Pair in JWT.Decoded do
-        if not (SameText(Pair.JsonString.Value, 'sub') or SameText(Pair.JsonString.Value, 'iss') or
-                SameText(Pair.JsonString.Value, 'aud') or SameText(Pair.JsonString.Value, 'iat') or
-                SameText(Pair.JsonString.Value, 'exp') or SameText(Pair.JsonString.Value, 'nbf') or
+        if not (SameText(Pair.JsonString.Value, 'sub') or
+                SameText(Pair.JsonString.Value, 'iss') or
+                SameText(Pair.JsonString.Value, 'aud') or
+                SameText(Pair.JsonString.Value, 'iat') or
+                SameText(Pair.JsonString.Value, 'exp') or
+                SameText(Pair.JsonString.Value, 'nbf') or
                 SameText(Pair.JsonString.Value, 'jti')) then
           CustomClaims.AddPair(Pair.JsonString.Value, Pair.JsonValue.Clone as TJSONValue);
 
@@ -867,8 +918,10 @@ begin
     else
       LogSecurityEvent('Token refresh failed', 'Could not create new token.');
   finally
-    if Assigned(JWT) then JWT.Free;
-    if Assigned(CustomClaims) then CustomClaims.Free;
+    if Assigned(JWT) then
+      JWT.Free;
+    if Assigned(CustomClaims) then
+      CustomClaims.Free;
   end;
 end;
 

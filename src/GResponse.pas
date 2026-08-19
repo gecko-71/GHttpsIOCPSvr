@@ -1,7 +1,7 @@
 {
   MIT License
 
-  Copyright (c) (c) 2025 GECKO-71
+  Copyright (c) (c) 2026 GECKO-71
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -172,6 +172,7 @@ type
     FCurrentInMemoryFile: TMemoryStream;
     FContentFinalized: Boolean;
     FHeaderPosition: Integer;
+    FKeepAlive: Boolean;
     procedure BuildHeaders;
     procedure BuildContentBytes;
     procedure BuildMultipartContent;
@@ -233,6 +234,9 @@ type
     procedure SetFound(const URL: string);
     procedure Write(const Data: TBytes); overload;
     procedure Write(const Data: string); overload;
+    function GetBodyBytes: TBytes;
+    property Headers: TStringList read FHeaders;
+    property ContentType: string read FContentType;
     property Socket: TSocket read FSocket;
     property BytesSent: Integer read FBytesSent;
     property Status: THttpStatus read FStatus;
@@ -241,6 +245,7 @@ type
     property TotalContentSize: Int64 read FTotalContentSize;
     property CurrentInMemoryFile: TMemoryStream read FCurrentInMemoryFile;
     property ContentPosition: Int64 read FContentPosition;
+    property KeepAlive: Boolean read FKeepAlive write FKeepAlive;
   end;
 
 implementation
@@ -329,15 +334,24 @@ begin
     begin
       Ext := LowerCase(ExtractFileExt(Filename));
       if Ext = '.html' then FContentType := 'text/html'
-      else if Ext = '.css' then FContentType := 'text/css'
-      else if Ext = '.js' then FContentType := 'application/javascript'
-      else if Ext = '.json' then FContentType := 'application/json'
-      else if Ext = '.xml' then FContentType := 'application/xml'
-      else if Ext = '.pdf' then FContentType := 'application/pdf'
-      else if Ext = '.jpg' then FContentType := 'image/jpeg'
-      else if Ext = '.png' then FContentType := 'image/png'
-      else if Ext = '.gif' then FContentType := 'image/gif'
-      else FContentType := 'application/octet-stream';
+      else if Ext = '.css' then
+        FContentType := 'text/css'
+      else if Ext = '.js' then
+        FContentType := 'application/javascript'
+      else if Ext = '.json' then
+        FContentType := 'application/json'
+      else if Ext = '.xml' then
+        FContentType := 'application/xml'
+      else if Ext = '.pdf' then
+        FContentType := 'application/pdf'
+      else if Ext = '.jpg' then
+        FContentType := 'image/jpeg'
+      else if Ext = '.png' then
+        FContentType := 'image/png'
+      else if Ext = '.gif' then
+        FContentType := 'image/gif'
+      else
+        FContentType := 'application/octet-stream';
     end;
   except
     on E: Exception do
@@ -401,9 +415,9 @@ begin
     CleanupTempFile;
   finally
     try
-      FHeaders.Free;
-      FMultipartParts.Free;
-      FInMemoryFiles.Free;
+      FreeAndNil(FHeaders);
+      FreeAndNil(FMultipartParts);
+      FreeAndNil(FInMemoryFiles);
       SetLength(FHeadersData, 0);
       SetLength(FContentBytes, 0);
     finally
@@ -461,6 +475,8 @@ begin
       try
         FTempFileStream.Free;
       except
+        on E: Exception do
+          Logger.Warn('Failed to free temp file stream: ' + E.Message);
       end;
       FTempFileStream := nil;
     end;
@@ -470,10 +486,14 @@ begin
       try
         TFile.Delete(FTempFilePath);
       except
+        on E: Exception do
+          Logger.Warn(Format('Failed to delete temp file "%s": %s', [FTempFilePath, E.Message]));
       end;
       FTempFilePath := '';
     end;
   except
+    on E: Exception do
+      Logger.Warn('Error in CleanupTempFile: ' + E.Message);
   end;
 end;
 
@@ -1283,7 +1303,10 @@ begin
     FinalizeContent;
     FMultipartBuilt := True;
     var stomod := '';
-    if FStorageMode = csmMemory then stomod := 'Memory' else stomod := 'File';
+    if FStorageMode = csmMemory then
+      stomod := 'Memory'
+    else
+      stomod := 'File';
   except
     on E: Exception do
     begin
@@ -1318,22 +1341,43 @@ begin
         FinalHeaders.Insert(1, 'Content-Length: ' + IntToStr(FTotalContentSize))
       else
         FinalHeaders.Insert(1, 'Content-Length: 0');
-      if FinalHeaders.IndexOfName('Server') = -1 then
+      var HasServer: Boolean := False;
+      var HasDate: Boolean := False;
+      var HasConnection: Boolean := False;
+      var HasHSTS: Boolean := False;
+      for I := 0 to FinalHeaders.Count - 1 do
+      begin
+        if StartsText('Server:', FinalHeaders[I]) then
+          HasServer := True
+        else if StartsText('Date:', FinalHeaders[I]) then
+          HasDate := True
+        else if StartsText('Connection:', FinalHeaders[I]) then
+          HasConnection := True
+        else if StartsText('Strict-Transport-Security:', FinalHeaders[I]) then
+          HasHSTS := True;
+      end;
+      if not HasServer then
          FinalHeaders.Add('Server: GHttpsServerIOCP/2.0');
-      if FinalHeaders.IndexOfName('Date') = -1 then
-         FinalHeaders.Add('Date: ' + FormatDateTime('ddd, dd mmm yyyy hh:nn:ss', Now, TFormatSettings.Create('en-US')) + ' GMT');
-      if FinalHeaders.IndexOfName('Connection') = -1 then
-         FinalHeaders.Add('Connection: close');
-      if FinalHeaders.IndexOfName('Strict-Transport-Security') = -1 then
+      if not HasDate then
+         FinalHeaders.Add('Date: ' + FormatDateTime('ddd, dd mmm yyyy hh:nn:ss" GMT"', Now, TFormatSettings.Invariant));
+      if not HasConnection then
+      begin
+        if FKeepAlive then
+        begin
+          FinalHeaders.Add('Connection: keep-alive');
+          FinalHeaders.Add('Keep-Alive: timeout=5, max=1000');
+        end
+        else
+          FinalHeaders.Add('Connection: close');
+      end;
+      if not HasHSTS then
          FinalHeaders.Add('Strict-Transport-Security: max-age=31536000; includeSubDomains; preload');
       HeaderBuilder := TStringBuilder.Create;
       try
         StatusText := GetStatusText(FStatus);
         HeaderBuilder.AppendFormat('HTTP/1.1 %d %s'#13#10, [Integer(FStatus), StatusText]);
         for I := 0 to FinalHeaders.Count - 1 do
-        begin
           HeaderBuilder.AppendLine(FinalHeaders[I]);
-        end;
         HeaderBuilder.AppendLine;
         FHeadersData := TEncoding.UTF8.GetBytes(HeaderBuilder.ToString);
         FHeadersBuilt := True;
@@ -1681,6 +1725,32 @@ begin
   except
     on E: Exception do
       raise Exception.CreateFmt('Failed to set permanent redirect: %s', [E.Message]);
+  end;
+end;
+
+function TResponse.GetBodyBytes: TBytes;
+var
+  Stream: TMemoryStream;
+  Buffer: array[0..65535] of Byte;
+  ReadBytes: Integer;
+begin
+  FinalizeContent;
+  FHeadersSent := True; // Ignore raw HTTP/1.1 header block!
+  Stream := TMemoryStream.Create;
+  try
+    repeat
+      ReadBytes := ReadNextChunk(@Buffer[0], SizeOf(Buffer));
+      if ReadBytes > 0 then
+        Stream.WriteBuffer(Buffer[0], ReadBytes);
+    until ReadBytes <= 0;
+    SetLength(Result, Stream.Size);
+    if Stream.Size > 0 then
+    begin
+      Stream.Position := 0;
+      Stream.ReadBuffer(Result[0], Stream.Size);
+    end;
+  finally
+    Stream.Free;
   end;
 end;
 

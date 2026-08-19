@@ -1,7 +1,7 @@
 {
   MIT License
 
-  Copyright (c) (c) 2025 GECKO-71
+  Copyright (c) (c) 2026 GECKO-71
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -46,7 +46,15 @@ uses
   GRequestBody in 'src\GRequestBody.pas',
   GResponse in 'src\GResponse.pas',
   OverlappedExPool in 'src\OverlappedExPool.pas',
-  WinApiAdditions in 'src\WinApiAdditions.pas';
+  WinApiAdditions in 'src\WinApiAdditions.pas',
+  WinApi.MsQuic in 'Http3Delphi\WinApi.MsQuic.pas',
+  Net.MsQuic in 'Http3Delphi\Net.MsQuic.pas',
+  Net.Http3Frames in 'Http3Delphi\Net.Http3Frames.pas',
+  Net.QPACK.Huffman in 'Http3Delphi\Net.QPACK.Huffman.pas',
+  Net.QPACK in 'Http3Delphi\Net.QPACK.pas',
+  Net.Http3Request in 'Http3Delphi\Net.Http3Request.pas',
+  Net.Http3Response in 'Http3Delphi\Net.Http3Response.pas',
+  Net.Http3Server in 'Http3Delphi\Net.Http3Server.pas';
 
 procedure ConfigureFastMM;
 begin
@@ -68,9 +76,8 @@ begin
   BaseDir := TPath.Combine(ExtractFilePath(ParamStr(0)), ASubDir);
   FullFilePath := TPath.Combine(BaseDir, AFileName);
   if TFile.Exists(FullFilePath) then
-  begin
     Exit;
-  end;
+
   try
     if not TDirectory.Exists(BaseDir) then
       TDirectory.CreateDirectory(BaseDir);
@@ -82,13 +89,10 @@ begin
       NumWrites := AFileSizeInBytes div BufferSize;
       RemainingBytes := AFileSizeInBytes mod BufferSize;
       for i := 1 to NumWrites do
-      begin
         FileStream.WriteBuffer(Buffer[0], BufferSize);
-      end;
+
       if RemainingBytes > 0 then
-      begin
         FileStream.WriteBuffer(Buffer[0], RemainingBytes);
-      end;
     finally
       FileStream.Free;
     end;
@@ -103,44 +107,245 @@ begin
   end;
 end;
 
+procedure PrintUsage;
+begin
+  Writeln('================================================================');
+  Writeln('  GHttpsIOCPSvr - High Performance Hybrid IOCP Server');
+  Writeln('  Supported Protocols: HTTP/1.1, HTTPS (TLS 1.3/1.2), HTTP/3 QUIC');
+  Writeln('================================================================');
+  Writeln('COMMAND LINE SWITCHES (CLI):');
+  Writeln('  -mode:http | dual | https     Select operating mode (default: dual)');
+  Writeln('                                 http:  Plain HTTP/1.1 only (no SSL certificate required)');
+  Writeln('                                 dual:  Simultaneous HTTP + HTTPS on two separate ports');
+  Writeln('                                 https: HTTPS (TLS 1.3/1.2) + HTTP/3 only');
+  Writeln('  -httpport:<port>              Port for plaintext HTTP (default: 8080)');
+  Writeln('  -httpsport:<port>             Port for encrypted HTTPS TLS (default: 8443)');
+  Writeln('  -redirect                     Automatically redirect plain HTTP to HTTPS (301)');
+  Writeln('  -keepalive / -nokeepalive     Enable or disable persistent Keep-Alive connections');
+  Writeln('  -nolog                        Disable all logging (maximum performance)');
+  Writeln('  -certstore:<name>             Windows Certificate Store name (default: GHttpsIOCPSvr)');
+  Writeln('  -subject:<name>               TLS Certificate Subject name (default: localhost)');
+  Writeln('  -help / -h / -?               Display this help message');
+  Writeln('----------------------------------------------------------------');
+  Writeln('SERVER CONTROL:');
+  Writeln('  [ENTER]                       Graceful server shutdown');
+  Writeln('================================================================');
+end;
+
 const
    DOWNLOAD_DIR = 'download';
    DOWNLAD_FILE = 'largefile_10mb.bin';
 
 begin
+  if FindCmdLineSwitch('help', True) or FindCmdLineSwitch('h', True) or
+     FindCmdLineSwitch('?', True) or FindCmdLineSwitch('-help', True) then
+  begin
+    PrintUsage;
+    Exit;
+  end;
+
   PrepareTestFile(DOWNLOAD_DIR, DOWNLAD_FILE, 10 * 1024 * 1024);
   ConfigureFastMM;
   try
+    var LoggingDisabled := FindCmdLineSwitch('nolog', True) or
+                           FindCmdLineSwitch('disable-log', True) or
+                           FindCmdLineSwitch('no-log', True);
+
+    Logger.WaitForFlushBeforeExit := 60;
     Logger.Providers.Add(GlobalLogFileProvider);
     Logger.Providers.Add(GlobalLogConsoleProvider);
+
     var AFileName := '.\Log';
-    if not TDirectory.Exists(AFileName) then
+    if (not LoggingDisabled) and (not TDirectory.Exists(AFileName)) then
        TDirectory.CreateDirectory(AFileName);
 
     with GlobalLogFileProvider do
-   	begin
+    begin
       FileName := AFileName + '\Logger.log';
       DailyRotate := True;
       MaxFileSizeInMB := 50;
       LogLevel := LOG_ALL;
-    	Enabled := True;
-  	end;
+      Enabled := not LoggingDisabled;
+    end;
     with GlobalLogConsoleProvider do
     begin
-    	LogLevel := LOG_DEBUG;
-        ShowEventColors := True;
-        Enabled := True;
+      LogLevel := LOG_DEBUG;
+      ShowEventColors := True;
+      Enabled := not LoggingDisabled;
     end;
-    Writeln('If you don''t have an existing certificate,');
-    Writeln('this command generates a self-signed X.509 certificate for localhost to enable secure');
-    Writeln('HTTPS communication for testing purposes on a local server.');
-    Writeln('MakeCert.exe -r -pe -n "CN=localhost" -ss GHttpsIOCPSvr -a sha256 -sky exchange -sp "Microsoft Enhanced RSA and AES Cryptographic Provider" -sy 24');
-    Logger.Info('====================================');
-    Logger.Info('');
-    var Server := TGHttpsServerIOCP.Create(8443, 'localhost', 'GHttpsIOCPSvr');
+
+    var CertStoreName: string := 'GHttpsIOCPSvr';
+    var SubjectNameParam: string := 'localhost';
+    var KeepAliveParam := not (FindCmdLineSwitch('nokeepalive', True) or
+                               FindCmdLineSwitch('no-keepalive', True) or
+                               FindCmdLineSwitch('disable-keepalive', True));
+
+    if FindCmdLineSwitch('keepalive', True) or
+       FindCmdLineSwitch('keep-alive', True) or
+       FindCmdLineSwitch('enable-keepalive', True) then
+      KeepAliveParam := True;
+
+    var HttpsPortParam: Word := 8443;
+    var HttpPortParam: Word := 8080;
+    var HttpActionParam: THttpActionOnDualMode := haServeNormally;
+
+    var ParamIdx: Integer;
+    for ParamIdx := 1 to ParamCount do
+    begin
+      var Param := ParamStr(ParamIdx);
+      if (Length(Param) > 1) and ((Param[1] = '-') or (Param[1] = '/')) then
+      begin
+        var CleanParam := Copy(Param, 2, MaxInt);
+        var Key := CleanParam;
+        var Val := '';
+        var SepPos := Pos(':', CleanParam);
+        if SepPos = 0 then SepPos := Pos('=', CleanParam);
+        if SepPos > 0 then
+        begin
+          Key := Copy(CleanParam, 1, SepPos - 1);
+          Val := Copy(CleanParam, SepPos + 1, MaxInt);
+        end
+        else if (ParamIdx < ParamCount) and (Length(ParamStr(ParamIdx + 1)) > 0) and (not ((ParamStr(ParamIdx + 1)[1] = '-') or (ParamStr(ParamIdx + 1)[1] = '/'))) then
+        begin
+          Val := ParamStr(ParamIdx + 1);
+        end;
+
+        if SameText(Key, 'mode') then
+        begin
+          if SameText(Val, 'http') or SameText(Val, 'httponly') then
+          begin
+            HttpsPortParam := 0;
+            if HttpPortParam = 0 then HttpPortParam := 8080;
+          end
+          else if SameText(Val, 'https') or SameText(Val, 'httpsonly') then
+          begin
+            HttpsPortParam := 8443;
+            HttpPortParam := 0;
+          end
+          else if SameText(Val, 'dual') or SameText(Val, 'dualstack') then
+          begin
+            if HttpsPortParam = 0 then HttpsPortParam := 8443;
+            if HttpPortParam = 0 then HttpPortParam := 8080;
+          end;
+        end
+        else if SameText(Key, 'httponly') or SameText(Key, 'http-only') then
+        begin
+          HttpsPortParam := 0;
+          if HttpPortParam = 0 then HttpPortParam := 8080;
+        end
+        else if SameText(Key, 'httpsonly') or SameText(Key, 'https-only') then
+        begin
+          HttpPortParam := 0;
+          if HttpsPortParam = 0 then HttpsPortParam := 8443;
+        end
+        else if SameText(Key, 'port') or SameText(Key, 'httpsport') or SameText(Key, 'https-port') then
+        begin
+          if Length(Val) > 0 then HttpsPortParam := StrToIntDef(Val, HttpsPortParam);
+        end
+        else if SameText(Key, 'httpport') or SameText(Key, 'http-port') then
+        begin
+          if Length(Val) > 0 then HttpPortParam := StrToIntDef(Val, HttpPortParam);
+        end
+        else if SameText(Key, 'certstore') or SameText(Key, 'cert-store') or SameText(Key, 'store') then
+        begin
+          if Length(Val) > 0 then CertStoreName := Val;
+        end
+        else if SameText(Key, 'subject') or SameText(Key, 'cert') then
+        begin
+          if Length(Val) > 0 then SubjectNameParam := Val;
+        end
+        else if SameText(Key, 'redirect') or SameText(Key, 'redirect-to-https') then
+        begin
+          HttpActionParam := haRedirectToHttps;
+        end;
+      end;
+    end;
+
+    Logger.Info('================================================================');
+    Logger.Info('  GHttpsIOCPSvr - High Performance Hybrid IOCP Server');
+    Logger.Info('  Protocols: HTTP/1.1, HTTPS (TLS 1.3/1.2), HTTP/3 QUIC');
+    Logger.Info('================================================================');
+    Logger.Info('SERVER CONTROL:');
+    Logger.Info('  Press [ENTER] in this console window to gracefully shut down.');
+    Logger.Info('----------------------------------------------------------------');
+    Logger.Info('ACTIVE CONFIGURATION:');
+    if (HttpsPortParam > 0) and (HttpPortParam > 0) then
+      Logger.Info('  Mode:            DUAL-STACK (Simultaneous HTTP + HTTPS)')
+    else if HttpsPortParam > 0 then
+      Logger.Info('  Mode:            HTTPS-ONLY (TLS 1.3/1.2 SChannel + HTTP/3)')
+    else
+      Logger.Info('  Mode:            HTTP-ONLY (Plaintext, No SSL certificate required)');
+    Logger.Info(Format('  HTTPS Port:      %d', [HttpsPortParam]));
+    Logger.Info(Format('  HTTP Port:       %d', [HttpPortParam]));
+    Logger.Info(Format('  HTTP->HTTPS 301: %s', [BoolToStr(HttpActionParam = haRedirectToHttps, True)]));
+    Logger.Info(Format('  Keep-Alive:      %s', [BoolToStr(KeepAliveParam, True)]));
+    Logger.Info(Format('  Cert Store:      %s (Subject: %s)', [CertStoreName, SubjectNameParam]));
+    Logger.Info('----------------------------------------------------------------');
+    Logger.Info('CLI SWITCHES GUIDE:');
+    Logger.Info('  -mode:http|dual|https  -httpport:<port>  -httpsport:<port>');
+    Logger.Info('  -redirect              -keepalive|-nokeepalive  -nolog');
+    Logger.Info('  -certstore:<name>      -subject:<name>          -help');
+    Logger.Info('================================================================');
+    Logger.Info('Starting server...');
+
+    var Server := TGHttpsServerIOCP.Create(HttpsPortParam, SubjectNameParam,
+                               CertStoreName,
+                               'Abcd1234Efgh5678Ijkl9012Mnop3456Qrst7890Uvwx1234Yz!',
+                               2000,
+                               1000000,
+                               DEFAULT_MAX_REQUEST_HEDER_SIZE,
+                               DEFAULT_MAX_REQUEST_SIZE,
+                               DEFAULT_MAX_RESPONSE_SIZE,
+                               DEFAULT_CHUNK_SIZE,
+                               50,
+                               85,
+                               True,
+                               KeepAliveParam,
+                               HttpPortParam,
+                               HttpActionParam);
     try
       Server.SetSSLShutdownOptions(True, 200);
-      ///////////////////////////////////////////////////
+      Server.EnableKeepAlive := KeepAliveParam;
+      Server.EnableHttp3 := True;
+
+      Server.RegisterEndpointProc('/status', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        var
+          Json: TJSONObject;
+        begin
+          Json := TJSONObject.Create;
+          try
+            Json.AddPair('status', 'ok');
+            Json.AddPair('time', FormatDateTime('yyyy-mm-dd hh:nn:ss', Now));
+            Json.AddPair('server', 'GHttpsIOCPSvr-Hybrid');
+            Json.AddPair('keepalive', TJSONBool.Create(AServer.EnableKeepAlive));
+            AResponse.AddJSONContent(Json.ToJSON);
+          finally
+            Json.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc('/api/protocol', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        var
+          Json: TJSONObject;
+        begin
+          Json := TJSONObject.Create;
+          try
+            Json.AddPair('protocol', 'HTTP/1.1');
+            Json.AddPair('server', 'GHttpsIOCPSvr');
+            AResponse.AddJSONContent(Json.ToJSON);
+          finally
+            Json.Free;
+          end;
+        end
+      );
+
       Server.RegisterEndpointProc('/', hmGET,
       procedure(Sender: TObject; const ARequest: TRequest;
                                  const AResponse: TResponse;
@@ -157,7 +362,7 @@ begin
             '<style>body { font-family: sans-serif; text-align: center; padding-top: 5em; color: #444; }</style>' +
           '</head>' +
           '<body>' +
-            '<h1>HTTPS IOCP Server is Running</h1>' +
+            '<h1>GHttpsIOCPSvr Hybrid Server is Running</h1>' +
             '<p>Connection successful. The server is operational.</p>' +
             '<p>Server time is: %s UTC</p>' +
           '</body>' +
@@ -166,10 +371,10 @@ begin
         );
         AResponse.AddHTMLContent(Html);
       end);
-      ///////////////////////////////////////////////////
+
       Server.RegisterEndpointProc('/login', hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest;
-                                   const AResponse: TResponse                                   ;
+                                   const AResponse: TResponse;
                                    AServer:TGHttpsServerIOCP)
         var
           RequestBody: string;
@@ -211,7 +416,7 @@ begin
                     try
                       JsonResponse.AddPair('token_type', TJSONString.Create('Bearer'));
                       JsonResponse.AddPair('access_token', TJSONString.Create(Token));
-                      JsonResponse.AddPair('expires_in', TJSONNumber.Create(AServer.JWTManager.TokenExpiration * 60)); // w sekundach
+                      JsonResponse.AddPair('expires_in', TJSONNumber.Create(AServer.JWTManager.TokenExpiration * 60));
                       AResponse.AddJSONContent(JsonResponse.ToJSON);
                     finally
                       JsonResponse.Free;
@@ -221,7 +426,6 @@ begin
                   begin
                     AResponse.SetInternalServerError('Failed to generate JWT token.');
                   end;
-
                 finally
                   CustomClaims.Free;
                 end;
@@ -242,7 +446,7 @@ begin
           end;
         end
       );
-      ///////////////////////////////////////////////////
+
       Server.RegisterEndpointProc('/echo', hmGET,
         procedure(Sender: TObject; const ARequest: TRequest;
                                    const AResponse: TResponse;
@@ -260,7 +464,7 @@ begin
           AResponse.SetStatus(200);
           AResponse.AddTextContent('text/html; charset=utf-8', ResponseStr);
         end, atNone);
-      ///////////////////////////////////////////////////
+
       Server.RegisterEndpointProc('/echojson', hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest;
                                    const AResponse: TResponse;
@@ -297,13 +501,13 @@ begin
               begin
                 AResponse.SetInternalServerError('An unexpected error occurred: ' + E.Message);
               end;
-            end
+            end;
           finally
             if Assigned(JsonValue) then
               JsonValue.Free;
           end;
         end, atJWTBearer);
-      //////////////////////////////////////////////////////
+
       Server.RegisterEndpointProc('/large', hmGET,
       procedure(Sender: TObject; const ARequest: TRequest;
                                  const AResponse: TResponse;
@@ -326,7 +530,7 @@ begin
           end;
         end;
       end);
-      //////////////////////////////////////////////////////
+
       Server.RegisterEndpointProc('/upload', hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest;
                                  const AResponse: TResponse;
@@ -346,10 +550,10 @@ begin
           UploadDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'uploads');
           SavedFilesCount := 0;
           HasErrors := False;
-         JsonRoot := TJSONObject.Create;
+          JsonRoot := TJSONObject.Create;
           JsonFilesArray := TJSONArray.Create;
           JsonFieldsArray := TJSONArray.Create;
-           try
+          try
             if not TDirectory.Exists(UploadDir) then
                TDirectory.CreateDirectory(UploadDir);
             if ARequest.BodyPartCount > 0 then
@@ -424,10 +628,55 @@ begin
           end;
         end
       );
-      ///////////////////////////////////////////////////////////////////////////
+
+      Server.RegisterEndpointProc('/api/metrics', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        var
+          MetricsJson: TJSONObject;
+        begin
+          MetricsJson := TJSONObject.Create;
+          try
+            MetricsJson.AddPair('pool_count', TJSONNumber.Create(AServer.OverlappedPool.Count));
+            MetricsJson.AddPair('total_created', TJSONNumber.Create(AServer.OverlappedPool.TotalCreated));
+            MetricsJson.AddPair('active_connections', TJSONNumber.Create(AServer.ActiveConnections));
+            AResponse.AddJSONContent(MetricsJson.ToJSON);
+          finally
+            MetricsJson.Free;
+          end;
+        end
+      );
+
       Server.Start;
-      Logger.Info('Server running. Press Enter to stop...');
-      Readln;
+      if not Server.Running then
+      begin
+        Logger.Error('CRITICAL: Server startup failed (e.g. missing certificate). Exiting application.');
+        ExitCode := 1;
+        Exit;
+      end;
+
+      Logger.Info('================================================================');
+      Logger.Info('  SERVER STARTED SUCCESSFULLY AND READY FOR TRAFFIC');
+      Logger.Info('================================================================');
+      if HttpsPortParam > 0 then
+      begin
+        Logger.Info(Format('  [HTTPS TLS]   https://localhost:%d/status', [HttpsPortParam]));
+        Logger.Info(Format('  [HTTP/3 QUIC] UDP Port %d (Alt-Svc h3 enabled)', [HttpsPortParam]));
+      end;
+      if HttpPortParam > 0 then
+      begin
+        Logger.Info(Format('  [HTTP Plain]  http://localhost:%d/status', [HttpPortParam]));
+      end;
+      Logger.Info('----------------------------------------------------------------');
+      Logger.Info('  CONTROL: Press [ENTER] in console window to gracefully stop the server.');
+      Logger.Info('================================================================');
+
+      try
+        Readln;
+      except
+        on E: EInOutError do ;
+      end;
       Server.Stop;
     finally
       Server.Free;
@@ -436,9 +685,8 @@ begin
   except
     on E: Exception do
     begin
+      Writeln('Error: ' + E.ClassName +  ': ' + E.Message);
       Logger.Error('Error: ' + E.ClassName +  ': ' + E.Message);
-      Logger.Info('Press Enter to finish...');
-      Readln;
     end;
   end;
 end.

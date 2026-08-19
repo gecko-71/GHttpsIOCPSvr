@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DEMO 05: HTTP/3 QUIC Speed Server</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo">GHttpsIOCP HTTP/3 QUIC Engine</div>
+      <div class="status-badge">HTTP/3 ALPN ACTIVE</div>
+    </header>
+
+    <main class="main-card">
+      <div class="card">
+        <h2>HTTP/3 Ping & Negotiation</h2>
+        <div class="button-grid">
+          <button id="btnPing" class="btn btn-primary">Ping /api/http3/ping</button>
+          <button id="btnBenchmark" class="btn btn-secondary">Run Benchmark /api/http3/benchmark</button>
+        </div>
+      </div>
+
+      <div class="card full-width">
+        <h2>HTTP/3 Response & Latency Log</h2>
+        <pre id="outputLog">System ready. Click ping or benchmark above to test QUIC dual-stack latency.</pre>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div>GHttpsIOCPSvr DEMO 05 &copy; 2026 GECKO-71</div>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

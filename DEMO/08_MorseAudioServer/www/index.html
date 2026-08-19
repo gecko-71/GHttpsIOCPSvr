@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DEMO 08: Morse Audio Radio Stream Server</title>
+  <link rel="stylesheet" href="/style.css?v=100">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo">GHttpsIOCP Morse Audio Radio Server</div>
+      <div class="status-badge" id="liveBadge">LIVE BROADCAST</div>
+    </header>
+
+    <!-- Main Content Grid -->
+    <main class="main-card">
+
+
+      <!-- Live Broadcast Monitor Card -->
+      <div class="card card-highlight">
+
+
+        <div class="broadcast-box">
+          <div class="broadcast-text-scroll" id="broadcastText"></div>
+          <div class="live-info">
+            <div>Current Char: <b id="currentChar" class="accent-text">-</b></div>
+            <div>Symbol: <b id="currentSymbol" class="accent-text">-</b></div>
+            <div>Element: <b id="currentElement" class="accent-text">-</b></div>
+            <div>Active Listeners: <b id="activeListeners" class="accent-text">1</b></div>
+          </div>
+        </div>
+
+        <div class="visualizer-container">
+          <div class="tape-box">
+            <canvas id="morseTapeCanvas" width="900" height="60"></canvas>
+          </div>
+        </div>
+
+        <div class="btn-group">
+          <button class="btn btn-play" id="btnStart">Start Radio</button>
+          <button class="btn btn-stop" id="btnStop">Stop Radio</button>
+        </div>
+      </div>
+
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <div>GHttpsServerIOCP DEMO 08 &copy; 2026 GECKO-71</div>
+    </footer>
+  </div>
+
+  <script src="/app.js?v=100"></script>
+</body>
+</html>

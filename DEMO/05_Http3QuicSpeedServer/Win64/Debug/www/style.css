@@ -1,0 +1,68 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+  background: #0f172a;
+  color: #f8fafc;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 20px;
+}
+
+.container {
+  width: 100%;
+  max-width: 800px;
+  background: #1e293b;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  border: 1px solid #334155;
+  overflow: hidden;
+}
+
+.header {
+  background: #0284c7;
+  color: #ffffff;
+  padding: 20px 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.logo { font-size: 1.2rem; font-weight: 700; }
+.status-badge { background: #0369a1; padding: 6px 14px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; }
+
+.main-card { padding: 30px; display: grid; gap: 25px; }
+
+.card { background: #0f172a; border-radius: 8px; padding: 20px; border: 1px solid #334155; }
+h2 { font-size: 1.1rem; margin-bottom: 15px; color: #38bdf8; }
+
+.button-grid { display: flex; gap: 15px; }
+.btn { padding: 12px 20px; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; }
+.btn-primary { background: #38bdf8; color: #0f172a; }
+.btn-secondary { background: #818cf8; color: #0f172a; }
+
+pre {
+  background: #020617;
+  color: #4ade80;
+  padding: 16px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  height: 160px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+.footer {
+  background: #0f172a;
+  border-top: 1px solid #334155;
+  padding: 14px 30px;
+  font-size: 0.85rem;
+  color: #94a3b8;
+  text-align: center;
+}

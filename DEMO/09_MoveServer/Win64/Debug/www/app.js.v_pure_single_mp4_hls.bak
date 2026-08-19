@@ -1,0 +1,231 @@
+// DEMO 09: Professional HLS (HTTP Live Streaming) Client with hls.js
+
+let hls = null;
+let ws = null;
+let isServerOnline = false;
+
+let sessionStartTimestamp = null;
+let sessionTimer = null;
+
+// DOM Elements
+const video = document.getElementById('moviePlayer');
+const liveBadge = document.getElementById('liveBadge');
+const liveWatermark = document.getElementById('liveWatermark');
+const offlineOverlay = document.getElementById('offlineOverlay');
+const activeViewers = document.getElementById('activeViewers');
+const streamStateVal = document.getElementById('streamStateVal');
+const uptimeVal = document.getElementById('uptimeVal');
+const userSessionVal = document.getElementById('userSessionVal');
+const sessionTimeDisplay = document.getElementById('sessionTimeDisplay');
+const btnPlayPause = document.getElementById('btnPlayPause');
+const btnSyncLive = document.getElementById('btnSyncLive');
+const btnFullscreen = document.getElementById('btnFullscreen');
+
+function formatUptime(seconds) {
+  if (isNaN(seconds) || seconds < 0) seconds = 0;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function updateSessionTimer() {
+  if (!sessionStartTimestamp || !isServerOnline) return;
+  const elapsedSec = Math.floor((Date.now() - sessionStartTimestamp) / 1000);
+  const formatted = formatUptime(elapsedSec);
+  if (sessionTimeDisplay) sessionTimeDisplay.innerText = formatted;
+  if (userSessionVal) userSessionVal.innerText = formatted;
+}
+
+function setServerState(online) {
+  isServerOnline = online;
+
+  if (online) {
+    if (liveBadge) {
+      liveBadge.innerHTML = 'LIVE BROADCAST';
+      liveBadge.className = 'status-badge status-live';
+    }
+    if (liveWatermark) liveWatermark.classList.remove('hidden');
+    if (offlineOverlay) offlineOverlay.classList.add('hidden');
+    if (btnPlayPause) {
+      btnPlayPause.disabled = false;
+      btnPlayPause.innerText = 'Pause';
+      btnPlayPause.classList.add('active');
+    }
+    if (btnSyncLive) btnSyncLive.disabled = false;
+    if (streamStateVal) {
+      streamStateVal.innerText = 'LIVE HLS BROADCAST';
+      streamStateVal.className = 'm-val highlight-green';
+    }
+
+    if (!sessionStartTimestamp) {
+      sessionStartTimestamp = Date.now();
+    }
+    if (!sessionTimer) {
+      sessionTimer = setInterval(updateSessionTimer, 1000);
+    }
+  } else {
+    if (liveBadge) {
+      liveBadge.innerHTML = 'STREAM OFFLINE';
+      liveBadge.className = 'status-badge status-offline';
+    }
+    if (liveWatermark) liveWatermark.classList.add('hidden');
+    if (offlineOverlay) offlineOverlay.classList.remove('hidden');
+    if (btnPlayPause) {
+      btnPlayPause.disabled = true;
+      btnPlayPause.innerText = 'Pause';
+      btnPlayPause.classList.remove('active');
+    }
+    if (btnSyncLive) btnSyncLive.disabled = true;
+    if (streamStateVal) {
+      streamStateVal.innerText = 'OFFLINE (NO SIGNAL)';
+      streamStateVal.className = 'm-val highlight';
+    }
+
+    if (video) {
+      video.pause();
+    }
+
+    if (uptimeVal) uptimeVal.innerText = '--:--:--';
+    if (activeViewers) activeViewers.innerText = '0';
+  }
+}
+
+function initHlsPlayer() {
+  const streamUrl = '/live/stream.m3u8';
+
+  if (window.Hls && Hls.isSupported()) {
+    if (hls) {
+      hls.destroy();
+    }
+
+    hls = new Hls({
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 4,
+      enableWorker: true,
+      lowLatencyMode: true,
+      backBufferLength: 10
+    });
+
+    hls.loadSource(streamUrl);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      setServerState(true);
+      video.play().catch(() => {});
+    });
+
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (data.fatal) {
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            hls.recoverMediaError();
+            break;
+          default:
+            setServerState(false);
+            setTimeout(initHlsPlayer, 2000);
+            break;
+        }
+      }
+    });
+  } else if (video && video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native Safari / iOS HLS support
+    video.src = streamUrl;
+    video.addEventListener('loadedmetadata', () => {
+      setServerState(true);
+      video.play().catch(() => {});
+    });
+  }
+}
+
+function connectTelemetryWebSocket() {
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsProtocol}//${window.location.host}/status-ws`;
+
+  try {
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      setServerState(true);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.active_viewers !== undefined && activeViewers) {
+          activeViewers.innerText = data.active_viewers;
+        }
+        if (data.uptime_sec !== undefined && uptimeVal) {
+          uptimeVal.innerText = formatUptime(data.uptime_sec);
+        }
+      } catch (e) {
+        console.error('Error parsing telemetry JSON:', e);
+      }
+    };
+
+    ws.onclose = () => {
+      setServerState(false);
+      setTimeout(connectTelemetryWebSocket, 2000);
+    };
+
+    ws.onerror = () => {
+      setServerState(false);
+    };
+  } catch (e) {
+    setServerState(false);
+  }
+}
+
+// Controls Bar Handlers
+if (btnPlayPause) {
+  btnPlayPause.addEventListener('click', () => {
+    if (!video || !isServerOnline) return;
+    if (video.paused) {
+      video.play();
+      btnPlayPause.innerText = 'Pause';
+      btnPlayPause.classList.add('active');
+    } else {
+      video.pause();
+      btnPlayPause.innerText = 'Play';
+      btnPlayPause.classList.remove('active');
+    }
+  });
+}
+
+if (btnSyncLive) {
+  btnSyncLive.addEventListener('click', () => {
+    if (!video || !isServerOnline) return;
+    if (video.seekable && video.seekable.length > 0) {
+      video.currentTime = video.seekable.end(video.seekable.length - 1);
+    }
+    if (video.paused) {
+      video.play().catch(() => {});
+      if (btnPlayPause) {
+        btnPlayPause.innerText = 'Pause';
+        btnPlayPause.classList.add('active');
+      }
+    }
+  });
+}
+
+if (btnFullscreen) {
+  btnFullscreen.addEventListener('click', () => {
+    const container = document.querySelector('.video-container');
+    if (!container) return;
+    if (!document.fullscreenElement) {
+      container.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+    }
+  });
+}
+
+// Inicjalizacja HLS i telemetrii po załadowaniu DOM
+window.addEventListener('DOMContentLoaded', () => {
+  setServerState(false);
+  initHlsPlayer();
+  connectTelemetryWebSocket();
+});

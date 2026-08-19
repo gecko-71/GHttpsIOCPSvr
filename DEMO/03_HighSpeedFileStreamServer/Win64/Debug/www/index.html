@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DEMO 03: High-Speed File Stream & Media Server</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo">GHttpsIOCP Media & File Streaming</div>
+      <div class="status-badge">STREAMING ONLINE</div>
+    </header>
+
+    <main class="main-card">
+      <div class="card">
+        <h2>HTTP 206 Media Range Streaming</h2>
+        <p class="subtitle">Stream video/audio chunks on demand</p>
+        <div class="button-grid">
+          <button id="btnStreamMedia" class="btn btn-primary">Test GET /api/media/stream (Range 0-1023)</button>
+          <button id="btnDownloadFile" class="btn btn-secondary">Test GET /api/download (Attachment)</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Multipart & Binary File Upload</h2>
+        <p class="subtitle">Upload file payload directly to server</p>
+        <div class="form-group">
+          <input type="file" id="fileInput">
+          <button id="btnUpload" class="btn btn-success">Upload Binary Data</button>
+        </div>
+      </div>
+
+      <div class="card full-width">
+        <h2>Transfer Output Log</h2>
+        <pre id="outputLog">System ready. Select a stream or transfer action above.</pre>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div>GHttpsIOCPSvr DEMO 03 &copy; 2026 GECKO-71</div>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

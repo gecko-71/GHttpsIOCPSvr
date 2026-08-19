@@ -1,0 +1,120 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{88888888-8888-8888-8888-888888888888}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="01_StaticAndSpaServer\D01_StaticAndSpaServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="02_JwtSecurityWafServer\D02_JwtSecurityWafServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="03_HighSpeedFileStreamServer\D03_HighSpeedFileStreamServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="04_WebSocketChatAndTelemetryServer\D04_WebSocketChatAndTelemetryServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="05_Http3QuicSpeedServer\D05_Http3QuicSpeedServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="06_TriProtocolHybridServer\D06_TriProtocolHybridServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="08_MorseAudioServer\D08_MorseAudioServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="09_MoveServer\D09_MoveServer.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="D01_StaticAndSpaServer">
+        <MSBuild Projects="01_StaticAndSpaServer\D01_StaticAndSpaServer.dproj"/>
+    </Target>
+    <Target Name="D01_StaticAndSpaServer:Clean">
+        <MSBuild Projects="01_StaticAndSpaServer\D01_StaticAndSpaServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D01_StaticAndSpaServer:Make">
+        <MSBuild Projects="01_StaticAndSpaServer\D01_StaticAndSpaServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D02_JwtSecurityWafServer">
+        <MSBuild Projects="02_JwtSecurityWafServer\D02_JwtSecurityWafServer.dproj"/>
+    </Target>
+    <Target Name="D02_JwtSecurityWafServer:Clean">
+        <MSBuild Projects="02_JwtSecurityWafServer\D02_JwtSecurityWafServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D02_JwtSecurityWafServer:Make">
+        <MSBuild Projects="02_JwtSecurityWafServer\D02_JwtSecurityWafServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D03_HighSpeedFileStreamServer">
+        <MSBuild Projects="03_HighSpeedFileStreamServer\D03_HighSpeedFileStreamServer.dproj"/>
+    </Target>
+    <Target Name="D03_HighSpeedFileStreamServer:Clean">
+        <MSBuild Projects="03_HighSpeedFileStreamServer\D03_HighSpeedFileStreamServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D03_HighSpeedFileStreamServer:Make">
+        <MSBuild Projects="03_HighSpeedFileStreamServer\D03_HighSpeedFileStreamServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D04_WebSocketChatAndTelemetryServer">
+        <MSBuild Projects="04_WebSocketChatAndTelemetryServer\D04_WebSocketChatAndTelemetryServer.dproj"/>
+    </Target>
+    <Target Name="D04_WebSocketChatAndTelemetryServer:Clean">
+        <MSBuild Projects="04_WebSocketChatAndTelemetryServer\D04_WebSocketChatAndTelemetryServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D04_WebSocketChatAndTelemetryServer:Make">
+        <MSBuild Projects="04_WebSocketChatAndTelemetryServer\D04_WebSocketChatAndTelemetryServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D05_Http3QuicSpeedServer">
+        <MSBuild Projects="05_Http3QuicSpeedServer\D05_Http3QuicSpeedServer.dproj"/>
+    </Target>
+    <Target Name="D05_Http3QuicSpeedServer:Clean">
+        <MSBuild Projects="05_Http3QuicSpeedServer\D05_Http3QuicSpeedServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D05_Http3QuicSpeedServer:Make">
+        <MSBuild Projects="05_Http3QuicSpeedServer\D05_Http3QuicSpeedServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D06_TriProtocolHybridServer">
+        <MSBuild Projects="06_TriProtocolHybridServer\D06_TriProtocolHybridServer.dproj"/>
+    </Target>
+    <Target Name="D06_TriProtocolHybridServer:Clean">
+        <MSBuild Projects="06_TriProtocolHybridServer\D06_TriProtocolHybridServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D06_TriProtocolHybridServer:Make">
+        <MSBuild Projects="06_TriProtocolHybridServer\D06_TriProtocolHybridServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D08_MorseAudioServer">
+        <MSBuild Projects="08_MorseAudioServer\D08_MorseAudioServer.dproj"/>
+    </Target>
+    <Target Name="D08_MorseAudioServer:Clean">
+        <MSBuild Projects="08_MorseAudioServer\D08_MorseAudioServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D08_MorseAudioServer:Make">
+        <MSBuild Projects="08_MorseAudioServer\D08_MorseAudioServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D09_MoveServer">
+        <MSBuild Projects="09_MoveServer\D09_MoveServer.dproj"/>
+    </Target>
+    <Target Name="D09_MoveServer:Clean">
+        <MSBuild Projects="09_MoveServer\D09_MoveServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D09_MoveServer:Make">
+        <MSBuild Projects="09_MoveServer\D09_MoveServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="D01_StaticAndSpaServer;D02_JwtSecurityWafServer;D03_HighSpeedFileStreamServer;D04_WebSocketChatAndTelemetryServer;D05_Http3QuicSpeedServer;D06_TriProtocolHybridServer;D08_MorseAudioServer;D09_MoveServer"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="D01_StaticAndSpaServer:Clean;D02_JwtSecurityWafServer:Clean;D03_HighSpeedFileStreamServer:Clean;D04_WebSocketChatAndTelemetryServer:Clean;D05_Http3QuicSpeedServer:Clean;D06_TriProtocolHybridServer:Clean;D08_MorseAudioServer:Clean;D09_MoveServer:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="D01_StaticAndSpaServer:Make;D02_JwtSecurityWafServer:Make;D03_HighSpeedFileStreamServer:Make;D04_WebSocketChatAndTelemetryServer:Make;D05_Http3QuicSpeedServer:Make;D06_TriProtocolHybridServer:Make;D08_MorseAudioServer:Make;D09_MoveServer:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>

@@ -1,7 +1,7 @@
-{
+﻿{
   MIT License
 
-  Copyright (c) (c) 2025 GECKO-71
+  Copyright (c) (c) 2026 GECKO-71
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -61,7 +61,9 @@ type
                     otRead,
                     otSSLHandshake,
                     otWriteChunk,
-                    otTimeoutClose);
+                    otTimeoutClose,
+                    otWebSocketRead,
+                    otWebSocketWrite);
 
   POverlappedEx = ^TOverlappedEx;
   TOverlappedEx = record
@@ -81,6 +83,13 @@ type
     Request: TRequest;
     Response: TResponse;
     LastActivityTime: UInt64;
+    KeepAliveRequestsCount: Integer;
+    KeepAliveActive: Boolean;
+    IsTLS: Boolean;
+    ListenerPort: Word;
+    WebSocketSession: TObject;
+    WebSocketState: Integer;
+    InPool: LongInt;
   end;
 
 
@@ -278,6 +287,19 @@ const
   CERT_FIND_ANY = 0;
   CERT_FIND_SUBJECT_STR = $00080007;
   SCHANNEL_SHUTDOWN = 1;
+  CERT_STORE_PROV_MEMORY = LPCSTR(2);
+  CERT_STORE_PROV_SYSTEM_A = LPCSTR(10);
+  CERT_STORE_READONLY_FLAG = $00008000;
+  CERT_FIND_SUBJECT_STR_W = $00070007;
+  CERT_FIND_SHA1_HASH = $00010000;
+  CERT_STORE_ADD_ALWAYS = 4;
+
+type
+  PCRYPT_DATA_BLOB = ^CRYPT_DATA_BLOB;
+  CRYPT_DATA_BLOB = record
+    cbData: DWORD;
+    pbData: PByte;
+  end;
 
 type
   HCERTSTORE = Pointer;
@@ -303,10 +325,30 @@ function CertFindCertificateInStore(hCertStore: HCERTSTORE; dwCertEncodingType: 
 function CertFreeCertificateContext(pCertContext: PCCERT_CONTEXT): BOOL; stdcall;
   external 'crypt32.dll';
 
+function CertOpenStore(lpszStoreProvider: LPCSTR; dwEncodingType: DWORD;
+  hCryptProv: HCRYPTPROV; dwFlags: DWORD; pvPara: Pointer): HCERTSTORE; stdcall;
+  external 'crypt32.dll';
+
+function CertDuplicateCertificateContext(pCertContext: PCCERT_CONTEXT): PCCERT_CONTEXT; stdcall;
+  external 'crypt32.dll';
+
 function CertGetNameString(pCertContext: PCCERT_CONTEXT; dwType: DWORD;
   dwFlags: DWORD; pvTypePara: Pointer; pszNameString: PWideChar;
   cchNameString: DWORD): DWORD; stdcall;
   external 'crypt32.dll' name 'CertGetNameStringW';
+
+function CertGetCertificateContextProperty(pCertContext: PCCERT_CONTEXT;
+  dwPropId: DWORD; pvData: Pointer; var pcbData: DWORD): BOOL; stdcall;
+  external 'crypt32.dll';
+
+function CertAddCertificateContextToStore(hCertStore: HCERTSTORE;
+  pCertContext: PCCERT_CONTEXT; dwAddDisposition: DWORD;
+  ppStoreContext: Pointer): BOOL; stdcall;
+  external 'crypt32.dll';
+
+function PFXExportCertStoreEx(hStore: HCERTSTORE; pPFX: PCRYPT_DATA_BLOB;
+  szPassword: LPCWSTR; pvReserved: Pointer; dwFlags: DWORD): BOOL; stdcall;
+  external 'crypt32.dll';
 
 function CryptAcquireCertificatePrivateKey(pCert: PCCERT_CONTEXT; dwFlags: DWORD;
   pvReserved: Pointer; var phCryptProv: HCRYPTPROV; var pdwKeySpec: DWORD;

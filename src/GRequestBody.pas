@@ -1,7 +1,7 @@
-﻿{
+{
   MIT License
 
-  Copyright (c) (c) 2025 GECKO-71
+  Copyright (c) (c) 2026 GECKO-71
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -146,7 +146,7 @@ type
     function AppendData(const Data: array of Byte; Size: Integer): Boolean; virtual; abstract;
     procedure SetContentTypeAndDetectEncoding(const ContentType: string); virtual;
     function IsDataAvailable: Boolean; virtual;
-    function SaveToFile(const FileName: string): Boolean; virtual;
+    function SaveToFile(const FileName: string): Boolean; virtual; abstract;
     function MoveTo(const DestFileName: string): Boolean; virtual; abstract;
     property Name: string read FName write FName;
     property ContentType: string read FContentType write FContentType;
@@ -531,9 +531,7 @@ begin
       end;
     end
     else
-    begin
       TDirectory.CreateDirectory(CurrentDir);
-    end;
   except
     on E: Exception do
     begin
@@ -636,17 +634,13 @@ begin
           end;
         except
           on E: Exception do
-          begin
             Inc(ErrorCount);
-          end;
         end;
       end;
     end;
   except
     on E: Exception do
-    begin
       Logger.Error('Critical error in CleanupAllFiles: %s', [E.Message]);
-    end;
   end;
 end;
 
@@ -691,11 +685,6 @@ begin
   if not Assigned(FHeaders) then
      FHeaders := TStringList.Create;
   FHeaders.Values[HeaderName] := HeaderValue;
-end;
-
-function TBodyPart.SaveToFile(const FileName: string): Boolean;
-begin
-
 end;
 
 function TBodyPart.GetHeader(const HeaderName: string): string;
@@ -1299,9 +1288,7 @@ begin
       FDiskFileStream := nil;
     except
       on E: Exception do
-      begin
         Logger.Info(Format('Error closing disk file stream: %s', [E.Message]));
-      end;
     end;
   end;
 end;
@@ -1357,7 +1344,14 @@ begin
         end;
       end;
     smMemory:
-      ;
+      begin
+        if Assigned(FFileStream) then
+        begin
+          FFileStream.Free;
+          FFileStream := nil;
+        end;
+        FTempFilePath := '';
+      end;
   end;
 end;
 
@@ -1399,7 +1393,14 @@ begin
         end;
       end;
     smMemory:
-      ;
+      begin
+        if Assigned(FFileStream) then
+        begin
+          FFileStream.Free;
+          FFileStream := nil;
+        end;
+        FTempFilePath := '';
+      end;
   end;
 end;
 
@@ -1661,9 +1662,7 @@ begin
         end;
       end
       else if TFile.Exists(FTempFilePath) then
-      begin
-        Result := TFile.ReadAllBytes(FTempFilePath);
-      end
+        Result := TFile.ReadAllBytes(FTempFilePath)
       else
       begin
         FStream.Position := 0;
@@ -1722,16 +1721,12 @@ begin
           end;
         end
         else
-        begin
           FStream.WriteBuffer(Data[0], Size);
-        end;
       end;
       smFile:
       begin
         if Assigned(FFileStream) then
-        begin
-          FFileStream.WriteBuffer(Data[0], Size);
-        end
+          FFileStream.WriteBuffer(Data[0], Size)
         else
         begin
           SetError('File stream not initialized for file streaming mode');
@@ -2069,7 +2064,8 @@ begin
         begin
           HeaderData := Copy(BufferBytes, BufferPos, HeadersEndPos - BufferPos);
           ParsePartHeaders(TEncoding.UTF8.GetString(HeaderData));
-          if FParseState = bpsError then Break;
+          if FParseState = bpsError then
+            Break;
           BufferPos := HeadersEndPos + Length(DOUBLE_CRLF);
           FParseState := bpsParsingContent;
         end else
@@ -2147,9 +2143,7 @@ begin
        FBuffer.Size := RemainingBytes;
     end
     else
-    begin
       FBuffer.Clear;
-    end;
   end;
 end;
 
@@ -2220,9 +2214,7 @@ begin
       TBinaryBodyPart(FCurrentPart).FileName := Filename;
     FParts.Add(FCurrentPart);
   end else
-  begin
     SetError('Failed to create body part from headers.');
-  end;
 end;
 
 function TMultipartBodyPart.CreatePartFromHeaders: TBodyPart;
@@ -2318,13 +2310,9 @@ begin
   Result := nil;
   try
     if Assigned(FMainPart) and (FMainPart is TMultipartBodyPart) then
-    begin
-      Result := TMultipartBodyPart(FMainPart).GetPart(Index);
-    end
+      Result := TMultipartBodyPart(FMainPart).GetPart(Index)
     else if (Index = 0) and Assigned(FMainPart) then
-    begin
-      Result := FMainPart;
-    end;
+      Result := FMainPart
   except
     on E: Exception do
     begin
@@ -2353,18 +2341,12 @@ begin
   Result := nil;
   try
     if Assigned(FMainPart) and (FMainPart is TMultipartBodyPart) then
-    begin
-      Result := TMultipartBodyPart(FMainPart).GetPartByName(Name);
-    end
+      Result := TMultipartBodyPart(FMainPart).GetPartByName(Name)
     else if Assigned(FMainPart) and SameText(FMainPart.Name, Name) then
-    begin
-      Result := FMainPart;
-    end;
+      Result := FMainPart
   except
     on E: Exception do
-    begin
       Logger.Error('Error getting body part by name: ' + E.Message);
-    end;
   end;
 end;
 
@@ -2463,12 +2445,14 @@ begin
     begin
       Inc(BoundaryStart);
       BoundaryEnd := Pos('"', ContentTypeHeader, BoundaryStart);
-      if BoundaryEnd = 0 then BoundaryEnd := Length(ContentTypeHeader) + 1;
+      if BoundaryEnd = 0 then
+        BoundaryEnd := Length(ContentTypeHeader) + 1;
     end
     else
     begin
       BoundaryEnd := Pos(';', ContentTypeHeader, BoundaryStart);
-      if BoundaryEnd = 0 then BoundaryEnd := Length(ContentTypeHeader) + 1;
+      if BoundaryEnd = 0 then
+        BoundaryEnd := Length(ContentTypeHeader) + 1;
     end;
     BoundaryValue := Copy(ContentTypeHeader, BoundaryStart, BoundaryEnd - BoundaryStart);
     Result := Trim(BoundaryValue);
@@ -2804,9 +2788,7 @@ begin
             Break;
           end
           else
-          begin
             FChunkState := 1;
-          end;
         end;
       end;
       1:
@@ -2823,9 +2805,7 @@ begin
           I := I + BytesToRead;
         end;
         if FCurrentChunkReceived >= FCurrentChunkSize then
-        begin
           FChunkState := 2;
-        end;
       end;
       2:
       begin
@@ -2853,7 +2833,7 @@ begin
     if SemicolonPos > 0 then
        HexSize := Copy(HexSize, 1, SemicolonPos - 1);
     HexSize := Trim(HexSize);
-     if HexSize <> '' then
+    if HexSize <> '' then
        Result := StrToInt('$' + HexSize);
   except
     on E: Exception do

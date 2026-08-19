@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DEMO 01: Static &amp; SPA Fallback Server</title>
+  <link rel="stylesheet" href="/style.css?v=102">
+</head>
+<body>
+  <div class="container">
+    <!-- Navigation Header -->
+    <header class="header">
+      <div class="logo">GHttpsIOCP Static &amp; SPA Server</div>
+      <nav class="nav">
+        <a href="/" class="nav-btn active" data-path="/">Home</a>
+        <a href="/explorer" class="nav-btn" data-path="/explorer">Static Assets</a>
+        <a href="/etag-test" class="nav-btn" data-path="/etag-test">ETag Cache Test</a>
+        <a href="/dashboard" class="nav-btn" data-path="/dashboard">SPA Routes</a>
+        <a href="/api-status" class="nav-btn" data-path="/api-status">API Status</a>
+      </nav>
+    </header>
+
+    <!-- Main View Content -->
+    <main id="mainContent" class="main-card">
+      <h1>Welcome to DEMO 01: Static File Server &amp; SPA Fallback</h1>
+      <p>Demonstration server written in Delphi using asynchronous Windows IOCP architecture and SSPI Schannel TLS encryption.</p>
+      
+      <div style="background: #0f172a; border: 1px solid #334155; padding: 15px; border-radius: 6px; margin: 15px 0;">
+        <h3 style="color: #38bdf8;">Core Server Capabilities:</h3>
+        <ul style="margin-left: 20px; color: #cbd5e1; line-height: 1.8;">
+          <li><b>Automatic MIME Type Detection</b> – Supports HTML, CSS, JS, SVG, JSON, PNG file extensions.</li>
+          <li><b>ETag Cache Validation (HTTP 304)</b> – Reduces bandwidth usage by returning 304 Not Modified status without payload.</li>
+          <li><b>SPA Fallback Router</b> – Intercepts client-side routes (e.g. <code>/dashboard</code>, <code>/settings</code>) and serves <code>index.html</code> (HTTP 200 OK).</li>
+          <li><b>REST API Metrics</b> – Exposes telemetry metrics via <code>GET /api/status</code>.</li>
+        </ul>
+      </div>
+
+      <button class="btn" onclick="navigatePath('/etag-test')">Launch ETag Test (304)</button>
+      <button class="btn btn-secondary" onclick="navigatePath('/explorer')">View Static Assets</button>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <div>GHttpsServerIOCP DEMO 01 &copy; 2026 GECKO-71</div>
+      <div>Static Asset Serving &bull; ETag Validation (304) &bull; SPA Fallback</div>
+    </footer>
+  </div>
+
+  <script src="/app.js?v=102"></script>
+</body>
+</html>
