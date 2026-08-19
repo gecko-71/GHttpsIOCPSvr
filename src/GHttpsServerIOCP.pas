@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -335,9 +335,10 @@ begin
     if AOverlapped^.Socket <> INVALID_SOCKET then
     begin
       InterlockedDecrement64(Server.FActiveConnections);
+      var IsAbrupt: Boolean := ContainsText(AReason, 'interrupted') or ContainsText(AReason, 'aborted') or ContainsText(AReason, 'reset');
       if AOverlapped^.SSLContextValid then
       begin
-        if not ContainsText(AReason, 'SSL shutdown completed') then
+        if (not ContainsText(AReason, 'SSL shutdown completed')) and (not IsAbrupt) then
         begin
           try
             Server.PerformGracefulSSLShutdown(AOverlapped^);
@@ -352,10 +353,17 @@ begin
         end;
       end;
       try
-        shutdown(AOverlapped^.Socket, SD_SEND);
-        Sleep(25);
-        shutdown(AOverlapped^.Socket, SD_BOTH);
-        Sleep(10);
+        if not IsAbrupt then
+        begin
+          shutdown(AOverlapped^.Socket, SD_SEND);
+          Sleep(25);
+          shutdown(AOverlapped^.Socket, SD_BOTH);
+          Sleep(10);
+        end
+        else
+        begin
+          shutdown(AOverlapped^.Socket, SD_BOTH);
+        end;
       except
         on E: Exception do
           Logger.Error('TCP shutdown error: ' + E.Message);
@@ -1415,8 +1423,11 @@ begin
     end;
   end;
 
+  FRunning := True;
+
   if not CreateWorkerThreads then
   begin
+    FRunning := False;
     Logger.Info('Failed to create worker threads');
     CleanupWinsock;
     Exit;
@@ -1434,7 +1445,6 @@ begin
       Exit;
     end;
   end;
-  FRunning := True;
 
   if FListenSocket <> INVALID_SOCKET then
   begin
@@ -1523,7 +1533,7 @@ begin
           if Assigned(WS_Session) and (WS_Session.InCleanup = 0) then
           begin
             try
-              WS_Session.QueueSendFrame(wsOpClose, [$03, $E9]); // Going Away  ???
+              WS_Session.QueueSendFrame(wsOpClose, [$03, $E9]); // Going Away
               TriggerWebSocketWrite(WS_Session);
             except
               on E: Exception do
@@ -1727,8 +1737,6 @@ var
   BytesReceived, Flags: DWORD;
   OptNoDelay: Integer;
 begin
-  // Wyciszenie algorytmu Nagle'a (TCP_NODELAY) dla natychmiastowej transmisji pakietów TLS
-  // ???
   OptNoDelay := 1;
   setsockopt(ClientSocket, IPPROTO_TCP, TCP_NODELAY, @OptNoDelay, SizeOf(OptNoDelay));
 
@@ -1776,8 +1784,6 @@ var
   OverlappedEx: POverlappedEx;
   OptNoDelay: Integer;
 begin
-  // Wyciszenie algorytmu Nagle'a (TCP_NODELAY) dla natychmiastowej transmisji HTTP
-  // ???
   OptNoDelay := 1;
   setsockopt(ClientSocket, IPPROTO_TCP, TCP_NODELAY, @OptNoDelay, SizeOf(OptNoDelay));
 
@@ -1933,8 +1939,6 @@ begin
       end;
       SEC_E_DECRYPT_FAILURE:
       begin
-        // Sonda TLS / SChannel probe - wyciszona, aby nie zaśmiecać konsoli
-        // ???
         OverlappedEx.SSLNeedsMoreData := False;
         Result := False;
       end;
@@ -2333,6 +2337,13 @@ begin
         Logger.Info('Worker thread received shutdown signal');
         Break;
       end;
+      
+      if (CompletionKey <> 0) and (OverlappedEx^.OpType <> otAccept) and (CompletionKey <> ULONG_PTR(OverlappedEx^.Socket)) then
+      begin
+        // Logger.Info('Ghost completion detected (CompletionKey %d <> Socket %d) - ignoring', [CompletionKey, OverlappedEx^.Socket]);
+        Continue;
+      end;
+
       try
         case OverlappedEx^.OpType of
           otAccept:
@@ -2436,7 +2447,7 @@ begin
           end;
           otRead:
           begin
-            if BytesTransferred > 0 then
+            if (BytesTransferred > 0) or (OverlappedEx^.IsTLS and (Length(OverlappedEx^.ClientReceiveBuffer) > 0)) then
             begin
               if not OverlappedEx^.IsTLS then
               begin
@@ -2465,9 +2476,12 @@ begin
                  CleanupConnectionWithReason(Server, OverlappedEx, 'Receive buffer overflow');
                  Continue;
               end;
-              var CurrentBufferLen := Length(OverlappedEx^.ClientReceiveBuffer);
-              SetLength(OverlappedEx^.ClientReceiveBuffer, CurrentBufferLen + BytesTransferred);
-              Move(OverlappedEx^.Buffer[0], OverlappedEx^.ClientReceiveBuffer[CurrentBufferLen], BytesTransferred);
+              if BytesTransferred > 0 then
+              begin
+                var CurrentBufferLen := Length(OverlappedEx^.ClientReceiveBuffer);
+                SetLength(OverlappedEx^.ClientReceiveBuffer, CurrentBufferLen + BytesTransferred);
+                Move(OverlappedEx^.Buffer[0], OverlappedEx^.ClientReceiveBuffer[CurrentBufferLen], BytesTransferred);
+              end;
               var DecryptedPlainData: TBytes;
               var CurrentAttemptConsumedBytes: Integer;
               while Length(OverlappedEx^.ClientReceiveBuffer) > 0 do
@@ -2947,10 +2961,16 @@ begin
           end;
         end;
         ERROR_CONNECTION_ABORTED,
-        ERROR_NETNAME_DELETED:
+        ERROR_NETNAME_DELETED,
+        WSAECONNRESET,
+        WSAECONNABORTED,
+        WSAENOTSOCK,
+        WSAETIMEDOUT:
         begin
           if Assigned(OverlappedEx) then
           begin
+             if (CompletionKey <> 0) and (OverlappedEx^.OpType <> otAccept) and (CompletionKey <> ULONG_PTR(OverlappedEx^.Socket)) then
+               Continue;
             var IsActive: Boolean := False;
             Server.FActiveOverlappedLock.Enter;
             try
@@ -2968,7 +2988,6 @@ begin
         end;
         else
         begin
-          Inc(ConsecutiveErrors);
           if Assigned(OverlappedEx) then
           begin
             var IsActive: Boolean := False;
@@ -2980,22 +2999,25 @@ begin
             end;
             if IsActive then
             begin
-              Logger.Info(Format('GetQueuedCompletionStatus error: %d for socket %d', [Status, OverlappedEx^.Socket]));
+              Logger.Info(Format('GetQueuedCompletionStatus socket error: %d for socket %d', [Status, OverlappedEx^.Socket]));
               CleanupConnectionWithReason(Server,OverlappedEx, Format('Error GetQueuedCompletionStatus: %d', [Status]));
             end
             else
               Logger.Info('GetQueuedCompletionStatus error for already released overlapped - ignoring');
           end
           else
+          begin
+            Inc(ConsecutiveErrors);
             Logger.Info(Format('Fatal error GetQueuedCompletionStatus without context: %d (consecutive: %d)', [Status, ConsecutiveErrors]));
 
-          if ConsecutiveErrors > 5 then
-          begin
-            Logger.Info('Too many GetQueuedCompletionStatus errors - closing thread');
-            GracefulShutdown := True;
-          end
-          else
-            Sleep(100);
+            if ConsecutiveErrors > 5 then
+            begin
+              Logger.Info('Too many GetQueuedCompletionStatus errors - closing thread');
+              GracefulShutdown := True;
+            end
+            else
+              Sleep(100);
+          end;
         end;
       end;
     end;
@@ -3049,7 +3071,7 @@ begin
         begin
           OverlappedEx^.OpType := otRead;
           InitializeRequestProcessing(OverlappedEx);
-          PostQueuedCompletionStatus(FCompletionPort, 0, ULONG_PTR(OverlappedEx), POverlapped(OverlappedEx));
+          PostQueuedCompletionStatus(FCompletionPort, 0, ULONG_PTR(OverlappedEx^.Socket), POverlapped(OverlappedEx));
           Exit;
         end;
 
@@ -3232,10 +3254,6 @@ begin
             AllocatedBuffers[BuffersToFree] := Buffers[i].pvBuffer;
             AllocatedSizes[BuffersToFree] := Buffers[i].cbBuffer;
             Inc(BuffersToFree);
-          end
-          else
-          begin
-            // ???
           end;
           Inc(TotalSize, Buffers[i].cbBuffer);
         end;
@@ -3548,7 +3566,6 @@ begin
     end;
   end;
 
-  // Uruchomienie wysyłania początkowych ramek zakolejkowanych podczas połączenia (np. init-segment wideo)
   TriggerWebSocketWrite(Session);
 
   WSABuf.len := SizeOf(OverlappedEx^.Buffer);
