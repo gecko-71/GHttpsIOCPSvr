@@ -64,7 +64,7 @@ type
     SendCompleted: Boolean;
     ShutdownCompleted: Boolean;
     ResponseSent: Boolean;
-    ActiveSendCtx: Pointer; // Wskaźnik do aktywnego PHttp3SendContext (do bezpiecznego czyszczenia wycieków)
+    ActiveSendCtx: Pointer;
     Lock: TCriticalSection;
     constructor Create(AStream: TMsQuicStream);
     destructor Destroy; override;
@@ -136,7 +136,6 @@ var
   BufArray: PQUIC_BUFFER_ARRAY;
   I: Integer;
 begin
-  // Czyszczenie aktywnego kontekstu wysyłania HTTP/3 w przypadku nagłego zamknięcia strumienia
   if ActiveSendCtx <> nil then
   begin
     SendCtx := PHttp3SendContext(ActiveSendCtx);
@@ -186,7 +185,7 @@ var
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
-  FConnections := TObjectList<TMsQuicConnection>.Create(True); // OwnsObjects = True
+  FConnections := TObjectList<TMsQuicConnection>.Create(True);
   FStreams := TObjectDictionary<HQUIC, TStreamState>.Create([doOwnsValues]);
 
   Status := MsQuicOpenVersion(2, FApi);
@@ -446,7 +445,7 @@ begin
     HTTP3_SETTINGS_QPACK_BLOCKED_STREAMS, 0
   ]);
 
-  ControlPrefix := VarIntEncode(0); // Control Stream Type 0x00
+  ControlPrefix := VarIntEncode(0); 
   SetLength(FullData, Length(ControlPrefix) + Length(SettingsPayload));
   Move(ControlPrefix[0], FullData[0], Length(ControlPrefix));
   Move(SettingsPayload[0], FullData[Length(ControlPrefix)], Length(SettingsPayload));
