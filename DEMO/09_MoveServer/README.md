@@ -34,10 +34,8 @@ A high-performance, multi-threaded continuous live TV broadcast server implement
 * The live broadcast will start automatically. Control playback using the dedicated **Start** and **Pause** buttons.
 
 ### 3. VLC Media Player Playback:
-1. Open VLC Media Player.
-2. Select: *Media* $\to$ *Open Network Stream...* (or press `Ctrl+N`).
-3. Enter the live stream URL:
+   Enter the live stream URL:
    ```text
    https://localhost:8089/live/stream.m3u8
    ```
-4. Click **Play**. The stream will play continuously without stalls.
+
