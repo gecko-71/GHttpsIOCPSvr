@@ -18,6 +18,5 @@ A REST API gateway providing advanced protection against web attacks (WAF), requ
 | `GET` | `/api/status` | Server and WAF status | Public |
 
 ## Getting Started
-1. Open `JwtSecurityWafServer.dproj` in RAD Studio and build (Shift+F9).
-2. Run `JwtSecurityWafServer.exe`.
-3. Open `https://localhost:8082/` in your browser.
+1. Run `JwtSecurityWafServer.exe`.
+2. Open `https://localhost:8082/` in your browser.

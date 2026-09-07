@@ -1,4 +1,4 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{E90E54D5-3E38-41C5-B70B-C96F622269A7}</ProjectGuid>
         <MainSource>GHttpsIOCPSvrWebSocket.dpr</MainSource>
@@ -51,7 +51,7 @@
         <VerInfo_Locale>1045</VerInfo_Locale>
         <VerInfo_Keys>CompanyName=;FileDescription=;FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProductName=;ProductVersion=1.0.0.0;Comments=;CFBundleName=</VerInfo_Keys>
         <DCC_Namespace>System;Xml;Data;Datasnap;Web;Soap;Winapi;$(DCC_Namespace)</DCC_Namespace>
-        <DCC_UnitSearchPath>src;Http3Delphi;.\FASTMM5;.\QuickLogger;.\QuickLib;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
+        <DCC_UnitSearchPath>src;Http3DelphiV3;Http3DelphiV3\ls-qpack;.\FASTMM5;.\QuickLogger;.\QuickLib;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
         <Icon_MainIcon>$(BDS)\bin\delphi_PROJECTICON.ico</Icon_MainIcon>
         <Icns_MainIcns>$(BDS)\bin\delphi_PROJECTICNS.icns</Icns_MainIcns>
         <DCC_DcpOutput>.\$(Platform)\$(Config)</DCC_DcpOutput>
@@ -101,14 +101,26 @@
         <DCCReference Include="src\GResponse.pas"/>
         <DCCReference Include="src\OverlappedExPool.pas"/>
         <DCCReference Include="src\WinApiAdditions.pas"/>
-        <DCCReference Include="Http3Delphi\WinApi.MsQuic.pas"/>
-        <DCCReference Include="Http3Delphi\Net.MsQuic.pas"/>
-        <DCCReference Include="Http3Delphi\Net.Http3Frames.pas"/>
-        <DCCReference Include="Http3Delphi\Net.QPACK.Huffman.pas"/>
-        <DCCReference Include="Http3Delphi\Net.QPACK.pas"/>
-        <DCCReference Include="Http3Delphi\Net.Http3Request.pas"/>
-        <DCCReference Include="Http3Delphi\Net.Http3Response.pas"/>
-        <DCCReference Include="Http3Delphi\Net.Http3Server.pas"/>
+        <DCCReference Include="Http3DelphiV3\ls-qpack\LsQpack.Loader.pas"/>
+        <DCCReference Include="Http3DelphiV3\ls-qpack\LsQpack.Types.pas"/>
+        <DCCReference Include="Http3DelphiV3\Http3.Connection.pas"/>
+        <DCCReference Include="Http3DelphiV3\Http3.Frames.pas"/>
+        <DCCReference Include="Http3DelphiV3\Http3.Request.pas"/>
+        <DCCReference Include="Http3DelphiV3\Http3.Response.pas"/>
+        <DCCReference Include="Http3DelphiV3\Http3.Server.pas"/>
+        <DCCReference Include="Http3DelphiV3\Http3.Types.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.ApiTable.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.Certificate.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.Configuration.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.Errors.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.Listener.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.Loader.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.Registration.pas"/>
+        <DCCReference Include="Http3DelphiV3\MsQuic.Types.pas"/>
+        <DCCReference Include="Http3DelphiV3\Quic.Server.pas"/>
+        <DCCReference Include="Http3DelphiV3\WebTransport.Server.pas"/>
+        <DCCReference Include="Http3DelphiV3\WebTransport.Session.pas"/>
+        <DCCReference Include="Http3DelphiV3\WebTransport.Types.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

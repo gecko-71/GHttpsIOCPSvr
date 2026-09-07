@@ -64,7 +64,6 @@ type
     function GetClaim(const Name: string): string;
     procedure Clear;
     procedure SecureClear;
-
     property Header: string read FHeader write FHeader;
     property Payload: string read FPayload write FPayload;
     property Signature: string read FSignature write FSignature;
@@ -102,7 +101,6 @@ type
     FMaxValidationAttempts: Integer;
     FValidationWindowMinutes: Integer;
     FEnableSecurityLogging: Boolean;
-
     function ValidateAlgorithm(const Algorithm: string): Boolean;
     function CreateSignature(const HeaderPayload: string): string;
     function VerifySignature(const HeaderPayload, Signature: string): Boolean;
@@ -234,7 +232,6 @@ begin
   try
     if not IsValidSecretKey(ASecretKey) then
       raise Exception.Create('Invalid secret key: must be at least 32 characters long and have enough entropy.');
-
     FSecretKey := ASecretKey;
     FIssuer := AIssuer;
     FAudience := AAudience;
@@ -449,7 +446,6 @@ begin
   Result := False;
   try
     ExpectedSignature := CreateSignature(HeaderPayload);
-    Logger.Info(Format('[LOG-SIG-COMPARE] Expected="%s", Got="%s"', [ExpectedSignature, Signature]));
     Result := (ExpectedSignature <> '') and SecureCompare(ExpectedSignature, Signature);
     if not Result then
       LogSecurityEvent('Invalid signature detected.');
@@ -723,10 +719,8 @@ begin
     JWT.Payload := TokenParts[1];
     JWT.Signature := TokenParts[2];
 
-    Logger.Info(Format('[LOG-JWT-STEP] SecretKeyLen=%d, HeaderBase64="%s", PayloadBase64="%s", Sig="%s"', [Length(FSecretKey), JWT.Header, JWT.Payload, JWT.Signature]));
 
     var DecHeaderStr := DecodeBase64Url(JWT.Header);
-    Logger.Info('[LOG-JWT-STEP] Decoded Header JSON=' + DecHeaderStr);
     HeaderObj := ParseJsonSafely(DecHeaderStr);
     if not Assigned(HeaderObj) then
     begin
@@ -753,7 +747,6 @@ begin
     end;
 
     var DecPayloadStr := DecodeBase64Url(JWT.Payload);
-    Logger.Info('[LOG-JWT-STEP] Decoded Payload JSON=' + DecPayloadStr);
     PayloadObj := ParseJsonSafely(DecPayloadStr);
     if not Assigned(PayloadObj) then
     begin

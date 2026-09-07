@@ -190,10 +190,10 @@ type
     function StringToHttpVersion(const VersionStr: string): THttpVersion;
     function ParseTransferEncoding(const EncodingStr: string): TTransferEncoding;
     function ParseConnectionType(const ConnectionStr: string): TConnectionType;
-    procedure ValidateUriComponents;
   public
     constructor Create;
     destructor Destroy; override;
+    procedure ValidateUriComponents;
     procedure ParseQueryString(const AQueryString: string; ADictionary: TDictionary<string, string>);
     procedure ParseUri(const RawUri: string);
     procedure ParseRequestLine(const RequestLine: string);
@@ -1938,7 +1938,10 @@ begin
       end;
     end;
   except
-
+    on E: Exception do
+    begin
+      Logger.Error('[HttpHeaders.SanitizeHeaders] Exception during header sanitization: %s (%s)', [E.Message, E.ClassName]);
+    end;
   end;
 end;
 
@@ -2201,6 +2204,7 @@ begin
       FUriValidationErrors.Add('Path validation: ' + ErrorMsg);
     FNormalizedUri := TUriValidator.NormalizeURI(FRawUri);
     if FPath = '' then FPath := '/';
+    ValidateUriComponents;
   except
     on E: Exception do
     begin
@@ -2224,16 +2228,25 @@ begin
        FUriValidationErrors.Add('Query string too long (>4096 characters)');
     if Length(FFragment) > 1024 then
        FUriValidationErrors.Add('Fragment too long (>1024 characters)');
-    if Pos('..', FPath) > 0 then
-       FUriValidationErrors.Add('Path traversal attempt detected in path');
-    if Pos('%00', FRawUri) > 0 then
+    if (Pos('..', FPath) > 0) or (Pos('..', FRawUri) > 0) or (Pos('%2e%2e', LowerCase(FRawUri)) > 0) or
+       (Pos('%252e', LowerCase(FRawUri)) > 0) or (Pos('%c0%af', LowerCase(FRawUri)) > 0) then
+       FUriValidationErrors.Add('Path traversal attempt detected');
+    if (Pos('%00', FRawUri) > 0) or (Pos(#0, FRawUri) > 0) then
        FUriValidationErrors.Add('Null byte injection attempt detected');
-    if (Pos('%0A', FRawUri) > 0) or (Pos('%0D', FRawUri) > 0) or  (Pos(#10, FRawUri) > 0) or (Pos(#13, FRawUri) > 0) then
+    if (Pos('%0a', LowerCase(FRawUri)) > 0) or (Pos('%0d', LowerCase(FRawUri)) > 0) or (Pos(#10, FRawUri) > 0) or (Pos(#13, FRawUri) > 0) then
        FUriValidationErrors.Add('CRLF injection attempt detected');
 
     if FQueryString <> '' then
     begin
       LowerQuery := LowerCase(FQueryString);
+
+
+      if (Pos(';cat ', LowerQuery) > 0) or (Pos(';cat', LowerQuery) > 0) then
+        FUriValidationErrors.Add('Potential command injection in query string');
+      if (Pos('*(|', LowerQuery) > 0) or (Pos('mail=*', LowerQuery) > 0) then
+        FUriValidationErrors.Add('Potential LDAP injection in query string');
+      if Pos('%s%s', LowerQuery) > 0 then
+        FUriValidationErrors.Add('Potential format string attack in query string');
       SQLPatterns := [
         'union', 'select', 'insert', 'delete', 'update', 'drop',
         'or 1=1', 'or ''1''=''1''', '--', '/*', '*/',
@@ -2578,9 +2591,7 @@ begin
   FErrorMessage := ErrorMsg;
   FState := rsError;
   if (Threat <> stNone) or (Pos('injection', LowerCase(ErrorMsg)) > 0) or (Pos('attack', LowerCase(ErrorMsg)) > 0) then
-  begin
     FSecurityViolationDetected := True;
-  end;
 
   if Threat <> stNone then
   begin
@@ -2589,9 +2600,6 @@ begin
       var OldLen := Length(FSecurityThreats);
       SetLength(FSecurityThreats, OldLen + 1);
       FSecurityThreats[OldLen] := Threat;
-    end
-    else
-    begin
     end;
   end;
   ThreatsStr := '';
@@ -2612,9 +2620,7 @@ begin
     SetString(HeadersAsString, PAnsiChar(Buffer), Size);
     PosCRLF := Pos(#13#10#13#10, HeadersAsString);
     if PosCRLF > 0 then
-    begin
       Result := PosCRLF + 3;
-    end;
   except
     Result := -1;
   end;

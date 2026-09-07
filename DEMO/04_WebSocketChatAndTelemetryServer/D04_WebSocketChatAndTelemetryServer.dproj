@@ -36,7 +36,7 @@
         <VerInfo_Locale>1045</VerInfo_Locale>
         <VerInfo_Keys>CompanyName=;FileDescription=WebSocket Chat &amp; Telemetry Server;FileVersion=1.0.0.0;InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProductName=GHttpsIOCPSvr DEMO;ProductVersion=1.0.0.0;Comments=</VerInfo_Keys>
         <DCC_Namespace>System;Xml;Data;Datasnap;Web;Soap;Winapi;$(DCC_Namespace)</DCC_Namespace>
-        <DCC_UnitSearchPath>..\..\src;..\..\Http3Delphi;..\..\FASTMM5;..\..\QuickLogger;..\..\QuickLib;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
+        <DCC_UnitSearchPath>..\..\src;..\..\Http3DelphiV3;..\..\Http3DelphiV3\ls-qpack;..\..\FASTMM5;..\..\QuickLogger;..\..\QuickLib;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
         <DCC_DcpOutput>.\$(Platform)\$(Config)</DCC_DcpOutput>
         <DCC_DcuOutput>.\$(Platform)\$(Config)</DCC_DcuOutput>
         <DCC_ExeOutput>.\$(Platform)\$(Config)</DCC_ExeOutput>
@@ -65,14 +65,6 @@
         <DCCReference Include="..\..\src\GResponse.pas"/>
         <DCCReference Include="..\..\src\OverlappedExPool.pas"/>
         <DCCReference Include="..\..\src\WinApiAdditions.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\WinApi.MsQuic.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\Net.MsQuic.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\Net.Http3Frames.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\Net.QPACK.Huffman.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\Net.QPACK.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\Net.Http3Request.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\Net.Http3Response.pas"/>
-        <DCCReference Include="..\..\Http3Delphi\Net.Http3Server.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

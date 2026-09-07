@@ -10,6 +10,5 @@ A real-time bidirectional communication server built on IOCP with full WebSocket
 - **Heartbeat & Graceful Close**: Full support for Ping/Pong frames and safe connection teardown.
 
 ## Getting Started
-1. Open `WebSocketChatAndTelemetryServer.dproj` in RAD Studio and build (Shift+F9).
-2. Run `WebSocketChatAndTelemetryServer.exe`.
-3. Open `https://localhost:8443/` in your browser.
+1. Run `WebSocketChatAndTelemetryServer.exe`.
+2. Open `https://localhost:8443/` in your browser.

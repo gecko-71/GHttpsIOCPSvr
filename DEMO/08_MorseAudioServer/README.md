@@ -34,16 +34,9 @@ A multi-threaded Morse code radio broadcast server built on **GHttpsServerIOCP**
 
 ## Getting Started
 
-1. **Build the server in Delphi**: Open and compile `DEMO\08_MorseAudioServer\MorseAudioServer.dpr` (Win64 Debug/Release).
-2. **Static files**: Ensure the `www` subdirectory (containing `index.html`, `app.js`, `style.css`) is present next to the `.exe`.
-3. **Run**: Launch `MorseAudioServer.exe` and open `https://localhost:8088/` in your browser.
-4. Click **▶ Start Radio** to begin receiving the telegraph broadcast and audio synthesis.
+1. **Run**: Launch `MorseAudioServer.exe` and open `https://localhost:8088/` in your browser.
+2. Click **▶ Start Radio** to begin receiving the telegraph broadcast and audio synthesis.
 
 ---
 
-## Project Structure
-
-- `MorseAudioServer.dpr` — Main Delphi radio server program.
-- `www/index.html` — Radio receiver UI.
-- `www/app.js` — Telegraph tape renderer, Morse decoder and Web Audio API engine.
-- `www/style.css` — Dark retro-telegraph UI styling.
+ 

@@ -35,17 +35,53 @@ document.addEventListener('DOMContentLoaded', () => {
   btnUpload.addEventListener('click', () => {
     const file = fileInput.files[0];
     const payload = file ? file : new Blob(['Test binary payload content for DEMO 03 upload']);
+    const fileSize = file ? file.size : payload.size;
+    const fileName = file ? file.name : 'inline_payload.bin';
 
-    fetch('/api/upload', {
-      method: 'POST',
-      body: payload
-    })
-      .then(res => res.json())
-      .then(data => {
-        outputLog.innerText = `Upload Success:\n${JSON.stringify(data, null, 2)}`;
-      })
-      .catch(err => {
-        outputLog.innerText = `Upload Error: ${err.message}`;
-      });
+    outputLog.innerText = `Starting upload: ${fileName} (${(fileSize / (1024 * 1024)).toFixed(2)} MB)...`;
+    btnUpload.disabled = true;
+
+    const startTime = performance.now();
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const percent = ((e.loaded / e.total) * 100).toFixed(1);
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        const speedMBps = elapsedSec > 0 ? ((e.loaded / (1024 * 1024)) / elapsedSec).toFixed(2) : '0';
+        outputLog.innerText = `Uploading file: ${fileName}\n` +
+          `Progress: ${percent}%\n` +
+          `Transferred: ${(e.loaded / (1024 * 1024)).toFixed(2)} MB / ${(e.total / (1024 * 1024)).toFixed(2)} MB\n` +
+          `Transfer Speed: ${speedMBps} MB/s`;
+      }
+    };
+
+    xhr.onload = () => {
+      btnUpload.disabled = false;
+      const totalTime = ((performance.now() - startTime) / 1000).toFixed(2);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          outputLog.innerText = `Upload completed successfully in ${totalTime}s:\n${JSON.stringify(data, null, 2)}`;
+        } catch (_) {
+          outputLog.innerText = `Upload completed successfully in ${totalTime}s:\n${xhr.responseText}`;
+        }
+      } else {
+        outputLog.innerText = `Upload error (HTTP ${xhr.status}):\n${xhr.responseText || xhr.statusText}`;
+      }
+    };
+
+    xhr.onerror = () => {
+      btnUpload.disabled = false;
+      outputLog.innerText = `Network error / connection aborted during upload.`;
+    };
+
+    xhr.ontimeout = () => {
+      btnUpload.disabled = false;
+      outputLog.innerText = `Upload timed out.`;
+    };
+
+    xhr.send(payload);
   });
 });

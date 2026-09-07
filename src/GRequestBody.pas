@@ -327,7 +327,7 @@ type
     FDiskFileManager: TDiskFileManager;
     FUseDiskStorage: Boolean;
     FIsChunked: Boolean;
-    FChunkState: Integer; // 0=reading size, 1=reading data, 2=reading CRLF
+    FChunkState: Integer;
     FCurrentChunkSize: Integer;
     FCurrentChunkReceived: Integer;
     FContentEncoding: TContentEncoding;
@@ -424,10 +424,10 @@ end;
 constructor TSecuritySettings.Create;
 begin
   inherited Create;
-  MaxBodySize := 10485760; // 10MB
+  MaxBodySize := 10485760;
   MaxPartCount := 100;
   MaxFieldNameLength := 255;
-  MaxFieldValueLength := 1048576; // 1MB
+  MaxFieldValueLength := 1048576;
   MaxFilenameLength := 255;
   AllowedFileExtensions := TStringList.Create;
   BlockedMimeTypes := TStringList.Create;

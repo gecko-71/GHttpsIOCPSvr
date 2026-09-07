@@ -10,6 +10,5 @@ A hybrid network server combining three leading transport protocols on a single 
 - **Multi-Protocol Event Hub**: `POST /api/broadcast` pushes a message to all connected WebSocket clients in real time.
 
 ## Getting Started
-1. Open `TriProtocolHybridServer.dproj` in RAD Studio and build (Shift+F9).
-2. Run `TriProtocolHybridServer.exe`.
-3. Open `https://localhost:8444/` in your browser.
+1. Run `TriProtocolHybridServer.exe`.
+2. Open `https://localhost:8444/` in your browser.

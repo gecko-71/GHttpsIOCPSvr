@@ -181,7 +181,8 @@ begin
 
   if Frame.Masked then
   begin
-    if Length(RawData) - LocalOffset < 4 then Exit;
+    if Length(RawData) - LocalOffset < 4 then 
+	   Exit;
     Move(RawData[LocalOffset], Frame.MaskKey[0], 4);
     Inc(LocalOffset, 4);
   end;
@@ -238,13 +239,13 @@ begin
       Exit(False);
 
     if (B = $E0) and (Bytes[I + 1] < $A0) then
-      Exit(False); // Overlong 3-byte
+      Exit(False);
     if (B = $ED) and (Bytes[I + 1] > $9F) then
-      Exit(False); // UTF-16 surrogate ($ED $A0 $80 .. $ED $BF $BF)
+      Exit(False);
     if (B = $F0) and (Bytes[I + 1] < $90) then
-      Exit(False); // Overlong 4-byte
+      Exit(False);
     if (B = $F4) and (Bytes[I + 1] > $8F) then
-      Exit(False); // > U+10FFFF
+      Exit(False);
 
     Inc(I);
     while Needed > 0 do
@@ -756,8 +757,10 @@ begin
   finally
     FLock.Leave;
   end;
-  if Assigned(FSessions) then FreeAndNil(FSessions);
-  if Assigned(FLock) then FreeAndNil(FLock);
+  if Assigned(FSessions) then 
+     FreeAndNil(FSessions);
+  if Assigned(FLock) then 
+     FreeAndNil(FLock);
   inherited Destroy;
 end;
 

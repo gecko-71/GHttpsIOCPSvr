@@ -10,6 +10,5 @@ A demo server for secure and efficient hosting of static files (HTML5, CSS3, Jav
 - **SPA Fallback Router**: All requests to dynamic paths (e.g. `/dashboard`, `/settings`) return `index.html`.
 
 ## Getting Started
-1. Open `StaticAndSpaServer.dproj` in RAD Studio and build (Shift+F9).
-2. Run `StaticAndSpaServer.exe`.
-3. Open `https://localhost:8081/` in your browser.
+1. Run `StaticAndSpaServer.exe`.
+2. Open `https://localhost:8081/` in your browser.

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DEMO 09: Dynamic HLS Live TV</title>
+  <link rel="stylesheet" href="video-js.min.css">
   <link rel="stylesheet" href="style.css">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 </head>
@@ -26,13 +27,12 @@
       <section class="cinema-screen-card">
         <div class="screen-frame">
           <div class="video-container">
-            <!-- Professional HLS Video Player -->
-            <video id="moviePlayer" playsinline muted autoplay preload="auto">
+            <!-- Professional Video.js HLS Player -->
+            <video id="moviePlayer" class="video-js vjs-default-skin vjs-fill vjs-big-play-centered" playsinline muted autoplay preload="auto">
               Your browser does not support HLS video playback.
             </video>
 
-            <!-- Offline Overlay when server is stopped -->
-            <div id="offlineOverlay" class="offline-overlay">
+            <div id="offlineOverlay" class="offline-overlay hidden">
               <div class="offline-box">
                 <div class="offline-title">SERVER OFFLINE</div>
                 <div class="offline-desc">No active live broadcast from IOCP server. Waiting for broadcast to resume...</div>
@@ -48,12 +48,21 @@
             </div>
             
             <div class="timeline-box">
-              <span class="live-indicator">● LIVE</span>
+              <span class="live-indicator">LIVE</span>
               <span id="sessionTimeDisplay">00:00:00</span>
             </div>
 
             <div class="controls-right">
               <button id="btnFullscreen" class="ctrl-btn">Fullscreen</button>
+            </div>
+          </div>
+
+          <!-- Video Delivery Transport Selector -->
+          <div class="transport-selector-container">
+            <span class="transport-selector-label">Video Transport:</span>
+            <div class="transport-buttons">
+              <button id="btnTransportHttp" class="transport-btn active-tcp" title="Standard HLS over TCP">HTTP/2 (TCP)</button>
+              <button id="btnTransportWT" class="transport-btn" title="Next-Gen HLS Live Stream over WebTransport QUIC/UDP">WebTransport (QUIC/UDP)</button>
             </div>
           </div>
         </div>
@@ -78,8 +87,77 @@
               <span id="uptimeVal" class="m-val mono">--:--:--</span>
             </div>
             <div class="metric-row">
+              <span class="m-label">HLS Video Mode:</span>
+              <span id="activeVideoTransportVal" class="m-val highlight-cyan">HTTP / TCP</span>
+            </div>
+            <div class="metric-row">
+              <span class="m-label">WT HLS Segments:</span>
+              <span id="wtSegmentsLoadedVal" class="m-val mono">0</span>
+            </div>
+            <div class="metric-row">
+              <span class="m-label">Sync Role:</span>
+              <span id="syncRoleBadge" class="p-status connecting">DETECTING...</span>
+            </div>
+            <div class="metric-row">
+              <span class="m-label">Sync Drift:</span>
+              <span id="syncDriftVal" class="m-val mono">0.00s</span>
+            </div>
+            <div class="metric-row">
               <span class="m-label">VLC Stream URL:</span>
               <span id="vlcStreamUrl" class="m-val highlight">/live/stream.m3u8</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Protocol Showcase: WebSocket vs WebTransport -->
+        <div class="sidebar-card protocol-card">
+          <div class="card-header">
+            <h3>Dual Protocol Telemetry</h3>
+            <span class="badge-mini highlight-cyan">LIVE STREAM</span>
+          </div>
+          <div class="protocol-grid">
+            <!-- WebSocket Box -->
+            <div class="proto-box proto-ws">
+              <div class="proto-header">
+                <span class="proto-title">WebSocket</span>
+                <span class="proto-tag">TCP / TLS</span>
+              </div>
+              <div class="proto-metrics">
+                <div class="proto-row">
+                  <span>Status:</span>
+                  <span id="wsStatusBadge" class="p-status connecting">Connecting...</span>
+                </div>
+                <div class="proto-row">
+                  <span>Packets:</span>
+                  <span id="wsPacketCount" class="p-val mono">0</span>
+                </div>
+                <div class="proto-row">
+                  <span>Viewers:</span>
+                  <span id="wsViewersCount" class="p-val mono">0</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- WebTransport Box -->
+            <div class="proto-box proto-wt">
+              <div class="proto-header">
+                <span class="proto-title">WebTransport</span>
+                <span class="proto-tag highlight-purple">UDP / HTTP/3</span>
+              </div>
+              <div class="proto-metrics">
+                <div class="proto-row">
+                  <span>Status:</span>
+                  <span id="wtStatusBadge" class="p-status connecting">Connecting...</span>
+                </div>
+                <div class="proto-row">
+                  <span>Datagrams:</span>
+                  <span id="wtDatagramCount" class="p-val mono">0</span>
+                </div>
+                <div class="proto-row">
+                  <span>Viewers:</span>
+                  <span id="wtViewersCount" class="p-val mono">0</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -87,7 +165,7 @@
     </main>
   </div>
 
-  <script src="hls.min.js"></script>
-  <script src="app.js?v=hls2"></script>
+  <script src="video.min.js"></script>
+  <script src="app.js?v=live_lock_v17"></script>
 </body>
 </html>

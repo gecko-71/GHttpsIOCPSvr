@@ -34,12 +34,10 @@ uses
 
 type
   THttpStatus = (
-    // 1xx Informational
     hsContinue = 100,
     hsSwitchingProtocols = 101,
     hsProcessing = 102,
 
-    // 2xx Success
     hsOK = 200,
     hsCreated = 201,
     hsAccepted = 202,
@@ -51,7 +49,6 @@ type
     hsAlreadyReported = 208,
     hsIMUsed = 226,
 
-    // 3xx Redirection
     hsMultipleChoices = 300,
     hsMovedPermanently = 301,
     hsFound = 302,
@@ -61,7 +58,6 @@ type
     hsTemporaryRedirect = 307,
     hsPermanentRedirect = 308,
 
-    // 4xx Client Error
     hsBadRequest = 400,
     hsUnauthorized = 401,
     hsPaymentRequired = 402,
@@ -92,7 +88,6 @@ type
     hsRequestHeaderFieldsTooLarge = 431,
     hsUnavailableForLegalReasons = 451,
 
-    // 5xx Server Error
     hsInternalServerError = 500,
     hsNotImplemented = 501,
     hsBadGateway = 502,
@@ -253,7 +248,7 @@ implementation
 uses System.StrUtils;
 
 const
-  DEFAULT_MAX_MEMORY_SIZE = 10 * 1024 * 1024; // 10MB
+  DEFAULT_MAX_MEMORY_SIZE = 10 * 1024 * 1024;
   TEMP_FILE_PREFIX = 'GResponse_';
 
 constructor TMultipartPart.Create;
@@ -517,12 +512,10 @@ end;
 function TResponse.GetStatusText(Status: THttpStatus): string;
 begin
   case Status of
-    // 1xx Informational
     hsContinue: Result := 'Continue';
     hsSwitchingProtocols: Result := 'Switching Protocols';
     hsProcessing: Result := 'Processing';
 
-    // 2xx Success
     hsOK: Result := 'OK';
     hsCreated: Result := 'Created';
     hsAccepted: Result := 'Accepted';
@@ -534,7 +527,6 @@ begin
     hsAlreadyReported: Result := 'Already Reported';
     hsIMUsed: Result := 'IM Used';
 
-    // 3xx Redirection
     hsMultipleChoices: Result := 'Multiple Choices';
     hsMovedPermanently: Result := 'Moved Permanently';
     hsFound: Result := 'Found';
@@ -544,7 +536,6 @@ begin
     hsTemporaryRedirect: Result := 'Temporary Redirect';
     hsPermanentRedirect: Result := 'Permanent Redirect';
 
-    // 4xx Client Error
     hsBadRequest: Result := 'Bad Request';
     hsUnauthorized: Result := 'Unauthorized';
     hsPaymentRequired: Result := 'Payment Required';
@@ -575,7 +566,6 @@ begin
     hsRequestHeaderFieldsTooLarge: Result := 'Request Header Fields Too Large';
     hsUnavailableForLegalReasons: Result := 'Unavailable For Legal Reasons';
 
-    // 5xx Server Error
     hsInternalServerError: Result := 'Internal Server Error';
     hsNotImplemented: Result := 'Not Implemented';
     hsBadGateway: Result := 'Bad Gateway';
@@ -876,66 +866,104 @@ var
 begin
   Ext := LowerCase(ExtractFileExt(Filename));
 
-  // Images
-  if (Ext = '.jpg') or (Ext = '.jpeg') then Result := 'image/jpeg'
-  else if Ext = '.png' then Result := 'image/png'
-  else if Ext = '.gif' then Result := 'image/gif'
-  else if Ext = '.bmp' then Result := 'image/bmp'
-  else if Ext = '.webp' then Result := 'image/webp'
-  else if Ext = '.svg' then Result := 'image/svg+xml'
-  else if Ext = '.ico' then Result := 'image/x-icon'
-  else if Ext = '.tiff' then Result := 'image/tiff'
+  if (Ext = '.jpg') or (Ext = '.jpeg') then 
+          Result := 'image/jpeg'
+  else if Ext = '.png' then 
+          Result := 'image/png'
+  else if Ext = '.gif' then 
+          Result := 'image/gif'
+  else if Ext = '.bmp' then 
+          Result := 'image/bmp'
+  else if Ext = '.webp' then 
+          Result := 'image/webp'
+  else if Ext = '.svg' then 
+          Result := 'image/svg+xml'
+  else if Ext = '.ico' then 
+          Result := 'image/x-icon'
+  else if Ext = '.tiff' then 
+          Result := 'image/tiff'
 
-  // Documents
-  else if Ext = '.pdf' then Result := 'application/pdf'
-  else if Ext = '.doc' then Result := 'application/msword'
-  else if Ext = '.docx' then Result := 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-  else if Ext = '.xls' then Result := 'application/vnd.ms-excel'
-  else if Ext = '.xlsx' then Result := 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-  else if Ext = '.ppt' then Result := 'application/vnd.ms-powerpoint'
-  else if Ext = '.pptx' then Result := 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  else if Ext = '.pdf' then 
+          Result := 'application/pdf'
+  else if Ext = '.doc' then 
+          Result := 'application/msword'
+  else if Ext = '.docx' then 
+          Result := 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  else if Ext = '.xls' then 
+          Result := 'application/vnd.ms-excel'
+  else if Ext = '.xlsx' then 
+          Result := 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  else if Ext = '.ppt' then 
+          Result := 'application/vnd.ms-powerpoint'
+  else if Ext = '.pptx' then 
+          Result := 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
 
-  // Text
-  else if Ext = '.txt' then Result := 'text/plain'
-  else if Ext = '.html' then Result := 'text/html'
-  else if Ext = '.htm' then Result := 'text/html'
-  else if Ext = '.css' then Result := 'text/css'
-  else if Ext = '.js' then Result := 'application/javascript'
-  else if Ext = '.json' then Result := 'application/json'
-  else if Ext = '.xml' then Result := 'application/xml'
-  else if Ext = '.csv' then Result := 'text/csv'
+  else if Ext = '.txt' then 
+          Result := 'text/plain'
+  else if Ext = '.html' then 
+          Result := 'text/html'
+  else if Ext = '.htm' then 
+          Result := 'text/html'
+  else if Ext = '.css' then 
+          Result := 'text/css'
+  else if Ext = '.js' then 
+          Result := 'application/javascript'
+  else if Ext = '.json' then 
+          Result := 'application/json'
+  else if Ext = '.xml' then 
+          Result := 'application/xml'
+  else if Ext = '.csv' then 
+          Result := 'text/csv'
 
-  // Archives
-  else if Ext = '.zip' then Result := 'application/zip'
-  else if Ext = '.rar' then Result := 'application/x-rar-compressed'
-  else if Ext = '.7z' then Result := 'application/x-7z-compressed'
-  else if Ext = '.tar' then Result := 'application/x-tar'
-  else if Ext = '.gz' then Result := 'application/gzip'
+  else if Ext = '.zip' then 
+          Result := 'application/zip'
+  else if Ext = '.rar' then 
+          Result := 'application/x-rar-compressed'
+  else if Ext = '.7z' then 
+          Result := 'application/x-7z-compressed'
+  else if Ext = '.tar' then 
+          Result := 'application/x-tar'
+  else if Ext = '.gz' then 
+          Result := 'application/gzip'
 
-  // Video
-  else if Ext = '.mp4' then Result := 'video/mp4'
-  else if Ext = '.avi' then Result := 'video/x-msvideo'
-  else if Ext = '.mov' then Result := 'video/quicktime'
-  else if Ext = '.wmv' then Result := 'video/x-ms-wmv'
-  else if Ext = '.flv' then Result := 'video/x-flv'
-  else if Ext = '.webm' then Result := 'video/webm'
-  else if Ext = '.mkv' then Result := 'video/x-matroska'
+  else if Ext = '.mp4' then 
+          Result := 'video/mp4'
+  else if Ext = '.avi' then 
+          Result := 'video/x-msvideo'
+  else if Ext = '.mov' then 
+          Result := 'video/quicktime'
+  else if Ext = '.wmv' then 
+          Result := 'video/x-ms-wmv'
+  else if Ext = '.flv' then 
+          Result := 'video/x-flv'
+  else if Ext = '.webm' then 
+          Result := 'video/webm'
+  else if Ext = '.mkv' then 
+          Result := 'video/x-matroska'
 
-  // Audio
-  else if Ext = '.mp3' then Result := 'audio/mpeg'
-  else if Ext = '.wav' then Result := 'audio/wav'
-  else if Ext = '.ogg' then Result := 'audio/ogg'
-  else if Ext = '.flac' then Result := 'audio/flac'
-  else if Ext = '.aac' then Result := 'audio/aac'
-  else if Ext = '.wma' then Result := 'audio/x-ms-wma'
+  else if Ext = '.mp3' then 
+          Result := 'audio/mpeg'
+  else if Ext = '.wav' then 
+          Result := 'audio/wav'
+  else if Ext = '.ogg' then 
+          Result := 'audio/ogg'
+  else if Ext = '.flac' then 
+          Result := 'audio/flac'
+  else if Ext = '.aac' then 
+          Result := 'audio/aac'
+  else if Ext = '.wma' then 
+          Result := 'audio/x-ms-wma'
 
-  // Fonts
-  else if Ext = '.ttf' then Result := 'font/ttf'
-  else if Ext = '.otf' then Result := 'font/otf'
-  else if Ext = '.woff' then Result := 'font/woff'
-  else if Ext = '.woff2' then Result := 'font/woff2'
-
-  else Result := 'application/octet-stream';
+  else if Ext = '.ttf' then 
+          Result := 'font/ttf'
+  else if Ext = '.otf' then 
+          Result := 'font/otf'
+  else if Ext = '.woff' then 
+          Result := 'font/woff'
+  else if Ext = '.woff2' then 
+          Result := 'font/woff2'
+  else 
+          Result := 'application/octet-stream';
 end;
 
 procedure TResponse.AddFileStreamContent(const ContentType, Filename: string);
@@ -1077,7 +1105,7 @@ begin
     AddFileStreamContent(DetectContentTypeFromExtension(Filename), Filename);
     RemoveHeader('Content-Disposition');
     AddHeader('Content-Disposition', 'inline; filename="' + ExtractFileName(Filename) + '"');
-    AddHeader('Cache-Control', 'public, max-age=31536000'); // 1 year
+    AddHeader('Cache-Control', 'public, max-age=31536000');
     AddHeader('ETag', '"' + IntToStr(FSourceFileSize) + '-' + IntToStr(DateTimeToUnix(TFile.GetLastWriteTime(Filename))) + '"');
   except
     on E: Exception do
@@ -1735,7 +1763,7 @@ var
   ReadBytes: Integer;
 begin
   FinalizeContent;
-  FHeadersSent := True; // Ignore raw HTTP/1.1 header block!
+  FHeadersSent := True;
   Stream := TMemoryStream.Create;
   try
     repeat

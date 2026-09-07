@@ -10,6 +10,5 @@ A server demonstrating dual-stack transport over both TCP (HTTP/1.1) and UDP (HT
 - **Benchmarking**: `/api/http3/ping` and `/api/http3/benchmark` endpoints for protocol performance comparison.
 
 ## Getting Started
-1. Open `Http3QuicSpeedServer.dproj` in RAD Studio and build (Shift+F9).
-2. Run `Http3QuicSpeedServer.exe`.
-3. Open `https://localhost:8443/` in your browser.
+1. Run `Http3QuicSpeedServer.exe`.
+2. Open `https://localhost:8443/` in your browser.

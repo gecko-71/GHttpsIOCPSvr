@@ -40,6 +40,7 @@ uses
   System.StrUtils,
   System.IOUtils,
   System.JSON,
+  GWebSocket in 'src\GWebSocket.pas',
   GHttpsServerIOCP in 'src\GHttpsServerIOCP.pas',
   GJWTManager in 'src\GJWTManager.pas',
   GRequest in 'src\GRequest.pas',
@@ -47,14 +48,26 @@ uses
   GResponse in 'src\GResponse.pas',
   OverlappedExPool in 'src\OverlappedExPool.pas',
   WinApiAdditions in 'src\WinApiAdditions.pas',
-  WinApi.MsQuic in 'Http3Delphi\WinApi.MsQuic.pas',
-  Net.MsQuic in 'Http3Delphi\Net.MsQuic.pas',
-  Net.Http3Frames in 'Http3Delphi\Net.Http3Frames.pas',
-  Net.QPACK.Huffman in 'Http3Delphi\Net.QPACK.Huffman.pas',
-  Net.QPACK in 'Http3Delphi\Net.QPACK.pas',
-  Net.Http3Request in 'Http3Delphi\Net.Http3Request.pas',
-  Net.Http3Response in 'Http3Delphi\Net.Http3Response.pas',
-  Net.Http3Server in 'Http3Delphi\Net.Http3Server.pas';
+  LsQpack.Loader in 'Http3DelphiV3\ls-qpack\LsQpack.Loader.pas',
+  LsQpack.Types in 'Http3DelphiV3\ls-qpack\LsQpack.Types.pas',
+  Http3.Connection in 'Http3DelphiV3\Http3.Connection.pas',
+  Http3.Frames in 'Http3DelphiV3\Http3.Frames.pas',
+  Http3.Request in 'Http3DelphiV3\Http3.Request.pas',
+  Http3.Response in 'Http3DelphiV3\Http3.Response.pas',
+  Http3.Server in 'Http3DelphiV3\Http3.Server.pas',
+  Http3.Types in 'Http3DelphiV3\Http3.Types.pas',
+  MsQuic.ApiTable in 'Http3DelphiV3\MsQuic.ApiTable.pas',
+  MsQuic.Certificate in 'Http3DelphiV3\MsQuic.Certificate.pas',
+  MsQuic.Configuration in 'Http3DelphiV3\MsQuic.Configuration.pas',
+  MsQuic.Errors in 'Http3DelphiV3\MsQuic.Errors.pas',
+  MsQuic.Listener in 'Http3DelphiV3\MsQuic.Listener.pas',
+  MsQuic.Loader in 'Http3DelphiV3\MsQuic.Loader.pas',
+  MsQuic.Registration in 'Http3DelphiV3\MsQuic.Registration.pas',
+  MsQuic.Types in 'Http3DelphiV3\MsQuic.Types.pas',
+  Quic.Server in 'Http3DelphiV3\Quic.Server.pas',
+  WebTransport.Server in 'Http3DelphiV3\WebTransport.Server.pas',
+  WebTransport.Session in 'Http3DelphiV3\WebTransport.Session.pas',
+  WebTransport.Types in 'Http3DelphiV3\WebTransport.Types.pas';
 
 procedure ConfigureFastMM;
 begin
@@ -308,6 +321,45 @@ begin
       Server.EnableKeepAlive := KeepAliveParam;
       Server.EnableHttp3 := True;
 
+      Server.RegisterWebSocketRoute('/chat',
+        procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const MessageText: string; Opcode: TWebSocketOpcode)
+        begin
+          if Opcode = wsOpText then
+            Session.SendText(MessageText);
+          AServer.TriggerWebSocketWrite(Session);
+        end
+      );
+
+      Server.RegisterWebSocketRoute('/ws');
+
+      Server.RegisterWebTransportRoute(
+        '/webtransport',
+        nil, 
+        procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+        begin
+          Session.SendOnStream(Stream, Data);
+        end,
+        procedure(Session: PWTSessionContext; const Data: TBytes)
+        begin
+          Session.SendDatagram(Data);
+        end,
+        nil  
+      );
+
+      Server.RegisterWebTransportRoute(
+        '/wt',
+        nil, 
+        procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+        begin
+          Session.SendOnStream(Stream, Data);
+        end,
+        procedure(Session: PWTSessionContext; const Data: TBytes)
+        begin
+          Session.SendDatagram(Data);
+        end,
+        nil 
+      );
+
       Server.RegisterEndpointProc('/status', hmGET,
         procedure(Sender: TObject; const ARequest: TRequest;
                                    const AResponse: TResponse;
@@ -337,8 +389,9 @@ begin
         begin
           Json := TJSONObject.Create;
           try
-            Json.AddPair('protocol', 'HTTP/1.1');
-            Json.AddPair('server', 'GHttpsIOCPSvr');
+            Json.AddPair('server', 'GHttpsIOCPSvr-QuadProtocolHybrid');
+            Json.AddPair('protocols_active', 'HTTP/1.1 + HTTPS (TLS 1.3/1.2) + WebSocket + HTTP/3 QUIC + WebTransport');
+            Json.AddPair('alt_svc', Format('h3=":%d"; ma=86400', [HttpsPortParam]));
             AResponse.AddJSONContent(Json.ToJSON);
           finally
             Json.Free;
@@ -661,21 +714,37 @@ begin
       Logger.Info('================================================================');
       if HttpsPortParam > 0 then
       begin
-        Logger.Info(Format('  [HTTPS TLS]   https://localhost:%d/status', [HttpsPortParam]));
-        Logger.Info(Format('  [HTTP/3 QUIC] UDP Port %d (Alt-Svc h3 enabled)', [HttpsPortParam]));
+        Logger.Info(Format('  [HTTPS TLS]    https://localhost:%d/status', [HttpsPortParam]));
+        Logger.Info(Format('  [WebSocket]    wss://localhost:%d/chat', [HttpsPortParam]));
+        Logger.Info(Format('  [HTTP/3 QUIC]  UDP Port %d (Alt-Svc h3 enabled)', [HttpsPortParam]));
+        Logger.Info(Format('  [WebTransport] https://localhost:%d/webtransport', [HttpsPortParam]));
       end;
       if HttpPortParam > 0 then
       begin
-        Logger.Info(Format('  [HTTP Plain]  http://localhost:%d/status', [HttpPortParam]));
+        Logger.Info(Format('  [HTTP Plain]   http://localhost:%d/status', [HttpPortParam]));
+        Logger.Info(Format('  [WebSocket]    ws://localhost:%d/chat', [HttpPortParam]));
       end;
       Logger.Info('----------------------------------------------------------------');
       Logger.Info('  CONTROL: Press [ENTER] in console window to gracefully stop the server.');
       Logger.Info('================================================================');
 
-      try
-        Readln;
-      except
-        on E: EInOutError do ;
+      if FindCmdLineSwitch('daemon') then
+      begin
+        Logger.Info('Running in daemon mode. Press Ctrl+C or kill process to stop.');
+        while Server.Running do
+          Sleep(1000);
+      end
+      else
+      begin
+        try
+          Readln;
+        except
+          on E: EInOutError do
+          begin
+            while Server.Running do
+              Sleep(1000);
+          end;
+        end;
       end;
       Server.Stop;
     finally

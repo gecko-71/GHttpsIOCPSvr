@@ -1,4 +1,4 @@
-﻿{
+{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -50,14 +50,14 @@ uses
   GResponse,
   OverlappedExPool,
   WinApiAdditions,
-  WinApi.MsQuic,
-  Net.MsQuic,
-  Net.Http3Frames,
-  Net.QPACK.Huffman,
-  Net.QPACK,
-  Net.Http3Request,
-  Net.Http3Response,
-  Net.Http3Server;
+  Http3.Types,
+  Http3.Server,
+  Http3.Request,
+  Http3.Response,
+  WebTransport.Types,
+  WebTransport.Server,
+  WebTransport.Session,
+  MsQuic.Types;
 
 type
   TServerProtocolMode = (
@@ -87,6 +87,35 @@ type
   TWebSocketMessageProc = reference to procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const MessageText: string; Opcode: TWebSocketOpcode);
   TWebSocketConnectProc = reference to procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession);
   TWebSocketDisconnectProc = reference to procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const Reason: string);
+
+  THttp3Request = TQuicHttp3Request;
+  THttp3Response = TQuicHttp3Response;
+
+  TWebTransportSessionProc  = reference to procedure(Session: PWTSessionContext);
+  TWebTransportStreamProc   = reference to procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes);
+  TWebTransportDatagramProc = reference to procedure(Session: PWTSessionContext; const Data: TBytes);
+  TWebTransportClosedProc   = reference to procedure(SessionId: TWTSessionId);
+
+  TWebTransportRouteItem = class
+  private
+    FPath: string;
+    FOnSessionReady: TWebTransportSessionProc;
+    FOnStreamData: TWebTransportStreamProc;
+    FOnDatagram: TWebTransportDatagramProc;
+    FOnSessionClosed: TWebTransportClosedProc;
+  public
+    constructor Create(const APath: string;
+                       AOnSessionReady: TWebTransportSessionProc = nil;
+                       AOnStreamData: TWebTransportStreamProc = nil;
+                       AOnDatagram: TWebTransportDatagramProc = nil;
+                       AOnSessionClosed: TWebTransportClosedProc = nil);
+
+    property Path: string read FPath;
+    property OnSessionReady: TWebTransportSessionProc read FOnSessionReady;
+    property OnStreamData: TWebTransportStreamProc read FOnStreamData;
+    property OnDatagram: TWebTransportDatagramProc read FOnDatagram;
+    property OnSessionClosed: TWebTransportClosedProc read FOnSessionClosed;
+  end;
 
   TEndpointItem = class
   private
@@ -136,6 +165,8 @@ type
     FEndpoints: TDictionary<string, TEndpointItem>;
     FWebSocketRoutes: TDictionary<string, Boolean>;
     FWebSocketRouteHandlers: TDictionary<string, TWebSocketMessageProc>;
+    FWebTransportRoutes: TDictionary<string, TWebTransportRouteItem>;
+    FWebTransportSessionRoutes: TDictionary<TWTSessionId, string>;
     FOnWebSocketMessage: TWebSocketMessageProc;
     FOnWebSocketConnect: TWebSocketConnectProc;
     FOnWebSocketDisconnect: TWebSocketDisconnectProc;
@@ -178,7 +209,9 @@ type
     procedure ContinueReadingRequest(OverlappedEx: POverlappedEx);
     function ProcessSSLHandshakeStep(var OverlappedEx: TOverlappedEx; BytesReceived: DWORD): Boolean;
     function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
-                             var PlainData: TBytes; out BytesConsumed: Integer): Boolean;
+                             var PlainData: TBytes; out BytesConsumed: Integer): Boolean; overload;
+    function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
+                             var PlainData: TBytes; out BytesConsumed: Integer; out AStatus: SECURITY_STATUS): Boolean; overload;
     function EncryptBytesToSend(var Context: TCtxtHandle; const PlainData: TBytes; var EncryptedData: TBytes): Boolean;
     class function WorkerThreadProc(Parameter: Pointer): DWORD; stdcall; static;
     class function MonitorThreadProc(Parameter: Pointer): DWORD; stdcall; static;
@@ -186,9 +219,24 @@ type
     function IsRequestComplete(Request: TRequest): Boolean;
     procedure FreeSSLBuffer(var Buffer: Pointer; Size: Cardinal; const Context: string);
     procedure ProcessHttpRequest(OverlappedEx: POverlappedEx);
-    procedure ProcessHttp3Request(Req: THttp3Request; Resp: THttp3Response);
+    procedure HandleHttp3Request(
+      Sender: TObject;
+      const AMethod, APath: string;
+      const AHeaders: TArray<TPair<string, string>>;
+      const ABody: TBytes;
+      out AStatusCode: Integer;
+      out AContentType: string;
+      out AResponseBody: TBytes;
+      out AExtraHeaders: TArray<TPair<string, string>>
+    );
     procedure ContinueSendingResponse(OverlappedEx: POverlappedEx);
     procedure TransitionToWebSocket(OverlappedEx: POverlappedEx);
+
+    function WebTransportSessionRequest(Sender: TObject; const Info: TWTSessionInfo): Boolean;
+    procedure WebTransportSessionReady(Sender: TObject; Session: PWTSessionContext);
+    procedure WebTransportSessionClosed(Sender: TObject; SessionId: TWTSessionId);
+    procedure WebTransportStreamData(Sender: TObject; Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes);
+    procedure WebTransportDatagram(Sender: TObject; Session: PWTSessionContext; const Data: TBytes);
   public
     procedure TriggerWebSocketWrite(Session: TWebSocketSession);
     procedure CleanupWebSocketSession(Session: TWebSocketSession; const Reason: string);
@@ -227,6 +275,16 @@ type
                                       AAuthorizationType: TAuthorizationType = atNone );
     procedure RegisterWebSocketRoute(const APath: string); overload;
     procedure RegisterWebSocketRoute(const APath: string; AOnMessage: TWebSocketMessageProc); overload;
+
+    procedure RegisterWebTransportRoute(const APath: string); overload;
+    procedure RegisterWebTransportRoute(
+      const APath: string;
+      AOnSessionReady: TWebTransportSessionProc;
+      AOnStreamData: TWebTransportStreamProc;
+      AOnDatagram: TWebTransportDatagramProc;
+      AOnSessionClosed: TWebTransportClosedProc = nil
+    ); overload;
+    function GetCertificateSha256Hash: TBytes;
     property OnWebSocketMessage: TWebSocketMessageProc read FOnWebSocketMessage write FOnWebSocketMessage;
     property OnWebSocketConnect: TWebSocketConnectProc read FOnWebSocketConnect write FOnWebSocketConnect;
     property OnWebSocketDisconnect: TWebSocketDisconnectProc read FOnWebSocketDisconnect write FOnWebSocketDisconnect;
@@ -256,8 +314,8 @@ uses TypInfo, System.Hash;
 
 function IsMsQuicDllAvailable(out AErrorDetails: string): Boolean;
 var
-  ExeDir, DllPath: string;
-  H: HMODULE;
+  ExeDir, MsQuicPath, LsQpackPath: string;
+  HMsQuic, HLsQpack: HMODULE;
   OpenVerFunc: function(Version: Cardinal; out ApiTable: Pointer): Cardinal; stdcall;
   ApiTable: Pointer;
   Status: Cardinal;
@@ -267,28 +325,35 @@ begin
   AErrorDetails := '';
 
   ExeDir := ExtractFilePath(ParamStr(0));
-  DllPath := ExeDir + 'msquic.dll';
+  MsQuicPath := ExeDir + 'msquic.dll';
+  LsQpackPath := ExeDir + 'ls-qpack.dll';
 
-  if not FileExists(DllPath) then
+  if not FileExists(MsQuicPath) then
   begin
-    AErrorDetails := Format('msquic.dll not found in server directory: %s', [DllPath]);
+    AErrorDetails := Format('msquic.dll not found in server directory: %s', [MsQuicPath]);
+    Exit;
+  end;
+
+  if not FileExists(LsQpackPath) then
+  begin
+    AErrorDetails := Format('ls-qpack.dll not found in server directory: %s', [LsQpackPath]);
     Exit;
   end;
 
   OldErrorMode := SetErrorMode(SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
   try
-    H := LoadLibrary(PChar(DllPath));
-    if H = 0 then
+    HMsQuic := LoadLibrary(PChar(MsQuicPath));
+    if HMsQuic = 0 then
     begin
-      AErrorDetails := Format('LoadLibrary("%s") failed (Error %d: %s)', [DllPath, GetLastError, SysErrorMessage(GetLastError)]);
+      AErrorDetails := Format('LoadLibrary("%s") failed (Error %d: %s)', [MsQuicPath, GetLastError, SysErrorMessage(GetLastError)]);
       Exit;
     end;
 
     try
-      @OpenVerFunc := GetProcAddress(H, 'MsQuicOpenVersion');
+      @OpenVerFunc := GetProcAddress(HMsQuic, 'MsQuicOpenVersion');
       if not Assigned(@OpenVerFunc) then
       begin
-        AErrorDetails := Format('msquic.dll in "%s" does not export "MsQuicOpenVersion"', [DllPath]);
+        AErrorDetails := Format('msquic.dll in "%s" does not export "MsQuicOpenVersion"', [MsQuicPath]);
         Exit;
       end;
 
@@ -299,16 +364,33 @@ begin
         AErrorDetails := Format('MsQuicOpenVersion failed with status code 0x%x (%d)', [Status, Status]);
         Exit;
       end;
-
-      Result := True;
     finally
-      FreeLibrary(H);
+      FreeLibrary(HMsQuic);
     end;
+
+    HLsQpack := LoadLibrary(PChar(LsQpackPath));
+    if HLsQpack = 0 then
+    begin
+      AErrorDetails := Format('LoadLibrary("%s") failed (Error %d: %s)', [LsQpackPath, GetLastError, SysErrorMessage(GetLastError)]);
+      Exit;
+    end;
+
+    try
+      if (GetProcAddress(HLsQpack, 'lsqpack_enc_init') = nil) or
+         (GetProcAddress(HLsQpack, 'lsqpack_dec_init') = nil) then
+      begin
+        AErrorDetails := Format('ls-qpack.dll in "%s" does not export required entry points (lsqpack_enc_init / lsqpack_dec_init)', [LsQpackPath]);
+        Exit;
+      end;
+    finally
+      FreeLibrary(HLsQpack);
+    end;
+
+    Result := True;
   finally
     SetErrorMode(OldErrorMode);
   end;
 end;
-
 
 procedure CleanupConnectionWithReason(Server: TGHttpsServerIOCP; AOverlapped: POverlappedEx; const AReason: string);
 begin
@@ -319,7 +401,7 @@ begin
   begin
     var WsSession := TWebSocketSession(AOverlapped^.WebSocketSession);
     if Assigned(WsSession) then
-      Server.CleanupWebSocketSession(WsSession, AReason);
+       Server.CleanupWebSocketSession(WsSession, AReason);
     SetLength(AOverlapped^.ClientReceiveBuffer, 0);
     AOverlapped^.WebSocketSession := nil;
     Server.FActiveOverlappedLock.Enter;
@@ -348,10 +430,8 @@ begin
           end;
         end
         else
-        begin
           AOverlapped^.SSLContextValid := False;
-        end;
-      end;
+       end;
       try
         if not IsAbrupt then
         begin
@@ -361,12 +441,10 @@ begin
           Sleep(10);
         end
         else
-        begin
           shutdown(AOverlapped^.Socket, SD_BOTH);
-        end;
-      except
+       except
         on E: Exception do
-          Logger.Error('TCP shutdown error: ' + E.Message);
+           Logger.Error('TCP shutdown error: ' + E.Message);
       end;
       closesocket(AOverlapped^.Socket);
       AOverlapped^.Socket := INVALID_SOCKET;
@@ -501,6 +579,8 @@ begin
   FWebSocketManager := TWebSocketManager.Create;
   FWebSocketRoutes := TDictionary<string, Boolean>.Create;
   FWebSocketRouteHandlers := TDictionary<string, TWebSocketMessageProc>.Create;
+  FWebTransportRoutes := TDictionary<string, TWebTransportRouteItem>.Create;
+  FWebTransportSessionRoutes := TDictionary<TWTSessionId, string>.Create;
   ZeroMemory(@FServerCredHandle, SizeOf(FServerCredHandle));
   Logger.Info(Format('Creating OverlappedEx pool. Max connections: %d', [AMaxConnections]));
   FOverlappedPool := TOverlappedExPool.Create(AMaxConnections div 4, AMaxConnections, AMinFreeMemoryMb, AMaxMemoryLoadPercent);
@@ -529,7 +609,7 @@ begin
   Stop;
 
   if Assigned(FWebSocketManager) then
-    FreeAndNil(FWebSocketManager);
+     FreeAndNil(FWebSocketManager);
 
   if Assigned(FLock) then
   begin
@@ -560,6 +640,17 @@ begin
 
   if Assigned(FWebSocketRouteHandlers) then
     FreeAndNil(FWebSocketRouteHandlers);
+
+  if Assigned(FWebTransportRoutes) then
+  begin
+    for var WTRoute in FWebTransportRoutes.Values do
+      if Assigned(WTRoute) then
+        WTRoute.Free;
+    FreeAndNil(FWebTransportRoutes);
+  end;
+
+  if Assigned(FWebTransportSessionRoutes) then
+    FreeAndNil(FWebTransportSessionRoutes);
 
   if Assigned(FOverlappedPool) then
   begin
@@ -695,9 +786,7 @@ begin
     OutputBufferDesc.cBuffers := 2;
     OutputBufferDesc.pBuffers := @OutputBuffers[0];
     for i := 0 to 1 do
-    begin
-      OriginalBuffers[i] := OutputBuffers[i].pvBuffer;
-    end;
+        OriginalBuffers[i] := OutputBuffers[i].pvBuffer;
 
     Status := AcceptSecurityContext(
       @FServerCredHandle,
@@ -727,11 +816,9 @@ begin
     if (Status = SEC_E_OK) and (OutputBuffers[0].cbBuffer > 0) then
       BytesSent := send(OverlappedEx.Socket, OutputBuffers[0].pvBuffer^, OutputBuffers[0].cbBuffer, 0)
     else
-    begin
       Logger.Error('Could not generate close_notify: Status=0x%x, Size=%d',
         [Status, OutputBuffers[0].cbBuffer]);
-    end;
-  except
+    except
     on E: Exception do
     begin
       Logger.Error('Exception w graceful SSL shutdown: ' + E.Message);
@@ -762,9 +849,7 @@ begin
     end;
   end
   else
-  begin
     Logger.Info('No buffers allocated during SSL shutdown - no cleanup needed');
-  end;
   try
     DeleteSecurityContext(@OverlappedEx.SSLContext);
     OverlappedEx.SSLContextValid := False;
@@ -781,7 +866,7 @@ begin
   try
     var Req := TRequest(InterlockedExchangePointer(Pointer(OverlappedEx^.Request), nil));
     if Assigned(Req) then
-      Req.Free;
+       Req.Free;
 
     var Resp := TResponse(InterlockedExchangePointer(Pointer(OverlappedEx^.Response), nil));
     if Assigned(Resp) then
@@ -979,9 +1064,32 @@ begin
     if WSARecv(OverlappedEx^.Socket, @WSABuf, 1, BytesReceived, Flags,
                @OverlappedEx^.Overlapped, nil) = SOCKET_ERROR then
     begin
-      if WSAGetLastError <> WSA_IO_PENDING then
+      var LastErr := WSAGetLastError;
+      if LastErr <> WSA_IO_PENDING then
       begin
-        Logger.Error('Error continuing request read: ' + IntToStr(WSAGetLastError));
+        if (LastErr = WSAECONNRESET) or (LastErr = 10054) then
+        begin
+          if Assigned(GlobalLogFileProvider) and GlobalLogFileProvider.Enabled then
+          begin
+            TMonitor.Enter(GlobalLogFileProvider);
+            try
+              var LogItem := TLogItem.Create;
+              try
+                LogItem.EventType := etError;
+                LogItem.Msg := 'Error continuing request read: 10054 (WSAECONNRESET: Connection forcibly closed or reset by the remote peer/client)';
+                LogItem.EventDate := Now;
+                LogItem.ThreadId := GetCurrentThreadId;
+                GlobalLogFileProvider.WriteLog(LogItem);
+              finally
+                LogItem.Free;
+              end;
+            finally
+              TMonitor.Exit(GlobalLogFileProvider);
+            end;
+          end;
+        end
+        else
+          Logger.Error('Error continuing request read: ' + IntToStr(LastErr));
         CleanupConnectionWithReason(Self, OverlappedEx, 'Error continuing request read');
       end;
     end;
@@ -1052,7 +1160,8 @@ var
           PrevContext
         );
 
-        if FCertContext = nil then Break;
+        if FCertContext = nil then
+           Break;
 
         Logger.Info('Certificate context candidate allocated at: %p', [FCertContext]);
         try
@@ -1096,7 +1205,7 @@ var
               begin
                 @NCryptFreeObject := GetProcAddress(NCryptLib, 'NCryptFreeObject');
                 if Assigned(NCryptFreeObject) then
-                  NCryptFreeObject(CryptProv);
+                   NCryptFreeObject(CryptProv);
                 FreeLibrary(NCryptLib);
               end;
             end
@@ -1143,7 +1252,42 @@ begin
   Logger.Info(Format('LoadServerCertificate END - Result: %s, FCertContext: %p', [BoolToStr(Result, True), FCertContext]));
 end;
 
+function TGHttpsServerIOCP.GetCertificateSha256Hash: TBytes;
+var
+  HashBytes: array[0..31] of Byte;
+  HashSize: DWORD;
+  CertPtr: PCERT_CONTEXT;
+  RawBytes: TBytes;
+begin
+  SetLength(Result, 0);
+  if FCertContext = nil then Exit;
 
+  HashSize := SizeOf(HashBytes);
+  if CertGetCertificateContextProperty(FCertContext, CERT_SHA256_HASH_PROP_ID, @HashBytes[0], HashSize) then
+  begin
+    SetLength(Result, HashSize);
+    Move(HashBytes[0], Result[0], HashSize);
+    Exit;
+  end;
+
+  try
+    CertPtr := PCERT_CONTEXT(FCertContext);
+    if (CertPtr <> nil) and (CertPtr^.pbCertEncoded <> nil) and (CertPtr^.cbCertEncoded > 0) then
+    begin
+      var Stream := TBytesStream.Create;
+      try
+        Stream.WriteBuffer(CertPtr^.pbCertEncoded^, CertPtr^.cbCertEncoded);
+        Stream.Position := 0;
+        Result := THashSHA2.GetHashBytes(Stream, THashSHA2.TSHA2Version.SHA256);
+      finally
+        Stream.Free;
+      end;
+    end;
+  except
+    on E: Exception do
+      Logger.Warn('[Cert] Error calculating SHA-256 certificate hash: %s', [E.Message]);
+  end;
+end;
 
 function TGHttpsServerIOCP.InitializeSSLCredentials: Boolean;
 const
@@ -1162,7 +1306,7 @@ begin
   SchannelCred.dwVersion := SCHANNEL_CRED_VERSION;
   if FCertContext = nil then
   begin
-    Logger.Error('Błąd krytyczny: Brak certyfikatu.');
+    Logger.Error('Critical error: Missing certificate.');
     Exit;
   end;
   CertArray := FCertContext;
@@ -1349,20 +1493,20 @@ begin
   Logger.Info(Format('  Timeout: %dms', [FSSLShutdownTimeout]));
   Result := False;
   if FRunning then
-    Exit;
+     Exit;
 
-  var MsQuicErr: string;
-  if FEnableHttp3 and (FProtocolMode <> pmHttpOnly) and not IsMsQuicDllAvailable(MsQuicErr) then
+  var Http3DllErr: string;
+  if FEnableHttp3 and (FProtocolMode <> pmHttpOnly) and not IsMsQuicDllAvailable(Http3DllErr) then
   begin
     Writeln;
     Writeln('================================================================');
-    Writeln('  CRITICAL ERROR: Failed to load msquic.dll library!');
-    Writeln('  Reason: ' + MsQuicErr);
-    Writeln('  The server cannot start without a working msquic.dll.');
-    Writeln(Format('  Place a valid 64-bit msquic.dll in: %smsquic.dll', [ExtractFilePath(ParamStr(0))]));
+    Writeln('  CRITICAL ERROR: Failed to load required HTTP/3 libraries!');
+    Writeln('  Reason: ' + Http3DllErr);
+    Writeln('  The server cannot start without working msquic.dll and ls-qpack.dll.');
+    Writeln(Format('  Place valid 64-bit DLL files in: %s', [ExtractFilePath(ParamStr(0))]));
     Writeln('================================================================');
     Writeln;
-    Logger.Error('CRITICAL ERROR: Failed to load msquic.dll: %s', [MsQuicErr]);
+    Logger.Error('CRITICAL ERROR: Failed to load HTTP/3 libraries: %s', [Http3DllErr]);
     Exit;
   end;
 
@@ -1480,11 +1624,18 @@ begin
         end;
 
         Logger.Info(Format('[H3] Creating HTTP/3 server with SHA-1 hash %s from store LocalMachine\%s (StoreHandle=%p)', [H3HashHex, FCertificateStore, FServerCertStore]));
-        FHttp3Server := THttp3Server.Create(H3HashHex, FCertificateStore, FServerCertStore);
+        FHttp3Server := THttp3Server.Create(H3HashHex, FCertificateStore, FSubjectName, FServerCertStore);
+        FHttp3Server.EnableWebTransport;
+        FHttp3Server.OnHttpRequest := HandleHttp3Request;
 
-        FHttp3Server.OnRequest := ProcessHttp3Request;
+        FHttp3Server.WebTransport.OnSessionRequest := WebTransportSessionRequest;
+        FHttp3Server.WebTransport.OnSessionReady   := WebTransportSessionReady;
+        FHttp3Server.WebTransport.OnSessionClosed  := WebTransportSessionClosed;
+        FHttp3Server.WebTransport.OnStreamData     := WebTransportStreamData;
+        FHttp3Server.WebTransport.OnDatagram       := WebTransportDatagram;
+
         FHttp3Server.Start(FHttpsPort);
-        Logger.Info(Format('HTTP/3 (UDP) server listening on port %d', [FHttpsPort]));
+        Logger.Info(Format('HTTP/3 & WebTransport (UDP) server listening on port %d', [FHttpsPort]));
       end;
     except
       on E: Exception do
@@ -1499,9 +1650,14 @@ begin
           try
             FHttp3Server.Free;
           except
+            Logger.Error('ERROR  FHttp3Server.Free : ' + E.Message);
           end;
           FHttp3Server := nil;
         end;
+
+        Stop;
+        Result := False;
+        Exit;
       end;
     end;
   end;
@@ -1533,11 +1689,11 @@ begin
           if Assigned(WS_Session) and (WS_Session.InCleanup = 0) then
           begin
             try
-              WS_Session.QueueSendFrame(wsOpClose, [$03, $E9]); // Going Away
+              WS_Session.QueueSendFrame(wsOpClose, [$03, $E9]);
               TriggerWebSocketWrite(WS_Session);
             except
               on E: Exception do
-                Logger.Error('[STOP-WS-SENDCLOSE-ERR] Exception sending Close frame: %s', [E.Message]);
+                 Logger.Error('[STOP-WS-SENDCLOSE-ERR] Exception sending Close frame: %s', [E.Message]);
             end;
           end;
         end;
@@ -2002,6 +2158,16 @@ function TGHttpsServerIOCP.DecryptReceivedData(var Context: TCtxtHandle; const E
                            var PlainData: TBytes;
                            out BytesConsumed: Integer): Boolean;
 var
+  LStatus: SECURITY_STATUS;
+begin
+  Result := DecryptReceivedData(Context, EncryptedData, PlainData, BytesConsumed, LStatus);
+end;
+
+function TGHttpsServerIOCP.DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
+                           var PlainData: TBytes;
+                           out BytesConsumed: Integer;
+                           out AStatus: SECURITY_STATUS): Boolean;
+var
   Buffers: array[0..3] of TSecBuffer;
   BufferDesc: TSecBufferDesc;
   Status: SECURITY_STATUS;
@@ -2014,8 +2180,15 @@ begin
   Result := False;
   SetLength(PlainData, 0);
   BytesConsumed := 0;
+  AStatus := SEC_E_OK;
   if Length(EncryptedData) = 0 then
     Exit;
+
+  if (Context.dwLower = 0) and (Context.dwUpper = 0) then
+  begin
+    AStatus := SEC_E_INVALID_HANDLE;
+    Exit;
+  end;
 
   OriginalDataPtr := @EncryptedData[0];
   try
@@ -2040,6 +2213,7 @@ begin
     BufferDesc.pBuffers := @Buffers[0];
 
     Status := DecryptMessage(@Context, @BufferDesc, 0, nil);
+    AStatus := Status;
     if Status = SEC_E_OK then
     begin
       ExtraBufferFound := False;
@@ -2098,14 +2272,21 @@ begin
         end;
       end;
     end
-    else if Status <> SEC_E_INCOMPLETE_MESSAGE then
-      Logger.Error('DecryptMessage failed with error: 0x%x', [Status]);
+    else if (Status <> SEC_E_INCOMPLETE_MESSAGE) and
+            (Status <> Longint($80090330)) and
+            (Status <> SEC_E_CONTEXT_EXPIRED) and
+            (Status <> SEC_I_CONTEXT_EXPIRED) and
+            (Status <> SEC_I_RENEGOTIATE) then
+    begin
+      Logger.Debug('DecryptMessage info: 0x%x (%s)', [Status, GetSSLErrorDescription(Status)]);
+    end;
   except
     on E: Exception do
     begin
-      Logger.Error('Exception w DecryptReceivedData: %s', [E.Message]);
+      Logger.Error('Exception in DecryptReceivedData: %s', [E.Message]);
       Result := False;
       BytesConsumed := 0;
+      AStatus := SEC_E_INTERNAL_ERROR;
     end;
   end;
 end;
@@ -2209,7 +2390,16 @@ begin
     if Request.HasSecurityViolation then
     begin
       Logger.Warn('Security violation detected: ' + Request.GetThreatSummary);
-      Response.SetBadRequest('Security Violation Detected');
+      Response.KeepAlive := False;
+
+      if ContainsText(Request.ErrorMessage, 'exceed') or ContainsText(Request.GetThreatSummary, 'exceed') or
+         ContainsText(Request.GetThreatSummary, 'limit') or ContainsText(Request.GetThreatSummary, 'oversize') then
+      begin
+        Response.SetStatus(hsPayloadTooLarge);
+        Response.AddTextContent('application/json', '{"error":"Payload Too Large","message":"' + Request.ErrorMessage + '"}');
+      end
+      else
+        Response.SetBadRequest('Security Violation Detected: ' + Request.GetThreatSummary);
     end
     else
     begin
@@ -2294,10 +2484,163 @@ begin
         ContinueSendingResponse(OverlappedEx);
       end
       else
-      begin
         Logger.Error('Critical error: Missing OverlappedEx object in the exception handler.');
-      end;
     end;
+  end;
+end;
+
+procedure TGHttpsServerIOCP.HandleHttp3Request(
+  Sender: TObject;
+  const AMethod, APath: string;
+  const AHeaders: TArray<TPair<string, string>>;
+  const ABody: TBytes;
+  out AStatusCode: Integer;
+  out AContentType: string;
+  out AResponseBody: TBytes;
+  out AExtraHeaders: TArray<TPair<string, string>>
+);
+var
+  ReqInfo: THttpRequestInfo;
+  Endpoint: TEndpointItem;
+  Key: string;
+  MethodEnum: THttpMethod;
+  Request: TRequest;
+  Response: TResponse;
+  AuthHeader: string;
+  JWT: TJWTToken;
+  isAuthorized: Boolean;
+  Hdr: TPair<string, string>;
+  RemoteAddr: TSockAddrIn;
+begin
+  AStatusCode := 404;
+  AContentType := 'text/plain';
+  SetLength(AResponseBody, 0);
+  SetLength(AExtraHeaders, 0);
+
+  ReqInfo := THttpRequestInfo.Create;
+  try
+    ReqInfo.ParseUri(APath);
+
+    if not ReqInfo.IsUriValid then
+    begin
+      AStatusCode := 400;
+      AContentType := 'text/plain';
+      AResponseBody := TEncoding.UTF8.GetBytes('400 Bad Request');
+      Exit;
+    end;
+
+    if SameText(AMethod, 'GET') then
+      MethodEnum := hmGET
+    else if SameText(AMethod, 'POST') then
+      MethodEnum := hmPOST
+    else if SameText(AMethod, 'PUT') then
+      MethodEnum := hmPUT
+    else if SameText(AMethod, 'DELETE') then
+      MethodEnum := hmDELETE
+    else if SameText(AMethod, 'HEAD') then
+      MethodEnum := hmHEAD
+    else if SameText(AMethod, 'OPTIONS') then
+      MethodEnum := hmOPTIONS
+    else if SameText(AMethod, 'PATCH') then
+      MethodEnum := hmPATCH
+    else
+      MethodEnum := hmUnknown;
+
+    Key := GetEndpointKey(MethodEnum, ReqInfo.Path);
+
+    Endpoint := nil;
+    FLock.Enter;
+    try
+      if not FEndpoints.TryGetValue(Key, Endpoint) then
+      begin
+        if (MethodEnum = hmGET) and (ReqInfo.Path = '/') then
+          FEndpoints.TryGetValue(GetEndpointKey(hmGET, '/'), Endpoint);
+      end;
+    finally
+      FLock.Leave;
+    end;
+
+    if not Assigned(Endpoint) then
+    begin
+      AStatusCode := 404;
+      AContentType := 'text/plain';
+      AResponseBody := TEncoding.UTF8.GetBytes('404 Not Found');
+      Exit;
+    end;
+
+    FillChar(RemoteAddr, SizeOf(RemoteAddr), 0);
+    Request := TRequest.Create(INVALID_SOCKET, RemoteAddr, FMaxRequestHederSize, FMaxRequestSize);
+    Response := TResponse.Create(INVALID_SOCKET);
+    try
+      Request.RequestInfo.ParseRequestLine(AMethod + ' ' + APath + ' HTTP/1.1');
+      AuthHeader := '';
+      for Hdr in AHeaders do
+      begin
+        Request.Headers.AddHeader(Hdr.Key, Hdr.Value);
+        if SameText(Hdr.Key, 'authorization') then
+          AuthHeader := Hdr.Value;
+      end;
+
+      if Length(ABody) > 0 then
+      begin
+        var BodyStrm := Request.GetBodyStream;
+        if Assigned(BodyStrm) then
+        begin
+          BodyStrm.Clear;
+          BodyStrm.WriteBuffer(ABody[0], Length(ABody));
+          BodyStrm.Position := 0;
+        end;
+      end;
+
+      isAuthorized := True;
+      if Endpoint.AuthorizationType = atJWTBearer then
+      begin
+        isAuthorized := False;
+        AuthHeader := FJWTManager.ExtractTokenFromAuthHeader(AuthHeader);
+        if Length(AuthHeader) > 0 then
+        begin
+          JWT := nil;
+          try
+            if FJWTManager.ValidateToken(AuthHeader, JWT) then
+              isAuthorized := True;
+          finally
+            if Assigned(JWT) then
+               JWT.Free;
+          end;
+        end;
+        if not isAuthorized then
+        begin
+          AStatusCode := 401;
+          AContentType := 'application/json';
+          AResponseBody := TEncoding.UTF8.GetBytes('{"error":"Unauthorized"}');
+          Exit;
+        end;
+      end;
+
+      if Assigned(Endpoint.Handler) then
+        Endpoint.Handler(Self, Request, Response, Self)
+      else if Assigned(Endpoint.HandlerProc) then
+        Endpoint.HandlerProc(Self, Request, Response, Self);
+
+      AStatusCode := Ord(Response.Status);
+      if AStatusCode = 0 then
+        AStatusCode := 200;
+
+      AContentType := Response.ContentType;
+      if AContentType = '' then
+        AContentType := 'text/html; charset=utf-8';
+
+      AResponseBody := Response.GetBodyBytes;
+
+      SetLength(AExtraHeaders, 2);
+      AExtraHeaders[0] := TPair<string, string>.Create('etag', '"h3-static-etag"');
+      AExtraHeaders[1] := TPair<string, string>.Create('cache-control', 'max-age=3600, public');
+    finally
+      Request.Free;
+      Response.Free;
+    end;
+  finally
+    ReqInfo.Free;
   end;
 end;
 
@@ -2329,7 +2672,7 @@ begin
   while Server.FRunning and not GracefulShutdown do
   begin
     if GetQueuedCompletionStatus(Server.FCompletionPort, BytesTransferred,
-                                CompletionKey, POverlapped(OverlappedEx), 2000) then  // 2 sec timeout
+                                CompletionKey, POverlapped(OverlappedEx), 2000) then
     begin
       ConsecutiveErrors := 0;
       if OverlappedEx = nil then
@@ -2337,12 +2680,9 @@ begin
         Logger.Info('Worker thread received shutdown signal');
         Break;
       end;
-      
+
       if (CompletionKey <> 0) and (OverlappedEx^.OpType <> otAccept) and (CompletionKey <> ULONG_PTR(OverlappedEx^.Socket)) then
-      begin
-        // Logger.Info('Ghost completion detected (CompletionKey %d <> Socket %d) - ignoring', [CompletionKey, OverlappedEx^.Socket]);
         Continue;
-      end;
 
       try
         case OverlappedEx^.OpType of
@@ -2355,7 +2695,7 @@ begin
               Logger.Warn('New connection REJECTED due to connection limit reached (%d).', [Server.FMaxConnections]);
               closesocket(OverlappedEx^.ClientSocket);
             end
-            else if Server.FRejectNewConnections = 1 then // 1 = True
+            else if Server.FRejectNewConnections = 1 then
             begin
               Logger.Warn('New connection REJECTED due to system overload (monitor flag).');
               closesocket(OverlappedEx^.ClientSocket);
@@ -2384,7 +2724,7 @@ begin
               if (OverlappedEx^.SSLHandshakeStep = 0) and (BytesTransferred >= 4) then
               begin
                 var FirstByte := OverlappedEx^.Buffer[0];
-                if (FirstByte in [71, 80, 72, 68, 79, 67]) then // 'G', 'P', 'H', 'D', 'O', 'C'
+                if (FirstByte in [71, 80, 72, 68, 79, 67]) then
                 begin
                   var PlainHttpResponse :=
                     'HTTP/1.1 400 Bad Request' + #13#10 +
@@ -2449,6 +2789,9 @@ begin
           begin
             if (BytesTransferred > 0) or (OverlappedEx^.IsTLS and (Length(OverlappedEx^.ClientReceiveBuffer) > 0)) then
             begin
+              if Assigned(OverlappedEx^.Response) then
+                Continue;
+
               if not OverlappedEx^.IsTLS then
               begin
                 if not Assigned(OverlappedEx^.Request) then
@@ -2457,15 +2800,23 @@ begin
                 if Assigned(OverlappedEx^.Request) then
                 begin
                   OverlappedEx^.Request.AppendData(OverlappedEx^.Buffer, BytesTransferred);
-                  if Server.IsRequestComplete(OverlappedEx^.Request) then
-                    Server.ProcessHttpRequest(OverlappedEx)
-                  else if not OverlappedEx^.Request.CanAcceptMoreData then
-                    Server.ProcessHttpRequest(OverlappedEx)
+                  if Server.IsRequestComplete(OverlappedEx^.Request) or (not OverlappedEx^.Request.CanAcceptMoreData) then
+                  begin
+                    if not Assigned(OverlappedEx^.Response) then
+                      Server.ProcessHttpRequest(OverlappedEx);
+                  end
                   else
                     Server.ContinueReadingRequest(OverlappedEx);
                 end
                 else
                   CleanupConnectionWithReason(Server, OverlappedEx, 'Request object NIL during plain HTTP read');
+                Continue;
+              end;
+
+              if OverlappedEx^.IsTLS and (not OverlappedEx^.SSLContextValid) then
+              begin
+                SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+                CleanupConnectionWithReason(Server, OverlappedEx, 'TLS context invalid or already terminated');
                 Continue;
               end;
 
@@ -2484,12 +2835,15 @@ begin
               end;
               var DecryptedPlainData: TBytes;
               var CurrentAttemptConsumedBytes: Integer;
+              var DecryptStatus: SECURITY_STATUS := SEC_E_OK;
+              var FatalTlsError: Boolean := False;
               while Length(OverlappedEx^.ClientReceiveBuffer) > 0 do
               begin
                 DecryptSuccess := Server.DecryptReceivedData(OverlappedEx^.SSLContext,
                                                              OverlappedEx^.ClientReceiveBuffer,
                                                              DecryptedPlainData,
-                                                             CurrentAttemptConsumedBytes);
+                                                             CurrentAttemptConsumedBytes,
+                                                             DecryptStatus);
 
                 if DecryptSuccess then
                 begin
@@ -2523,14 +2877,29 @@ begin
                   end;
                 end
                 else
-                  Break;
+                begin
+                  if (DecryptStatus = SEC_E_INCOMPLETE_MESSAGE) or (DecryptStatus = Longint($80090330)) then
+                     Break
+                  else
+                  begin
+                    FatalTlsError := True;
+                    SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+                    CleanupConnectionWithReason(Server, OverlappedEx,
+                      Format('TLS fatal decrypt error: %s (0x%x)', [GetSSLErrorDescription(DecryptStatus), DecryptStatus]));
+                    Break;
+                  end;
+                end;
               end;
+
+               if FatalTlsError or (OverlappedEx^.Socket = INVALID_SOCKET) then
+                Continue;
               if Assigned(OverlappedEx^.Request) then
               begin
-                  if Server.IsRequestComplete(OverlappedEx^.Request) then
-                    Server.ProcessHttpRequest(OverlappedEx)
-                  else if not OverlappedEx^.Request.CanAcceptMoreData then
-                    Server.ProcessHttpRequest(OverlappedEx)
+                  if Server.IsRequestComplete(OverlappedEx^.Request) or (not OverlappedEx^.Request.CanAcceptMoreData) then
+                  begin
+                    if not Assigned(OverlappedEx^.Response) then
+                      Server.ProcessHttpRequest(OverlappedEx);
+                  end
                   else
                     Server.ContinueReadingRequest(OverlappedEx);
               end
@@ -2578,6 +2947,7 @@ begin
                   if (BytesTransferred > 0) and (WsSession.InCleanup = 0) then
                   begin
                     var CloseConn: Boolean := False;
+                    var WsFatalError: Boolean := False;
 
                     if not OverlappedEx^.IsTLS then
                     begin
@@ -2664,15 +3034,25 @@ begin
                     end
                     else
                     begin
+                      if OverlappedEx^.IsTLS and (not OverlappedEx^.SSLContextValid) then
+                      begin
+                        Server.CleanupWebSocketSession(WsSession, 'WebSocket TLS context invalid or released');
+                        SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+                        OverlappedEx^.WebSocketSession := nil;
+                        Server.FOverlappedPool.Release(OverlappedEx);
+                        Continue;
+                      end;
+
                       var CurrentLen := Length(OverlappedEx^.ClientReceiveBuffer);
                       SetLength(OverlappedEx^.ClientReceiveBuffer, CurrentLen + BytesTransferred);
                       Move(OverlappedEx^.Buffer[0], OverlappedEx^.ClientReceiveBuffer[CurrentLen], BytesTransferred);
 
                       var DecryptedPlainData: TBytes;
                       var ConsumedBytes: Integer;
+                      var WsDecryptStatus: SECURITY_STATUS := SEC_E_OK;
                       while (Length(OverlappedEx^.ClientReceiveBuffer) > 0) and (WsSession.InCleanup = 0) do
                       begin
-                        if Server.DecryptReceivedData(OverlappedEx^.SSLContext, OverlappedEx^.ClientReceiveBuffer, DecryptedPlainData, ConsumedBytes) then
+                        if Server.DecryptReceivedData(OverlappedEx^.SSLContext, OverlappedEx^.ClientReceiveBuffer, DecryptedPlainData, ConsumedBytes, WsDecryptStatus) then
                         begin
                           if ConsumedBytes > 0 then
                           begin
@@ -2768,9 +3148,25 @@ begin
                             Break;
                         end
                         else
-                          Break;
+                        begin
+                          if (WsDecryptStatus = SEC_E_INCOMPLETE_MESSAGE) or (WsDecryptStatus = Longint($80090330)) then
+                            Break
+                          else
+                          begin
+                            WsFatalError := True;
+                            Server.CleanupWebSocketSession(WsSession,
+                              Format('WebSocket TLS fatal decrypt error: %s (0x%x)', [GetSSLErrorDescription(WsDecryptStatus), WsDecryptStatus]));
+                            SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+                            OverlappedEx^.WebSocketSession := nil;
+                            Server.FOverlappedPool.Release(OverlappedEx);
+                            Break;
+                          end;
+                        end;
                       end;
                     end;
+
+                    if WsFatalError or (WsSession.InCleanup <> 0) then
+                      Continue;
 
                     if not CloseConn and (WsSession.InCleanup = 0) then
                     begin
@@ -3026,7 +3422,7 @@ begin
   Result := 0;
 end;
 
-const RESPONSE_CHUNK_SIZE = 8192; // 8KB
+const RESPONSE_CHUNK_SIZE = 8192;
 procedure TGHttpsServerIOCP.ContinueSendingResponse(OverlappedEx: POverlappedEx);
 var
   PlainChunk: TBytes;
@@ -3096,7 +3492,7 @@ begin
           PerformGracefulSSLShutdown(OverlappedEx^);
         except
           on E: Exception do
-            Logger.Error('Błąd SSL shutdown po transferze: ' + E.Message);
+            Logger.Error('SSL shutdown error after transfer: ' + E.Message);
         end;
       end else
       begin
@@ -3153,7 +3549,8 @@ begin
       begin
         var ErrorCode := WSAGetLastError;
         if (ErrorCode = WSAECONNRESET) or (ErrorCode = WSAECONNABORTED) or (ErrorCode = WSAENOTSOCK) or (ErrorCode = 10038) then
-          Logger.Info('Client disconnected during chunk upload (code %d)', [ErrorCode])
+        begin
+        end
         else
           Logger.Error('Error starting chunk upload: %d', [ErrorCode]);
         CleanupConnectionWithReason(Self, OverlappedEx, Format('Error WSASend: %d', [ErrorCode]));
@@ -3508,8 +3905,6 @@ var
   WSABuf: TWSABUF;
   Flags, BytesReceived: DWORD;
 begin
-  Logger.Info('Upgrading connection on socket %d to WebSocket', [OverlappedEx^.Socket]);
-
   var ReqPath: string := '';
   if Assigned(OverlappedEx^.Request) then
     ReqPath := OverlappedEx^.Request.RequestInfo.Path.ToLower;
@@ -3549,7 +3944,7 @@ begin
 
   OverlappedEx^.OpType := otWebSocketRead;
   OverlappedEx^.WebSocketSession := Session;
-  OverlappedEx^.WebSocketState := 1; // 1 = Open
+  OverlappedEx^.WebSocketState := 1;
 
   Session.ReadOverlapped := OverlappedEx;
   Session.WriteOverlapped := WriteOverlapped;
@@ -3576,9 +3971,13 @@ begin
   if WSARecv(OverlappedEx^.Socket, @WSABuf, 1, BytesReceived, Flags,
             @OverlappedEx^.Overlapped, nil) = SOCKET_ERROR then
   begin
-    if WSAGetLastError <> WSA_IO_PENDING then
+    var LastErr := WSAGetLastError;
+    if LastErr <> WSA_IO_PENDING then
     begin
-      Logger.Error('WSARecv failed in TransitionToWebSocket: %d', [WSAGetLastError]);
+      if (LastErr = 10053 {WSAECONNABORTED}) or (LastErr = 10054 {WSAECONNRESET}) or (LastErr = 10058 {WSAESHUTDOWN}) then
+        Logger.Debug('Client disconnected during TransitionToWebSocket: %d', [LastErr])
+      else
+        Logger.Error('WSARecv failed in TransitionToWebSocket: %d', [LastErr]);
       CleanupWebSocketSession(Session, 'WSARecv failed on transition');
     end;
   end;
@@ -3735,8 +4134,6 @@ begin
 
   try
     var LocalSocket := Session.Socket;
-    Logger.Info('Closing WebSocket session for socket %d. Reason: %s', [LocalSocket, Reason]);
-
     if Assigned(FOnWebSocketDisconnect) then
     begin
       try
@@ -3790,157 +4187,6 @@ begin
       if Assigned(Session) then SockId := Session.Socket;
       Logger.Error('Exception in CleanupWebSocketSession [Socket:%d, %s]: %s', [SockId, E.ClassName, E.Message]);
     end;
-  end;
-end;
-
-procedure TGHttpsServerIOCP.ProcessHttp3Request(Req: THttp3Request; Resp: THttp3Response);
-var
-  Endpoint: TEndpointItem;
-  Key: string;
-  Method: THttpMethod;
-  DummyReq: TRequest;
-  DummyResp: TResponse;
-  RemoteAddr: TSockAddrIn;
-  IsAuth: Boolean;
-  AuthHeader: string;
-  JWT: TJWTToken;
-begin
-  if Req = nil then
-     Exit;
-
-  if SameText(Req.Method, 'GET') then
-     Method := hmGET
-  else if SameText(Req.Method, 'POST') then
-     Method := hmPOST
-  else if SameText(Req.Method, 'PUT') then
-     Method := hmPUT
-  else if SameText(Req.Method, 'DELETE') then
-     Method := hmDELETE
-  else if SameText(Req.Method, 'HEAD') then
-     Method := hmHEAD
-  else if SameText(Req.Method, 'OPTIONS') then
-     Method := hmOPTIONS
-  else if SameText(Req.Method, 'PATCH') then
-     Method := hmPATCH
-  else
-     Method := hmUnknown;
-
-  var QueryPos: Integer := Pos('?', Req.Path);
-  var PurePath: string;
-  if QueryPos > 0 then
-    PurePath := Copy(Req.Path, 1, QueryPos - 1)
-  else
-    PurePath := Req.Path;
-
-  Key := GetEndpointKey(Method, PurePath);
-
-  FillChar(RemoteAddr, SizeOf(RemoteAddr), 0);
-  DummyReq := TRequest.Create(INVALID_SOCKET, RemoteAddr, FMaxRequestHederSize, FMaxRequestSize);
-  DummyResp := TResponse.Create(INVALID_SOCKET);
-  try
-    var RawHeaderStr: string := Req.Method + ' ' + Req.Path + ' HTTP/1.1' + #13#10;
-    var HasHost: Boolean := False;
-    var HasContentLength: Boolean := False;
-    for var H in Req.Headers do
-    begin
-      if (Length(H.Name) > 0) and (H.Name[1] <> ':') then
-      begin
-        RawHeaderStr := RawHeaderStr + H.Name + ': ' + H.Value + #13#10;
-        if SameText(H.Name, 'host') then
-           HasHost := True;
-        if SameText(H.Name, 'content-length') then
-           HasContentLength := True;
-      end;
-    end;
-    if not HasHost and (Req.Host <> '') then
-      RawHeaderStr := RawHeaderStr + 'Host: ' + Req.Host + #13#10;
-    if not HasContentLength then
-      RawHeaderStr := RawHeaderStr + 'Content-Length: ' + IntToStr(Length(Req.Body)) + #13#10;
-
-    RawHeaderStr := RawHeaderStr + #13#10;
-
-    var RawHeaderBytes: TBytes := TEncoding.UTF8.GetBytes(RawHeaderStr);
-    var FullRawBytes: TBytes;
-    SetLength(FullRawBytes, Length(RawHeaderBytes) + Length(Req.Body));
-    if Length(RawHeaderBytes) > 0 then
-      Move(RawHeaderBytes[0], FullRawBytes[0], Length(RawHeaderBytes));
-    if Length(Req.Body) > 0 then
-      Move(Req.Body[0], FullRawBytes[Length(RawHeaderBytes)], Length(Req.Body));
-
-    if Length(FullRawBytes) > 0 then
-      DummyReq.AppendData(FullRawBytes[0], Length(FullRawBytes));
-
-    var HasEndpoint: Boolean := False;
-    FLock.Enter;
-    try
-      HasEndpoint := FEndpoints.TryGetValue(Key, Endpoint);
-    finally
-      FLock.Leave;
-    end;
-
-    if HasEndpoint then
-    begin
-      IsAuth := True;
-      if Endpoint.AuthorizationType = atJWTBearer then
-      begin
-        AuthHeader := Req.GetHeader('authorization');
-        if (AuthHeader = '') and (DummyReq.Headers <> nil) then
-          AuthHeader := DummyReq.Headers.Authorization;
-        Logger.Info('[LOG-H3-AUTH] Raw AuthHeader=' + AuthHeader);
-        AuthHeader := FJWTManager.ExtractTokenFromAuthHeader(AuthHeader);
-        Logger.Info('[LOG-H3-AUTH] Extracted Token=' + AuthHeader);
-
-        if Length(AuthHeader) > 0 then
-        begin
-          IsAuth := FJWTManager.ValidateToken(AuthHeader, JWT);
-          Logger.Info(Format('[LOG-H3-AUTH] ValidateToken result=%s', [BoolToStr(IsAuth, True)]));
-          if Assigned(JWT) then
-             JWT.Free;
-        end
-        else
-          IsAuth := False;
-
-
-        if not IsAuth then
-          DummyResp.SetUnauthorized();
-      end;
-
-      if IsAuth then
-      begin
-        if Assigned(Endpoint.Handler) then
-          Endpoint.Handler(Self, DummyReq, DummyResp, Self)
-        else if Assigned(Endpoint.HandlerProc) then
-          Endpoint.HandlerProc(Self, DummyReq, DummyResp, Self);
-      end;
-    end
-    else
-      DummyResp.SetNotFound('The requested resource could not be found.');
-
-    Resp.StatusCode := Ord(DummyResp.Status);
-    Resp.AddHeader('Alt-Svc', Format('h3=":%d"; ma=86400', [FPort]));
-
-    if DummyResp.Headers <> nil then
-    begin
-      for var I: Integer := 0 to DummyResp.Headers.Count - 1 do
-      begin
-        var HeaderStr: string := DummyResp.Headers[I];
-        var ColonPos: Integer := Pos(':', HeaderStr);
-        if ColonPos > 0 then
-        begin
-          var HName: string := Trim(Copy(HeaderStr, 1, ColonPos - 1));
-          var HValue: string := Trim(Copy(HeaderStr, ColonPos + 1, MaxInt));
-          if not SameText(HName, 'Content-Length') and not SameText(HName, 'Content-Type') then
-            Resp.AddHeader(HName, HValue);
-        end;
-      end;
-    end;
-
-    var BodyBytes: TBytes := DummyResp.GetBodyBytes;
-    if Length(BodyBytes) > 0 then
-      Resp.SetBodyBytes(BodyBytes, DummyResp.ContentType);
-  finally
-    DummyReq.Free;
-    DummyResp.Free;
   end;
 end;
 
@@ -4002,6 +4248,170 @@ begin
     if Assigned(AOnMessage) then
       FWebSocketRouteHandlers.AddOrSetValue(CleanPath, AOnMessage);
     Logger.Info(Format('Registered WebSocket route: %s (HasCustomHandler: %s)', [APath, BoolToStr(Assigned(AOnMessage), True)]));
+  finally
+    FLock.Leave;
+  end;
+end;
+
+{ TWebTransportRouteItem }
+
+constructor TWebTransportRouteItem.Create(const APath: string;
+  AOnSessionReady: TWebTransportSessionProc;
+  AOnStreamData: TWebTransportStreamProc;
+  AOnDatagram: TWebTransportDatagramProc;
+  AOnSessionClosed: TWebTransportClosedProc);
+begin
+  inherited Create;
+  FPath := APath;
+  FOnSessionReady := AOnSessionReady;
+  FOnStreamData := AOnStreamData;
+  FOnDatagram := AOnDatagram;
+  FOnSessionClosed := AOnSessionClosed;
+end;
+
+procedure TGHttpsServerIOCP.RegisterWebTransportRoute(const APath: string);
+var
+  LSessionReady: TWebTransportSessionProc;
+  LStreamData: TWebTransportStreamProc;
+  LDatagram: TWebTransportDatagramProc;
+  LSessionClosed: TWebTransportClosedProc;
+begin
+  LSessionReady := nil;
+  LSessionClosed := nil;
+  LStreamData :=
+    procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+    begin
+      Session.SendOnStream(Stream, Data);
+    end;
+  LDatagram :=
+    procedure(Session: PWTSessionContext; const Data: TBytes)
+    begin
+      Session.SendDatagram(Data);
+    end;
+  RegisterWebTransportRoute(APath, LSessionReady, LStreamData, LDatagram, LSessionClosed);
+end;
+
+procedure TGHttpsServerIOCP.RegisterWebTransportRoute(
+  const APath: string;
+  AOnSessionReady: TWebTransportSessionProc;
+  AOnStreamData: TWebTransportStreamProc;
+  AOnDatagram: TWebTransportDatagramProc;
+  AOnSessionClosed: TWebTransportClosedProc);
+var
+  Item: TWebTransportRouteItem;
+begin
+  FLock.Enter;
+  try
+    Item := TWebTransportRouteItem.Create(APath, AOnSessionReady, AOnStreamData, AOnDatagram, AOnSessionClosed);
+    FWebTransportRoutes.AddOrSetValue(LowerCase(APath), Item);
+    Logger.Info(Format('Registered WebTransport route: %s (HasOnStreamData: %s, HasOnDatagram: %s)',
+      [APath, BoolToStr(Assigned(AOnStreamData), True), BoolToStr(Assigned(AOnDatagram), True)]));
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TGHttpsServerIOCP.WebTransportSessionRequest(Sender: TObject; const Info: TWTSessionInfo): Boolean;
+var
+  Item: TWebTransportRouteItem;
+  PurePath: string;
+begin
+  Result := False;
+  PurePath := LowerCase(Info.Path);
+  var QMark := Pos('?', PurePath);
+  if QMark > 0 then
+    PurePath := Copy(PurePath, 1, QMark - 1);
+
+  FLock.Enter;
+  try
+    Result := FWebTransportRoutes.TryGetValue(PurePath, Item);
+  finally
+    FLock.Leave;
+  end;
+
+end;
+
+procedure TGHttpsServerIOCP.WebTransportSessionReady(Sender: TObject; Session: PWTSessionContext);
+var
+  Item: TWebTransportRouteItem;
+  PurePath: string;
+begin
+  if Session = nil then Exit;
+  PurePath := LowerCase(Session^.Path);
+  var QMark := Pos('?', PurePath);
+  if QMark > 0 then
+    PurePath := Copy(PurePath, 1, QMark - 1);
+
+  FLock.Enter;
+  try
+    if Assigned(FWebTransportSessionRoutes) then
+      FWebTransportSessionRoutes.AddOrSetValue(Session^.SessionId, PurePath);
+    if FWebTransportRoutes.TryGetValue(PurePath, Item) and Assigned(Item.OnSessionReady) then
+      Item.OnSessionReady(Session);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TGHttpsServerIOCP.WebTransportSessionClosed(Sender: TObject; SessionId: TWTSessionId);
+var
+  Item: TWebTransportRouteItem;
+  PurePath: string;
+begin
+  FLock.Enter;
+  try
+    if Assigned(FWebTransportSessionRoutes) and FWebTransportSessionRoutes.TryGetValue(SessionId, PurePath) then
+    begin
+      FWebTransportSessionRoutes.Remove(SessionId);
+      if FWebTransportRoutes.TryGetValue(PurePath, Item) and Assigned(Item.OnSessionClosed) then
+        Item.OnSessionClosed(SessionId);
+    end
+    else
+    begin
+      for Item in FWebTransportRoutes.Values do
+        if Assigned(Item.OnSessionClosed) then
+           Item.OnSessionClosed(SessionId);
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TGHttpsServerIOCP.WebTransportStreamData(Sender: TObject; Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes);
+var
+  Item: TWebTransportRouteItem;
+  PurePath: string;
+begin
+  if Session = nil then Exit;
+  PurePath := LowerCase(Session^.Path);
+  var QMark := Pos('?', PurePath);
+  if QMark > 0 then
+    PurePath := Copy(PurePath, 1, QMark - 1);
+
+  FLock.Enter;
+  try
+    if FWebTransportRoutes.TryGetValue(PurePath, Item) and Assigned(Item.OnStreamData) then
+      Item.OnStreamData(Session, Stream, Data);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TGHttpsServerIOCP.WebTransportDatagram(Sender: TObject; Session: PWTSessionContext; const Data: TBytes);
+var
+  Item: TWebTransportRouteItem;
+  PurePath: string;
+begin
+  if Session = nil then Exit;
+  PurePath := LowerCase(Session^.Path);
+  var QMark := Pos('?', PurePath);
+  if QMark > 0 then
+    PurePath := Copy(PurePath, 1, QMark - 1);
+
+  FLock.Enter;
+  try
+    if FWebTransportRoutes.TryGetValue(PurePath, Item) and Assigned(Item.OnDatagram) then
+      Item.OnDatagram(Session, Data);
   finally
     FLock.Leave;
   end;

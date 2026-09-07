@@ -51,7 +51,25 @@ uses
   GRequestBody in '..\..\src\GRequestBody.pas',
   GResponse in '..\..\src\GResponse.pas',
   OverlappedExPool in '..\..\src\OverlappedExPool.pas',
-  WinApiAdditions in '..\..\src\WinApiAdditions.pas';
+  WinApiAdditions in '..\..\src\WinApiAdditions.pas',
+  Http3.Connection in '..\..\Http3DelphiV3\Http3.Connection.pas',
+  Http3.Frames in '..\..\Http3DelphiV3\Http3.Frames.pas',
+  Http3.Request in '..\..\Http3DelphiV3\Http3.Request.pas',
+  Http3.Response in '..\..\Http3DelphiV3\Http3.Response.pas',
+  Http3.Server in '..\..\Http3DelphiV3\Http3.Server.pas',
+  Http3.Types in '..\..\Http3DelphiV3\Http3.Types.pas',
+  MsQuic.ApiTable in '..\..\Http3DelphiV3\MsQuic.ApiTable.pas',
+  MsQuic.Certificate in '..\..\Http3DelphiV3\MsQuic.Certificate.pas',
+  MsQuic.Configuration in '..\..\Http3DelphiV3\MsQuic.Configuration.pas',
+  MsQuic.Errors in '..\..\Http3DelphiV3\MsQuic.Errors.pas',
+  MsQuic.Listener in '..\..\Http3DelphiV3\MsQuic.Listener.pas',
+  MsQuic.Loader in '..\..\Http3DelphiV3\MsQuic.Loader.pas',
+  MsQuic.Registration in '..\..\Http3DelphiV3\MsQuic.Registration.pas',
+  MsQuic.Types in '..\..\Http3DelphiV3\MsQuic.Types.pas',
+  Quic.Server in '..\..\Http3DelphiV3\Quic.Server.pas',
+  WebTransport.Server in '..\..\Http3DelphiV3\WebTransport.Server.pas',
+  WebTransport.Session in '..\..\Http3DelphiV3\WebTransport.Session.pas',
+  WebTransport.Types in '..\..\Http3DelphiV3\WebTransport.Types.pas';
 
 procedure ConfigureFastMM;
 begin
@@ -84,7 +102,7 @@ type
     destructor Destroy; override;
     function GetLiveManifest: string;
     function GetSegment(SeqNumber: Integer): TBytes;
-    function GetStatusJSON(ActiveViewers: Integer): string;
+    function GetStatusJSON(ActiveWsViewers: Integer = 0; ActiveWtViewers: Integer = 0): string;
     property SegmentCount: Integer read FSegmentCount;
     property SourcePath: string read FSourcePath;
   end;
@@ -102,6 +120,149 @@ type
 var
   GLiveEngine: TDynamicHlsLiveEngine = nil;
   GTelemetryThread: TDynamicTelemetryThread = nil;
+  GWTSessions: TList<TWTSessionContext> = nil;
+  GWTLock: TCriticalSection = nil;
+  GSyncLock: TCriticalSection = nil;
+
+procedure AddWTSession(Session: PWTSessionContext);
+var
+  I: Integer;
+begin
+  if (GWTLock = nil) or (GWTSessions = nil) or (Session = nil) then Exit;
+  GWTLock.Enter;
+  try
+    for I := 0 to GWTSessions.Count - 1 do
+    begin
+      if GWTSessions[I].SessionId = Session^.SessionId then
+      begin
+        GWTSessions[I] := Session^;
+        Exit;
+      end;
+    end;
+    GWTSessions.Add(Session^);
+  finally
+    GWTLock.Leave;
+  end;
+end;
+
+procedure RemoveWTSession(SessionId: TWTSessionId);
+var
+  I: Integer;
+begin
+  if (GWTLock = nil) or (GWTSessions = nil) then Exit;
+  GWTLock.Enter;
+  try
+    for I := GWTSessions.Count - 1 downto 0 do
+    begin
+      if GWTSessions[I].SessionId = SessionId then
+      begin
+        GWTSessions.Delete(I);
+        Break;
+      end;
+    end;
+  finally
+    GWTLock.Leave;
+  end;
+end;
+
+function GetWTActiveCount: Integer;
+begin
+  Result := 0;
+  if (GWTLock = nil) or (GWTSessions = nil) then Exit;
+  GWTLock.Enter;
+  try
+    Result := GWTSessions.Count;
+  finally
+    GWTLock.Leave;
+  end;
+end;
+
+procedure BroadcastWebTransportTelemetry(const JSONText: string);
+var
+  Data: TBytes;
+  SessionList: TArray<TWTSessionContext>;
+  I: Integer;
+begin
+  if (GWTLock = nil) or (GWTSessions = nil) then Exit;
+  Data := TEncoding.UTF8.GetBytes(JSONText);
+  GWTLock.Enter;
+  try
+    SessionList := GWTSessions.ToArray;
+  finally
+    GWTLock.Leave;
+  end;
+
+  for I := 0 to High(SessionList) do
+  begin
+    try
+      if SessionList[I].Active then
+        SessionList[I].SendDatagram(Data);
+    except
+      on E: Exception do
+        Logger.Warn('[WT] Failed to send datagram to session %d: %s', [SessionList[I].SessionId, E.Message]);
+    end;
+  end;
+end;
+
+procedure HandleWebTransportHlsStream(Server: TGHttpsServerIOCP; Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes);
+var
+  Cmd: string;
+  SegNumStr: string;
+  SegNum: Integer;
+  SegBytes: TBytes;
+  ManifestText: string;
+  P, P2: Integer;
+begin
+  if (Session = nil) or (Stream = nil) or (Length(Data) = 0) then Exit;
+  Cmd := TEncoding.UTF8.GetString(Data).Trim;
+
+  if ContainsText(Cmd, 'stream.m3u8') or ContainsText(Cmd, 'GET_MANIFEST') or (Cmd = 'MANIFEST') then
+  begin
+    if Assigned(GLiveEngine) then
+    begin
+      ManifestText := GLiveEngine.GetLiveManifest;
+      Session.SendOnStream(Stream, TEncoding.UTF8.GetBytes(ManifestText), True);
+    end
+    else
+      Session.SendOnStream(Stream, TEncoding.UTF8.GetBytes('#EXTM3U'#10'#EXT-X-ERROR: Engine not ready'#10), True);
+    Exit;
+  end;
+
+  P := Pos('segment_', LowerCase(Cmd));
+  if P > 0 then
+  begin
+    SegNumStr := Copy(Cmd, P + 8, Length(Cmd));
+    P2 := Pos('.ts', LowerCase(SegNumStr));
+    if P2 > 0 then
+      SegNumStr := Copy(SegNumStr, 1, P2 - 1);
+  end
+  else
+  begin
+    P := Pos('segment:', LowerCase(Cmd));
+    if P > 0 then
+      SegNumStr := Copy(Cmd, P + 8, Length(Cmd))
+    else
+      SegNumStr := '';
+  end;
+
+  if (SegNumStr <> '') and TryStrToInt(Trim(SegNumStr), SegNum) and Assigned(GLiveEngine) then
+  begin
+    SegBytes := GLiveEngine.GetSegment(SegNum);
+    if Length(SegBytes) > 0 then
+    begin
+      Session.SendOnStream(Stream, SegBytes, True);
+      Exit;
+    end;
+  end;
+
+  if Assigned(GLiveEngine) and Assigned(Server) then
+  begin
+    var RespJSON := GLiveEngine.GetStatusJSON(Server.GetWebSocketActiveCount, GetWTActiveCount);
+    Session.SendOnStream(Stream, TEncoding.UTF8.GetBytes(RespJSON), True);
+  end
+  else
+    Session.SendOnStream(Stream, Data, True);
+end;
 
 { TDynamicHlsLiveEngine }
 
@@ -398,7 +559,7 @@ begin
     ElapsedSec := (Now - FStartTime) * 86400.0;
     CurrentSeq := Trunc(ElapsedSec / SEGMENT_DURATION_SEC);
 
-    WindowCount := 5;
+    WindowCount := 6;
     StartSeq := Max(0, CurrentSeq - (WindowCount - 1));
 
     SB := TStringBuilder.Create;
@@ -411,6 +572,8 @@ begin
       for I := 0 to WindowCount - 1 do
       begin
         Seq := StartSeq + I;
+        var SegTime := FStartTime + (Seq * SEGMENT_DURATION_SEC) / 86400.0;
+        SB.AppendLine(Format('#EXT-X-PROGRAM-DATE-TIME:%s', [DateToISO8601(SegTime, True)]));
         SB.AppendLine('#EXTINF:2.000,');
         SB.AppendLine(Format('/live/segment_%d.ts', [Seq]));
       end;
@@ -458,12 +621,13 @@ begin
   end;
 end;
 
-function TDynamicHlsLiveEngine.GetStatusJSON(ActiveViewers: Integer): string;
+function TDynamicHlsLiveEngine.GetStatusJSON(ActiveWsViewers: Integer = 0; ActiveWtViewers: Integer = 0): string;
 var
   ElapsedSec: Double;
   CurrentSeq, LocalIdx, LoopIdx: Integer;
-  RemainingLoopSec: Double;
+  RemainingLoopSec, LivePositionSec: Double;
   TotalDur: Double;
+  TotalActive: Integer;
 begin
   CheckAndReloadSource;
 
@@ -478,7 +642,8 @@ begin
          LocalIdx := 0;
       LoopIdx := CurrentSeq div FSegmentCount;
       TotalDur := FSegmentCount * SEGMENT_DURATION_SEC;
-      RemainingLoopSec := Max(0.0, TotalDur - (LocalIdx * SEGMENT_DURATION_SEC));
+      LivePositionSec := ElapsedSec - (LoopIdx * TotalDur);
+      RemainingLoopSec := Max(0.0, TotalDur - LivePositionSec);
     end
     else
     begin
@@ -487,7 +652,10 @@ begin
       LoopIdx := 0;
       RemainingLoopSec := 0.0;
       TotalDur := 0.0;
+      LivePositionSec := 0.0;
     end;
+
+    TotalActive := ActiveWsViewers + ActiveWtViewers;
 
     Result := Format(
       '{"status":"broadcasting",' +
@@ -497,11 +665,16 @@ begin
       '"loop_number":%d,' +
       '"segment_count":%d,' +
       '"total_duration_sec":%.1f,' +
+      '"live_position_sec":%.3f,' +
       '"remaining_loop_sec":%.1f,' +
       '"active_viewers":%d,' +
+      '"ws_viewers":%d,' +
+      '"wt_viewers":%d,' +
       '"protocol":"HLS Live (RFC 8216)",' +
+      '"telemetry_protocols":"WebSocket (RFC 6455) + WebTransport (RFC 9220)",' +
       '"video_source":"%s"}',
-      [ElapsedSec, CurrentSeq, LocalIdx, LoopIdx, FSegmentCount, TotalDur, RemainingLoopSec, ActiveViewers, ExtractFileName(FSourcePath)],
+      [ElapsedSec, CurrentSeq, LocalIdx, LoopIdx, FSegmentCount, TotalDur, LivePositionSec, RemainingLoopSec,
+       TotalActive, ActiveWsViewers, ActiveWtViewers, ExtractFileName(FSourcePath)],
       TFormatSettings.Invariant
     );
   finally
@@ -520,13 +693,32 @@ begin
 end;
 
 procedure TDynamicTelemetryThread.Execute;
+var
+  StatusJSON: string;
+  I: Integer;
 begin
   while not Terminated do
   begin
-    if Assigned(FServer) and Assigned(FEngine) then
-      FServer.BroadcastWebSocket(FEngine.GetStatusJSON(FServer.GetWebSocketActiveCount));
-    Sleep(1000);
+    try
+      if Assigned(FServer) and Assigned(FEngine) and not Terminated then
+      begin
+        StatusJSON := FEngine.GetStatusJSON(FServer.GetWebSocketActiveCount, GetWTActiveCount);
+        if not Terminated then
+        begin
+          FServer.BroadcastWebSocket(StatusJSON);
+          BroadcastWebTransportTelemetry(StatusJSON);
+        end;
+      end;
+    except
+    end;
+
+    for I := 1 to 10 do
+    begin
+      if Terminated then Break;
+      Sleep(50);
+    end;
   end;
+  StatusJSON := '';
 end;
 
 function GetWebRootDir: string;
@@ -637,6 +829,10 @@ begin
 
     GLiveEngine := TDynamicHlsLiveEngine.Create(SourceFile);
 
+    GWTLock := TCriticalSection.Create;
+    GWTSessions := TList<TWTSessionContext>.Create;
+    GSyncLock := TCriticalSection.Create;
+
     var Server := TGHttpsServerIOCP.Create(SERVER_PORT,
                                            'localhost',
                                            CertStoreName,
@@ -645,9 +841,92 @@ begin
                                            1000000);
     try
       Server.SetSSLShutdownOptions(True, 200);
+      Server.EnableHttp3 := True;
 
-      var TelemetryThread := TDynamicTelemetryThread.Create(Server, GLiveEngine);
-      GTelemetryThread := TelemetryThread;
+      Server.RegisterWebTransportRoute('/status-wt',
+        procedure(Session: PWTSessionContext)
+        begin
+          AddWTSession(Session);
+          Logger.Info('[WT] New WebTransport session established (SessionId: %d)', [Session^.SessionId]);
+          if Assigned(GLiveEngine) and Assigned(Server) then
+          begin
+            var InitJSON := GLiveEngine.GetStatusJSON(Server.GetWebSocketActiveCount, GetWTActiveCount);
+            Session.SendDatagram(TEncoding.UTF8.GetBytes(InitJSON));
+          end;
+        end,
+        procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+        begin
+          HandleWebTransportHlsStream(Server, Session, Stream, Data);
+        end,
+        procedure(Session: PWTSessionContext; const Data: TBytes)
+        begin
+          if Assigned(GLiveEngine) and Assigned(Server) then
+          begin
+            var DgramJSON := GLiveEngine.GetStatusJSON(Server.GetWebSocketActiveCount, GetWTActiveCount);
+            Session.SendDatagram(TEncoding.UTF8.GetBytes(DgramJSON));
+          end
+          else
+            Session.SendDatagram(Data);
+        end,
+        procedure(SessionId: TWTSessionId)
+        begin
+          RemoveWTSession(SessionId);
+          Logger.Info('[WT] WebTransport session closed (SessionId: %d)', [SessionId]);
+        end
+      );
+
+      Server.RegisterWebTransportRoute('/live-wt',
+        procedure(Session: PWTSessionContext)
+        begin
+          AddWTSession(Session);
+          Logger.Info('[WT] New WebTransport Live Video session established (SessionId: %d)', [Session^.SessionId]);
+          if Assigned(GLiveEngine) and Assigned(Server) then
+          begin
+            var InitJSON := GLiveEngine.GetStatusJSON(Server.GetWebSocketActiveCount, GetWTActiveCount);
+            Session.SendDatagram(TEncoding.UTF8.GetBytes(InitJSON));
+          end;
+        end,
+        procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+        begin
+          HandleWebTransportHlsStream(Server, Session, Stream, Data);
+        end,
+        procedure(Session: PWTSessionContext; const Data: TBytes)
+        begin
+          if Assigned(GLiveEngine) and Assigned(Server) then
+          begin
+            var DgramJSON := GLiveEngine.GetStatusJSON(Server.GetWebSocketActiveCount, GetWTActiveCount);
+            Session.SendDatagram(TEncoding.UTF8.GetBytes(DgramJSON));
+          end
+          else
+            Session.SendDatagram(Data);
+        end,
+        procedure(SessionId: TWTSessionId)
+        begin
+          RemoveWTSession(SessionId);
+          Logger.Info('[WT] WebTransport Live Video session closed (SessionId: %d)', [SessionId]);
+        end
+      );
+
+      Server.RegisterWebTransportRoute('/wt',
+        procedure(Session: PWTSessionContext)
+        begin
+          AddWTSession(Session);
+        end,
+        procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+        begin
+          Session.SendOnStream(Stream, Data);
+        end,
+        procedure(Session: PWTSessionContext; const Data: TBytes)
+        begin
+          Session.SendDatagram(Data);
+        end,
+        procedure(SessionId: TWTSessionId)
+        begin
+          RemoveWTSession(SessionId);
+        end
+      );
+
+      GTelemetryThread := TDynamicTelemetryThread.Create(Server, GLiveEngine);
 
       Server.RegisterEndpointProc('/live/stream.m3u8', hmGET,
         procedure(Sender: TObject; const ARequest: TRequest;
@@ -671,27 +950,59 @@ begin
           AResponse.SetStatus(200);
           AResponse.AddHeader('Cache-Control', 'no-cache');
           if Assigned(GLiveEngine) then
-            AResponse.AddJSONContent(GLiveEngine.GetStatusJSON(AServer.GetWebSocketActiveCount))
+            AResponse.AddJSONContent(GLiveEngine.GetStatusJSON(AServer.GetWebSocketActiveCount, GetWTActiveCount))
           else
             AResponse.AddJSONContent('{"status":"idle"}');
+        end);
+
+      Server.RegisterEndpointProc('/api/certificate-hash', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          HashBytes: TBytes;
+          JsonRes: TJSONObject;
+          JsonArr: TJSONArray;
+          I: Integer;
+        begin
+          AResponse.SetStatus(200);
+          AResponse.AddHeader('Cache-Control', 'no-cache');
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          HashBytes := AServer.GetCertificateSha256Hash;
+          JsonRes := TJSONObject.Create;
+          try
+            JsonRes.AddPair('algorithm', 'sha-256');
+            JsonArr := TJSONArray.Create;
+            for I := 0 to High(HashBytes) do
+              JsonArr.Add(HashBytes[I]);
+            JsonRes.AddPair('hash', JsonArr);
+            AResponse.AddJSONContent(JsonRes.ToJSON);
+          finally
+            JsonRes.Free;
+          end;
         end);
 
       Server.OnWebSocketConnect := procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession)
         begin
           if Assigned(GLiveEngine) and Assigned(Session) then
           begin
-            Session.SendText(GLiveEngine.GetStatusJSON(AServer.GetWebSocketActiveCount));
+            Session.SendText(GLiveEngine.GetStatusJSON(AServer.GetWebSocketActiveCount, GetWTActiveCount));
             AServer.TriggerWebSocketWrite(Session);
           end;
+        end;
+
+      Server.OnWebSocketDisconnect := procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const Reason: string)
+        begin
         end;
 
       Server.RegisterWebSocketRoute('/status-ws',
         procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession;
                   const MessageText: string; Opcode: TWebSocketOpcode)
         begin
-          if Assigned(GLiveEngine) and Assigned(Session) then
+          if not Assigned(Session) then
+             Exit;
+
+          if Assigned(GLiveEngine) then
           begin
-            Session.SendText(GLiveEngine.GetStatusJSON(AServer.GetWebSocketActiveCount));
+            Session.SendText(GLiveEngine.GetStatusJSON(AServer.GetWebSocketActiveCount, GetWTActiveCount));
             AServer.TriggerWebSocketWrite(Session);
           end;
         end);
@@ -731,39 +1042,89 @@ begin
              RelPath := 'index.html';
           FullPath := TPath.Combine(WebRootDir, RelPath);
 
-          if TryServeStaticFile(FullPath, ARequest, AResponse) then Exit;
+          if TryServeStaticFile(FullPath, ARequest, AResponse) then
+             Exit;
 
           FullPath := TPath.Combine(WebRootDir, 'index.html');
           if not TryServeStaticFile(FullPath, ARequest, AResponse) then
             AResponse.SetNotFound('Resource not found: ' + Uri);
         end);
 
-      Server.Start;
-      Logger.Info('=====================================================');
-      Logger.Info('  HLS Live Cinema Broadcast Running on port: ' + IntToStr(SERVER_PORT));
-      Logger.Info('  Web UI Stream URL:  https://localhost:' + IntToStr(SERVER_PORT) + '/');
-      Logger.Info('  VLC Stream URL:     https://localhost:' + IntToStr(SERVER_PORT) + '/live/stream.m3u8');
-      Logger.Info('  WebSocket Status:   wss://localhost:' + IntToStr(SERVER_PORT) + '/status-ws');
-      Logger.Info('=====================================================');
-      Logger.Info('Press ENTER to shut down server cleanly...');
-
-      ReadLn;
-
-      Logger.Info('Stopping telemetry thread...');
-      TelemetryThread.Terminate;
-      TelemetryThread.WaitFor;
-      TelemetryThread.Free;
-      GTelemetryThread := nil;
-
-      Logger.Info('Stopping IOCP server...');
-      Server.Stop;
-    finally
-      if Assigned(GLiveEngine) then
+      if Server.Start then
       begin
-        GLiveEngine.Free;
-        GLiveEngine := nil;
+        Logger.Info('=====================================================');
+        Logger.Info('  HLS Live Cinema Broadcast Running on port: ' + IntToStr(SERVER_PORT));
+        Logger.Info('  Web UI Stream URL:    https://localhost:' + IntToStr(SERVER_PORT) + '/');
+        Logger.Info('  VLC Stream URL:       https://localhost:' + IntToStr(SERVER_PORT) + '/live/stream.m3u8');
+        Logger.Info('  WebSocket Status:     wss://localhost:' + IntToStr(SERVER_PORT) + '/status-ws');
+        Logger.Info('  WebTransport Status:  https://localhost:' + IntToStr(SERVER_PORT) + '/status-wt');
+        Logger.Info('  Active Protocols:     HTTP/1.1 + HTTP/2 + HTTP/3 + WS + WebTransport');
+        Logger.Info('=====================================================');
+        Logger.Info('Press ENTER to shut down server cleanly...');
+
+        try
+          ReadLn;
+        except
+          on E: Exception do
+            Logger.Info('Console input terminated.');
+        end;
+
+        Logger.Info('Stopping telemetry thread...');
+        if Assigned(GTelemetryThread) then
+        begin
+          GTelemetryThread.Terminate;
+          GTelemetryThread.WaitFor;
+          FreeAndNil(GTelemetryThread);
+        end;
+
+        Logger.Info('Stopping IOCP server...');
+        Server.Stop;
+      end
+      else
+      begin
+        Writeln;
+        Writeln('================================================================');
+        Writeln(Format('  CRITICAL ERROR: Failed to start server on https://localhost:%d/', [SERVER_PORT]));
+        Writeln('  Server cannot run due to startup failure (e.g. missing required DLL or certificate).');
+        Writeln('  Application will terminate now.');
+        Writeln('================================================================');
+        Writeln;
+        Logger.Error(Format('CRITICAL: Server startup failed on port %d. Exiting application.', [SERVER_PORT]));
+
+        ExitCode := 1;
+        Exit;
       end;
-      Server.Free;
+    finally
+      if Assigned(GTelemetryThread) then
+      begin
+        GTelemetryThread.Terminate;
+        GTelemetryThread.WaitFor;
+        FreeAndNil(GTelemetryThread);
+      end;
+
+      if Assigned(GWTLock) then
+      begin
+        GWTLock.Enter;
+        try
+          FreeAndNil(GWTSessions);
+        finally
+          GWTLock.Leave;
+          FreeAndNil(GWTLock);
+        end;
+      end;
+
+      if Assigned(GSyncLock) then
+      begin
+        GSyncLock.Enter;
+        GSyncLock.Leave;
+        FreeAndNil(GSyncLock);
+      end;
+
+      if Assigned(GLiveEngine) then
+        FreeAndNil(GLiveEngine);
+
+      if Assigned(Server) then
+        FreeAndNil(Server);
     end;
   except
     on E: Exception do

@@ -1,4 +1,4 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{D1190831-1111-4377-9011-111111111111}</ProjectGuid>
         <ProjectVersion>20.1</ProjectVersion>
@@ -41,7 +41,7 @@
         <DCC_K>false</DCC_K>
         <DCC_Namespace>System;Xml;Data;Datasnap;Web;Soap;Winapi;$(DCC_Namespace)</DCC_Namespace>
         <SanitizedProjectName>D06_TriProtocolHybridServer</SanitizedProjectName>
-        <DCC_UnitSearchPath>..\..\src;..\..\Http3Delphi;..\..\FASTMM5;..\..\QuickLogger;..\..\QuickLib;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
+        <DCC_UnitSearchPath>..\..\src;..\..\Http3DelphiV3;..\..\Http3DelphiV3\ls-qpack;..\..\FASTMM5;..\..\QuickLogger;..\..\QuickLib;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
         <Icon_MainIcon>$(BDS)\bin\delphi_PROJECTICON.ico</Icon_MainIcon>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Base_Win32)'!=''">

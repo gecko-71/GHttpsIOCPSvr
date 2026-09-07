@@ -90,8 +90,8 @@ begin
   else
      ContentType := 'application/octet-stream';
 
-  FileBytes := TFile.ReadAllBytes(FilePath);
-  ETagVal := Format('"%d-%d"', [Length(FileBytes), DateTimeToUnix(TFile.GetLastWriteTime(FilePath))]);
+  var FileSize := TFile.GetSize(FilePath);
+  ETagVal := Format('"%d-%d"', [FileSize, DateTimeToUnix(TFile.GetLastWriteTime(FilePath))]);
 
   if (ARequest.Headers.GetHeader('If-None-Match') = ETagVal) then
   begin
@@ -102,7 +102,13 @@ begin
 
   AResponse.SetStatus(200);
   AResponse.AddHeader('ETag', ETagVal);
-  AResponse.AddBinaryContent(ContentType, FileBytes);
+  if FileSize > 1024 * 1024 then
+    AResponse.AddFileStreamContent(ContentType, FilePath)
+  else
+  begin
+    FileBytes := TFile.ReadAllBytes(FilePath);
+    AResponse.AddBinaryContent(ContentType, FileBytes);
+  end;
   Result := True;
 end;
 
@@ -141,7 +147,11 @@ begin
                                            CertStoreName,
                                            'Abcd1234Efgh5678Ijkl9012Mnop3456Qrst7890Uvwx1234Yz!',
                                            2000,
-                                           1000000);
+                                           1000000,
+                                           DEFAULT_MAX_REQUEST_HEDER_SIZE,
+                                           1073741824,
+                                           1073741824,
+                                           65536);
     try
       Server.SetSSLShutdownOptions(True, 200);
 
@@ -166,7 +176,7 @@ begin
           JSONResp := TJSONObject.Create;
           try
             JSONResp.AddPair('status', 'success');
-            JSONResp.AddPair('bytes_received', TJSONNumber.Create(Length(ARequest.GetBodyBytes)));
+            JSONResp.AddPair('bytes_received', TJSONNumber.Create(ARequest.BodyBytesReceived));
             JSONResp.AddPair('message', 'File uploaded successfully');
 
             AResponse.SetStatus(200);
@@ -268,18 +278,42 @@ begin
 
       if Server.Start then
       begin
-        Writeln;
-        Writeln;
+        try
+          Writeln;
+          Writeln;
+        except
+          on EInOutError do ;
+        end;
         Logger.Info(Format('SERVER STARTED: https://%s:%d/ (Host: %s, Port: %d)', [SERVER_HOST, SERVER_PORT, SERVER_HOST, SERVER_PORT]));
-        Logger.Info('Press [ENTER] to stop the server...');
-        Readln;
+        if FindCmdLineSwitch('daemon', True) then
+        begin
+          Logger.Info('Running in daemon mode. Press Ctrl+C or kill process to stop.');
+          while Server.Running do
+            Sleep(1000);
+        end
+        else
+        begin
+          try
+            Readln;
+          except
+            on E: EInOutError do
+            begin
+              while Server.Running do
+                Sleep(1000);
+            end;
+          end;
+        end;
         Server.Stop;
       end
       else
       begin
-        Writeln;
-        Writeln(Format('CRITICAL ERROR: Failed to start server on https://%s:%d/', [SERVER_HOST, SERVER_PORT]));
-        Writeln;
+        try
+          Writeln;
+          Writeln(Format('CRITICAL ERROR: Failed to start server on https://%s:%d/', [SERVER_HOST, SERVER_PORT]));
+          Writeln;
+        except
+          on EInOutError do ;
+        end;
         Logger.Error(Format('Failed to start HTTPS IOCP server on host %s port %d.', [SERVER_HOST, SERVER_PORT]));
       end;
     finally

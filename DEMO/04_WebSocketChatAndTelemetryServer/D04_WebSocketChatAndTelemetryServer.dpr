@@ -1,4 +1,4 @@
-﻿program D04_WebSocketChatAndTelemetryServer;
+program D04_WebSocketChatAndTelemetryServer;
 
 {
   MIT License
@@ -47,15 +47,7 @@ uses
   GRequestBody in '..\..\src\GRequestBody.pas',
   GResponse in '..\..\src\GResponse.pas',
   OverlappedExPool in '..\..\src\OverlappedExPool.pas',
-  WinApiAdditions in '..\..\src\WinApiAdditions.pas',
-  WinApi.MsQuic in '..\..\Http3Delphi\WinApi.MsQuic.pas',
-  Net.MsQuic in '..\..\Http3Delphi\Net.MsQuic.pas',
-  Net.Http3Frames in '..\..\Http3Delphi\Net.Http3Frames.pas',
-  Net.QPACK.Huffman in '..\..\Http3Delphi\Net.QPACK.Huffman.pas',
-  Net.QPACK in '..\..\Http3Delphi\Net.QPACK.pas',
-  Net.Http3Request in '..\..\Http3Delphi\Net.Http3Request.pas',
-  Net.Http3Response in '..\..\Http3Delphi\Net.Http3Response.pas',
-  Net.Http3Server in '..\..\Http3Delphi\Net.Http3Server.pas';
+  WinApiAdditions in '..\..\src\WinApiAdditions.pas';
 
 const
   SERVER_HOST = 'localhost';
@@ -191,7 +183,7 @@ begin
       '  <div class="grid-container">' + sLineBreak +
         '    <!-- IoT Telemetry Card -->' + sLineBreak +
         '    <div class="card">' + sLineBreak +
-          '      <h2>⚡ IoT Telemetry (Live Streaming)</h2>' + sLineBreak +
+          '      <h2>IoT Telemetry (Live Streaming)</h2>' + sLineBreak +
           '      <div class="telemetry-grid">' + sLineBreak +
             '        <div class="gauge-box">' + sLineBreak +
               '          <div class="gauge-title">Temperature</div>' + sLineBreak +
@@ -223,7 +215,7 @@ begin
           '      <h2>💬 Live Multi-Room Chat</h2>' + sLineBreak +
           '      <div class="chat-controls">' + sLineBreak +
             '        <input type="text" id="username" value="Operator" style="width: 140px;">' + sLineBreak +
-            '        <select id="roomSelect">' + sLineBreak +
+            '        <select id="roomSelect" onchange="switchRoom(this.value)">' + sLineBreak +
               '          <option value="General">Room: General</option>' + sLineBreak +
               '          <option value="DevTeam">Room: DevTeam</option>' + sLineBreak +
               '          <option value="IoT-Alerts">Room: IoT-Alerts</option>' + sLineBreak +
@@ -245,102 +237,121 @@ begin
         '    const wsStatus = document.getElementById("wsStatus");' + sLineBreak +
         '    const chatMessages = document.getElementById("chatMessages");' + sLineBreak +
         '    const telemetryLog = document.getElementById("telemetryLog");' + sLineBreak +
- 
+        '    const roomSelect = document.getElementById("roomSelect");' + sLineBreak +
+        '    const roomMessages = {' + sLineBreak +
+        '      "General": [],' + sLineBreak +
+        '      "DevTeam": [],' + sLineBreak +
+        '      "IoT-Alerts": []' + sLineBreak +
+        '    };' + sLineBreak +
+        '    let currentRoom = "General";' + sLineBreak +
+        '    function switchRoom(newRoom) {' + sLineBreak +
+        '      if (!newRoom) return;' + sLineBreak +
+        '      currentRoom = newRoom;' + sLineBreak +
+        '      for (let opt of roomSelect.options) {' + sLineBreak +
+        '        if (opt.value === currentRoom) opt.text = "Room: " + currentRoom;' + sLineBreak +
+        '      }' + sLineBreak +
+        '      chatMessages.innerHTML = "";' + sLineBreak +
+        '      appendChatMessageElement("System", "Switched to room: [" + currentRoom + "]", new Date().toLocaleTimeString(), true);' + sLineBreak +
+        '      const history = roomMessages[currentRoom] || [];' + sLineBreak +
+        '      history.forEach(item => {' + sLineBreak +
+        '        appendChatMessageElement(item.user, item.message, item.time, false);' + sLineBreak +
+        '      });' + sLineBreak +
+        '    }' + sLineBreak +
         '    function handleKeyPress(e) {' + sLineBreak +
-          '      if (e.key === "Enter") {' + sLineBreak +
-            '        sendMessage();' + sLineBreak +
-          '      }' + sLineBreak +
+        '      if (e.key === "Enter") sendMessage();' + sLineBreak +
         '    }' + sLineBreak +
- 
         '    function toggleConnection() {' + sLineBreak +
-          '      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {' + sLineBreak +
-            '        ws.close();' + sLineBreak +
-          '      } else {' + sLineBreak +
-            '        connectWebSocket();' + sLineBreak +
-          '      }' + sLineBreak +
+        '      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {' + sLineBreak +
+        '        ws.close();' + sLineBreak +
+        '      } else {' + sLineBreak +
+        '        connectWebSocket();' + sLineBreak +
+        '      }' + sLineBreak +
         '    }' + sLineBreak +
- 
         '    function connectWebSocket() {' + sLineBreak +
-          '      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";' + sLineBreak +
-          '      const wsUrl = protocol + "//" + window.location.host + "/ws";' + sLineBreak +
-          '      try {' + sLineBreak +
-            '        ws = new WebSocket(wsUrl);' + sLineBreak +
-            '        document.getElementById("btnConnect").innerText = "Connecting...";' + sLineBreak +
-            
-            '        ws.onopen = function() {' + sLineBreak +
-              '          wsStatus.className = "status-badge status-online";' + sLineBreak +
-              '          wsStatus.innerHTML = "<span class=\"dot\"></span> Connected (WSS)";' + sLineBreak +
-              '          document.getElementById("btnConnect").innerText = "Disconnect";' + sLineBreak +
-              '          appendChatMessage("System", "Successfully connected to IOCP WebSocket server!");' + sLineBreak +
-            '        };' + sLineBreak +
- 
-            '        ws.onmessage = function(event) {' + sLineBreak +
-              '          try {' + sLineBreak +
-                '            const data = JSON.parse(event.data);' + sLineBreak +
-                '            if (data.type === "telemetry") {' + sLineBreak +
-                  '              updateTelemetry(data);' + sLineBreak +
-                '            } else if (data.type === "chat") {' + sLineBreak +
-                  '              appendChatMessage(data.user + " [" + data.room + "]", data.message, data.time);' + sLineBreak +
-                '            }' + sLineBreak +
-              '          } catch(e) {' + sLineBreak +
-                '            appendChatMessage("Raw Payload", event.data);' + sLineBreak +
-              '          }' + sLineBreak +
-            '        };' + sLineBreak +
- 
-            '        ws.onclose = function() {' + sLineBreak +
-              '          wsStatus.className = "status-badge status-offline";' + sLineBreak +
-              '          wsStatus.innerHTML = "<span class=\"dot\"></span> Disconnected";' + sLineBreak +
-              '          document.getElementById("btnConnect").innerText = "Connect";' + sLineBreak +
-              '          appendChatMessage("System", "WebSocket connection closed.");' + sLineBreak +
-            '        };' + sLineBreak +
- 
-            '        ws.onerror = function(err) {' + sLineBreak +
-              '          console.error("WS Error:", err);' + sLineBreak +
-            '        };' + sLineBreak +
- 
-          '      } catch(e) {' + sLineBreak +
-            '        alert("WebSocket connection error: " + e.message);' + sLineBreak +
-          '      }' + sLineBreak +
+        '      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";' + sLineBreak +
+        '      const wsUrl = protocol + "//" + window.location.host + "/ws";' + sLineBreak +
+        '      try {' + sLineBreak +
+        '        ws = new WebSocket(wsUrl);' + sLineBreak +
+        '        document.getElementById("btnConnect").innerText = "Connecting...";' + sLineBreak +
+        '        ws.onopen = function() {' + sLineBreak +
+        '          wsStatus.className = "status-badge status-online";' + sLineBreak +
+        '          wsStatus.innerHTML = "<span class=\"dot\"></span> Connected (WSS)";' + sLineBreak +
+        '          document.getElementById("btnConnect").innerText = "Disconnect";' + sLineBreak +
+        '          switchRoom(roomSelect.value || "General");' + sLineBreak +
+        '        };' + sLineBreak +
+        '        ws.onmessage = function(event) {' + sLineBreak +
+        '          try {' + sLineBreak +
+        '            const data = JSON.parse(event.data);' + sLineBreak +
+        '            if (data.type === "telemetry") {' + sLineBreak +
+        '              updateTelemetry(data);' + sLineBreak +
+        '            } else if (data.type === "chat") {' + sLineBreak +
+        '              const room = data.room || "General";' + sLineBreak +
+        '              if (!roomMessages[room]) roomMessages[room] = [];' + sLineBreak +
+        '              roomMessages[room].push({ user: data.user, message: data.message, time: data.time });' + sLineBreak +
+        '              if (room === currentRoom) {' + sLineBreak +
+        '                appendChatMessageElement(data.user + " [" + room + "]", data.message, data.time, false);' + sLineBreak +
+        '              } else {' + sLineBreak +
+        '                for (let opt of roomSelect.options) {' + sLineBreak +
+        '                  if (opt.value === room && !opt.text.includes("●")) opt.text = "Room: " + room + " ●";' + sLineBreak +
+        '                }' + sLineBreak +
+        '              }' + sLineBreak +
+        '            }' + sLineBreak +
+        '          } catch(e) {' + sLineBreak +
+        '            appendChatMessageElement("Raw Payload", event.data, new Date().toLocaleTimeString(), true);' + sLineBreak +
+        '          }' + sLineBreak +
+        '        };' + sLineBreak +
+        '        ws.onclose = function() {' + sLineBreak +
+        '          wsStatus.className = "status-badge status-offline";' + sLineBreak +
+        '          wsStatus.innerHTML = "<span class=\"dot\"></span> Disconnected";' + sLineBreak +
+        '          document.getElementById("btnConnect").innerText = "Connect";' + sLineBreak +
+        '          appendChatMessageElement("System", "WebSocket connection closed.", new Date().toLocaleTimeString(), true);' + sLineBreak +
+        '        };' + sLineBreak +
+        '        ws.onerror = function(err) {' + sLineBreak +
+        '          console.error("WS Error:", err);' + sLineBreak +
+        '        };' + sLineBreak +
+        '      } catch(e) {' + sLineBreak +
+        '        alert("WebSocket connection error: " + e.message);' + sLineBreak +
+        '      }' + sLineBreak +
         '    }' + sLineBreak +
- 
         '    function updateTelemetry(data) {' + sLineBreak +
-          '      if (data.temperature_c !== undefined) document.getElementById("valTemp").innerText = data.temperature_c.toFixed(1);' + sLineBreak +
-          '      if (data.humidity_percent !== undefined) document.getElementById("valHum").innerText = data.humidity_percent.toFixed(1);' + sLineBreak +
-          '      if (data.pressure_hpa !== undefined) document.getElementById("valPress").innerText = data.pressure_hpa.toFixed(1);' + sLineBreak +
-          '      if (data.battery_pct !== undefined) document.getElementById("valBatt").innerText = data.battery_pct.toFixed(1);' + sLineBreak +
-          '      telemetryLog.innerText = "[" + new Date().toLocaleTimeString() + "] FRAME: " + JSON.stringify(data);' + sLineBreak +
+        '      if (data.temperature_c !== undefined) document.getElementById("valTemp").innerText = data.temperature_c.toFixed(1);' + sLineBreak +
+        '      if (data.humidity_percent !== undefined) document.getElementById("valHum").innerText = data.humidity_percent.toFixed(1);' + sLineBreak +
+        '      if (data.pressure_hpa !== undefined) document.getElementById("valPress").innerText = data.pressure_hpa.toFixed(1);' + sLineBreak +
+        '      if (data.battery_pct !== undefined) document.getElementById("valBatt").innerText = data.battery_pct.toFixed(1);' + sLineBreak +
+        '      telemetryLog.innerText = "[" + new Date().toLocaleTimeString() + "] FRAME: " + JSON.stringify(data);' + sLineBreak +
         '    }' + sLineBreak +
- 
         '    function sendMessage() {' + sLineBreak +
-          '      const input = document.getElementById("chatInput");' + sLineBreak +
-          '      const text = input.value.trim();' + sLineBreak +
-          '      if (!text) return;' + sLineBreak +
-          '      if (!ws || ws.readyState !== WebSocket.OPEN) {' + sLineBreak +
-            '        alert("Please connect to the WebSocket server first!");' + sLineBreak +
-            '        return;' + sLineBreak +
-          '      }' + sLineBreak +
-          '      const user = document.getElementById("username").value || "Operator";' + sLineBreak +
-          '      const room = document.getElementById("roomSelect").value;' + sLineBreak +
-          '      const payload = {' + sLineBreak +
-            '        type: "chat",' + sLineBreak +
-            '        user: user,' + sLineBreak +
-            '        room: room,' + sLineBreak +
-            '        message: text,' + sLineBreak +
-            '        time: new Date().toLocaleTimeString()' + sLineBreak +
-          '      };' + sLineBreak +
-          '      ws.send(JSON.stringify(payload));' + sLineBreak +
-          '      input.value = "";' + sLineBreak +
+        '      const input = document.getElementById("chatInput");' + sLineBreak +
+        '      const text = input.value.trim();' + sLineBreak +
+        '      if (!text) return;' + sLineBreak +
+        '      if (!ws || ws.readyState !== WebSocket.OPEN) {' + sLineBreak +
+        '        alert("Please connect to the WebSocket server first!");' + sLineBreak +
+        '        return;' + sLineBreak +
+        '      }' + sLineBreak +
+        '      const user = document.getElementById("username").value || "Operator";' + sLineBreak +
+        '      const room = roomSelect.value || "General";' + sLineBreak +
+        '      const payload = {' + sLineBreak +
+        '        type: "chat",' + sLineBreak +
+        '        user: user,' + sLineBreak +
+        '        room: room,' + sLineBreak +
+        '        message: text,' + sLineBreak +
+        '        time: new Date().toLocaleTimeString()' + sLineBreak +
+        '      };' + sLineBreak +
+        '      ws.send(JSON.stringify(payload));' + sLineBreak +
+        '      input.value = "";' + sLineBreak +
         '    }' + sLineBreak +
- 
-        '    function appendChatMessage(user, msg, time) {' + sLineBreak +
-          '      const timeStr = time || new Date().toLocaleTimeString();' + sLineBreak +
-          '      const div = document.createElement("div");' + sLineBreak +
-          '      div.className = "chat-msg";' + sLineBreak +
-          '      div.innerHTML = "<div class=\"meta\"><span class=\"user\">" + user + "</span><span>" + timeStr + "</span></div><div>" + msg + "</div>";' + sLineBreak +
-          '      chatMessages.appendChild(div);' + sLineBreak +
-          '      chatMessages.scrollTop = chatMessages.scrollHeight;' + sLineBreak +
+        '    function appendChatMessageElement(user, msg, time, isSystem) {' + sLineBreak +
+        '      const timeStr = time || new Date().toLocaleTimeString();' + sLineBreak +
+        '      const div = document.createElement("div");' + sLineBreak +
+        '      div.className = "chat-msg";' + sLineBreak +
+        '      if (isSystem) {' + sLineBreak +
+        '        div.style.borderLeftColor = "#94a3b8";' + sLineBreak +
+        '        div.style.background = "rgba(51, 65, 85, 0.4)";' + sLineBreak +
+        '      }' + sLineBreak +
+        '      div.innerHTML = "<div class=\"meta\"><span class=\"user\" style=\"" + (isSystem ? "color: #94a3b8;" : "") + "\">" + user + "</span><span>" + timeStr + "</span></div><div>" + msg + "</div>";' + sLineBreak +
+        '      chatMessages.appendChild(div);' + sLineBreak +
+        '      chatMessages.scrollTop = chatMessages.scrollHeight;' + sLineBreak +
         '    }' + sLineBreak +
-        
         '    window.onload = function() { connectWebSocket(); };' + sLineBreak +
       '  </script>' + sLineBreak +
     '</body>' + sLineBreak +
