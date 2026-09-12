@@ -335,7 +335,11 @@ begin
 
       QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
         begin
-          
+          if (Server <> nil) and (Server.FMsQuic <> nil) and (Server.FMsQuic.Api <> nil) then
+          begin
+            const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
+            Server.FMsQuic.Api.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+          end;
         end;
 
       QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
@@ -343,6 +347,15 @@ begin
           if (Server <> nil) and (Server.FMsQuic <> nil) and (Server.FMsQuic.Api <> nil) then
           begin
             Logger.Debug('[QUIC] Stream %p aborted by client (RESET_STREAM, Error code: 0x%x)', [Pointer(Stream), Event.ErrorCode]);
+            const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
+            Server.FMsQuic.Api.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, Event.ErrorCode);
+          end;
+        end;
+
+      QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+        begin
+          if (Server <> nil) and (Server.FMsQuic <> nil) and (Server.FMsQuic.Api <> nil) then
+          begin
             const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
             Server.FMsQuic.Api.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, Event.ErrorCode);
           end;

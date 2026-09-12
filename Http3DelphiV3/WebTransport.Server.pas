@@ -232,9 +232,9 @@ begin
         FStreamToSession.Remove(ConnectStreamOrDataStream);
         if FSessions.TryGetValue(ConnectStream, SessCtx) then
         begin
-          if SessCtx.StreamCount > 0 then
-            Dec(SessCtx.StreamCount);
-          FSessions.AddOrSetValue(ConnectStream, SessCtx);
+          ClosedSessionId := SessCtx.SessionId;
+          HasSessionClosed := True;
+          FSessions.Remove(ConnectStream);
         end;
       end;
     finally
