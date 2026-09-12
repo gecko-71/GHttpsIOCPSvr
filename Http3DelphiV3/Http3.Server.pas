@@ -429,7 +429,7 @@ begin
       end;
     end;
 
-    if Assigned(FWebTransport) and FWebTransport.HandleStreamData(Stream, TempBuf) then
+    if Assigned(FWebTransport) and FWebTransport.HandleStreamData(ConnCtx.Connection, Stream, TempBuf) then
     begin
       H3State.Lock.Enter;
       try

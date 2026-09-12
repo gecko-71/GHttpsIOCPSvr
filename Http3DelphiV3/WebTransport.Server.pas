@@ -72,7 +72,8 @@ type
     procedure HandleStreamClosed(ConnectStreamOrDataStream: HQUIC);
     procedure HandleConnectionClosed(Connection: HQUIC);
     function HandleNewStream(Connection: HQUIC; Stream: HQUIC; IsBidi: Boolean): Boolean;
-    function HandleStreamData(Stream: HQUIC; const Data: TBytes): Boolean;
+    function HandleStreamData(Connection: HQUIC; Stream: HQUIC; const Data: TBytes): Boolean; overload;
+    function HandleStreamData(Stream: HQUIC; const Data: TBytes): Boolean; overload;
     procedure HandleDatagram(Connection: HQUIC; const Data: TBytes);
     property OnSessionRequest: TOnWTSessionRequest read FOnSessionRequest write FOnSessionRequest;
     property OnSessionReady:   TOnWTSessionReady   read FOnSessionReady   write FOnSessionReady;
@@ -316,6 +317,11 @@ begin
 end;
 
 function TWebTransportServer.HandleStreamData(Stream: HQUIC; const Data: TBytes): Boolean;
+begin
+  Result := HandleStreamData(nil, Stream, Data);
+end;
+
+function TWebTransportServer.HandleStreamData(Connection: HQUIC; Stream: HQUIC; const Data: TBytes): Boolean;
 var
   SessCtx: TWTSessionContext;
   ConnectStream: HQUIC;
@@ -354,7 +360,10 @@ begin
             Found := False;
             for Pair in FSessions do
             begin
-              if (Pair.Value.StreamId = SessionId) or (Pair.Value.SessionId = SessionId) or (FSessions.Count = 1) then
+              if (Connection <> nil) and (Pair.Value.Connection <> Connection) then
+                Continue;
+
+              if (Pair.Value.StreamId = SessionId) or (Pair.Value.SessionId = SessionId) then
               begin
                 TargetConnectStream := Pair.Key;
                 FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
@@ -363,6 +372,34 @@ begin
                 Break;
               end;
             end;
+
+            if (not Found) and (Connection <> nil) then
+            begin
+              for Pair in FSessions do
+              begin
+                if Pair.Value.Connection = Connection then
+                begin
+                  TargetConnectStream := Pair.Key;
+                  FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
+                  PayloadOffset := DecodeOffset;
+                  Found := True;
+                  Break;
+                end;
+              end;
+            end;
+
+            if (not Found) and (FSessions.Count = 1) then
+            begin
+              for Pair in FSessions do
+              begin
+                TargetConnectStream := Pair.Key;
+                FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
+                PayloadOffset := DecodeOffset;
+                Found := True;
+                Break;
+              end;
+            end;
+
             if not Found then 
 			   Exit;
           end;
