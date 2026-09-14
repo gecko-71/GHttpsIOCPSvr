@@ -692,110 +692,117 @@ begin
   HeaderObj := nil;
   PayloadObj := nil;
   try
-    if IsRateLimited(ClientId) then
-    begin
-      JWT.LastError := jeRateLimited;
-      JWT.ErrorMessage := 'Too many validation attempts.';
-      Exit;
-    end;
-    UpdateValidationAttempt(ClientId);
-
-    if not ValidateTokenSize(Token) then
-    begin
-      JWT.LastError := jeTokenTooLarge;
-      JWT.ErrorMessage := Format('Token size (%d) exceeds maximum (%d bytes).', [Length(Token), FMaxTokenSize]);
-      Exit;
-    end;
-
-    TokenParts := Token.Split(['.']);
-    if Length(TokenParts) <> 3 then
-    begin
-      JWT.LastError := jeInvalidFormat;
-      JWT.ErrorMessage := 'Token must have exactly 3 parts separated by dots.';
-      LogSecurityEvent('Invalid token format', Format('Parts found: %d', [Length(TokenParts)]));
-      Exit;
-    end;
-    JWT.Header := TokenParts[0];
-    JWT.Payload := TokenParts[1];
-    JWT.Signature := TokenParts[2];
-
-
-    var DecHeaderStr := DecodeBase64Url(JWT.Header);
-    HeaderObj := ParseJsonSafely(DecHeaderStr);
-    if not Assigned(HeaderObj) then
-    begin
-      JWT.LastError := jeInvalidHeader;
-      JWT.ErrorMessage := 'Cannot decode or parse token header JSON: ' + DecHeaderStr;
-      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
-      Exit;
-    end;
-
-    if not ValidateHeaderSafely(HeaderObj) then
-    begin
-      JWT.LastError := jeInvalidHeader;
-      JWT.ErrorMessage := 'Invalid header content (e.g., algorithm not allowed).';
-      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
-      raise Exception.Create(JWT.ErrorMessage);
-    end;
-
-    if not VerifySignature(JWT.Header + '.' + JWT.Payload, JWT.Signature) then
-    begin
-      JWT.LastError := jeInvalidSignature;
-      JWT.ErrorMessage := 'Invalid token signature.';
-      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
-      raise Exception.Create(JWT.ErrorMessage);
-    end;
-
-    var DecPayloadStr := DecodeBase64Url(JWT.Payload);
-    PayloadObj := ParseJsonSafely(DecPayloadStr);
-    if not Assigned(PayloadObj) then
-    begin
-      JWT.LastError := jeInvalidPayload;
-      JWT.ErrorMessage := 'Cannot decode or parse token payload JSON: ' + DecPayloadStr;
-      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
-      raise Exception.Create(JWT.ErrorMessage);
-    end;
-
-    if not ValidateStandardClaims(PayloadObj, Error, ErrorMsg) then
-    begin
-      JWT.LastError := Error;
-      JWT.ErrorMessage := ErrorMsg;
-      raise Exception.Create(JWT.ErrorMessage);
-    end;
-
-    if PayloadObj.TryGetValue<Int64>('exp', ExpTime) then
-       JWT.ExpirationTime := UnixToDateTime(ExpTime);
-    if PayloadObj.TryGetValue<Int64>('iat', IatTime) then
-       JWT.IssuedAt := UnixToDateTime(IatTime);
-    if PayloadObj.TryGetValue<Int64>('nbf', NbfTime) then
-       JWT.NotBefore := UnixToDateTime(NbfTime);
-    if PayloadObj.TryGetValue<string>('sub', SubValue) then
-       JWT.Subject := SubValue;
-    if PayloadObj.TryGetValue<string>('iss', IssValue) then
-       JWT.Issuer := IssValue;
-    if PayloadObj.TryGetValue<string>('aud', AudValue) then
-       JWT.Audience := AudValue;
-    if PayloadObj.TryGetValue<string>('jti', JtiValue) then
-       JWT.JwtId := JtiValue;
-
-    JWT.HeaderDecoded := HeaderObj;
-    JWT.Decoded := PayloadObj;
-    JWT.IsValid := True;
-    Result := True;
-  except
-    on E: Exception do
-    begin
-      if JWT.LastError = jeNone then
+    try
+      if IsRateLimited(ClientId) then
       begin
-        JWT.LastError := jeParsingError;
-        JWT.ErrorMessage := 'Unexpected error during token validation: ' + E.Message;
+        JWT.LastError := jeRateLimited;
+        JWT.ErrorMessage := 'Too many validation attempts.';
+        Exit;
       end;
-      LogSecurityEvent('Token validation failed', JWT.ErrorMessage);
-      Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
-      Result := False;
+      UpdateValidationAttempt(ClientId);
 
-      if Assigned(HeaderObj) then HeaderObj.Free;
-      if Assigned(PayloadObj) then PayloadObj.Free;
+      if not ValidateTokenSize(Token) then
+      begin
+        JWT.LastError := jeTokenTooLarge;
+        JWT.ErrorMessage := Format('Token size (%d) exceeds maximum (%d bytes).', [Length(Token), FMaxTokenSize]);
+        Exit;
+      end;
+
+      TokenParts := Token.Split(['.']);
+      if Length(TokenParts) <> 3 then
+      begin
+        JWT.LastError := jeInvalidFormat;
+        JWT.ErrorMessage := 'Token must have exactly 3 parts separated by dots.';
+        LogSecurityEvent('Invalid token format', Format('Parts found: %d', [Length(TokenParts)]));
+        Exit;
+      end;
+      JWT.Header := TokenParts[0];
+      JWT.Payload := TokenParts[1];
+      JWT.Signature := TokenParts[2];
+
+
+      var DecHeaderStr := DecodeBase64Url(JWT.Header);
+      HeaderObj := ParseJsonSafely(DecHeaderStr);
+      if not Assigned(HeaderObj) then
+      begin
+        JWT.LastError := jeInvalidHeader;
+        JWT.ErrorMessage := 'Cannot decode or parse token header JSON: ' + DecHeaderStr;
+        Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
+        Exit;
+      end;
+
+      if not ValidateHeaderSafely(HeaderObj) then
+      begin
+        JWT.LastError := jeInvalidHeader;
+        JWT.ErrorMessage := 'Invalid header content (e.g., algorithm not allowed).';
+        Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
+        raise Exception.Create(JWT.ErrorMessage);
+      end;
+
+      if not VerifySignature(JWT.Header + '.' + JWT.Payload, JWT.Signature) then
+      begin
+        JWT.LastError := jeInvalidSignature;
+        JWT.ErrorMessage := 'Invalid token signature.';
+        Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
+        raise Exception.Create(JWT.ErrorMessage);
+      end;
+
+      var DecPayloadStr := DecodeBase64Url(JWT.Payload);
+      PayloadObj := ParseJsonSafely(DecPayloadStr);
+      if not Assigned(PayloadObj) then
+      begin
+        JWT.LastError := jeInvalidPayload;
+        JWT.ErrorMessage := 'Cannot decode or parse token payload JSON: ' + DecPayloadStr;
+        Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
+        raise Exception.Create(JWT.ErrorMessage);
+      end;
+
+      if not ValidateStandardClaims(PayloadObj, Error, ErrorMsg) then
+      begin
+        JWT.LastError := Error;
+        JWT.ErrorMessage := ErrorMsg;
+        raise Exception.Create(JWT.ErrorMessage);
+      end;
+
+      if PayloadObj.TryGetValue<Int64>('exp', ExpTime) then
+         JWT.ExpirationTime := UnixToDateTime(ExpTime);
+      if PayloadObj.TryGetValue<Int64>('iat', IatTime) then
+         JWT.IssuedAt := UnixToDateTime(IatTime);
+      if PayloadObj.TryGetValue<Int64>('nbf', NbfTime) then
+         JWT.NotBefore := UnixToDateTime(NbfTime);
+      if PayloadObj.TryGetValue<string>('sub', SubValue) then
+         JWT.Subject := SubValue;
+      if PayloadObj.TryGetValue<string>('iss', IssValue) then
+         JWT.Issuer := IssValue;
+      if PayloadObj.TryGetValue<string>('aud', AudValue) then
+         JWT.Audience := AudValue;
+      if PayloadObj.TryGetValue<string>('jti', JtiValue) then
+         JWT.JwtId := JtiValue;
+
+      JWT.HeaderDecoded := HeaderObj;
+      JWT.Decoded := PayloadObj;
+      JWT.IsValid := True;
+      Result := True;
+    except
+      on E: Exception do
+      begin
+        if JWT.LastError = jeNone then
+        begin
+          JWT.LastError := jeParsingError;
+          JWT.ErrorMessage := 'Unexpected error during token validation: ' + E.Message;
+        end;
+        LogSecurityEvent('Token validation failed', JWT.ErrorMessage);
+        Logger.Info('[LOG-JWT-FAIL] ' + JWT.ErrorMessage);
+        Result := False;
+
+        if Assigned(HeaderObj) then HeaderObj.Free;
+        if Assigned(PayloadObj) then PayloadObj.Free;
+      end;
+    end;
+  finally
+    if not Result then
+    begin
+      FreeAndNil(JWT);
     end;
   end;
 end;
