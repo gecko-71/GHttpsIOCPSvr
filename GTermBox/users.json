@@ -1,0 +1,64 @@
+{
+  "users": [
+    {
+      "username": "usr1",
+      "salt": "salt_usr1_8f2a1b9c3e",
+      "passwordHash": "96e90211ce9ca78a7c3f2961ffc22fe4f7547f7172cdea6ec69ecaf3f37e51f1",
+      "sandbox": "sandbox_usr1",
+      "apps": [
+        "far",
+        "edit",
+        "powershell",
+        "pytui"
+      ]
+    },
+    {
+      "username": "usr2",
+      "salt": "salt_usr2_5d7e4a1f8b",
+      "passwordHash": "1d2fe714c3b54f42f8797ae639a9e5cd7ff94b1d54ada1650b7697c25eb7400f",
+      "sandbox": "sandbox_usr2",
+      "apps": [
+        "edit",
+        "powershell"
+      ]
+    },
+    {
+      "username": "usr3",
+      "salt": "salt_usr3_2c9e7f4a6d",
+      "passwordHash": "602a656cfdd59aef9611c8822369a2d988cd220ec7d55e0e93acb4fb8154c407",
+      "sandbox": "sandbox_usr3",
+      "apps": [
+        "edit",
+        "powershell"
+      ]
+    },
+    {
+      "username": "usr6",
+      "salt": "salt_usr6_1417970748",
+      "passwordHash": "b819d4697ca2335667a26567943dc00628840f8534591d01c39b245403faa5fa",
+      "sandbox": "sandbox_usr6",
+      "apps": [
+        "far",
+        "edit",
+        "powershell"
+      ]
+    },
+    {
+      "username": "admin",
+      "role": "admin",
+      "salt": "salt_admin_7951d215c4",
+      "passwordHash": "ce20232d96aa0651ef8b56fb8abb831d83f2b17dabcb612a30075cb4d062bf57",
+      "sandbox": "sandbox_admin",
+      "apps": [
+        "*"
+      ],
+      "grants": {
+        "network": true,
+        "allowJobOnly": true,
+        "fullDiskAccess": true,
+        "allowedDirsRead": [],
+        "allowedDirsWrite": []
+      }
+    }
+  ]
+}

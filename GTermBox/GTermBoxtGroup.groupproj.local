@@ -1,0 +1,9 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<BorlandProject>
+	<Transactions>
+    <Transaction>1899.12.30 00:00:00.000.569,C:\Users\maja\Documents\Embarcadero\Studio\Projects\ProjectGroup1.groupproj=C:\PRJ\GTermBox\GTermBoxtGroup.groupproj</Transaction>
+  </Transactions>
+	<Default.Personality>
+		<Projects ActiveProject="C:\PRJ\GHttpsIOCPSvr-mainv3\GHttpsIOCPSvr\GTermBox\ManageUsers.dproj"/>
+	</Default.Personality>
+</BorlandProject>

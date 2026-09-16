@@ -1,0 +1,48 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{3B0194BE-6E20-4A5D-A544-2CFFEEC66DAC}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="GTermBoxServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="ManageUsers.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="GTermBoxServer">
+        <MSBuild Projects="GTermBoxServer.dproj"/>
+    </Target>
+    <Target Name="GTermBoxServer:Clean">
+        <MSBuild Projects="GTermBoxServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="GTermBoxServer:Make">
+        <MSBuild Projects="GTermBoxServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="ManageUsers">
+        <MSBuild Projects="ManageUsers.dproj"/>
+    </Target>
+    <Target Name="ManageUsers:Clean">
+        <MSBuild Projects="ManageUsers.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="ManageUsers:Make">
+        <MSBuild Projects="ManageUsers.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="GTermBoxServer;ManageUsers"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="GTermBoxServer:Clean;ManageUsers:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="GTermBoxServer:Make;ManageUsers:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>

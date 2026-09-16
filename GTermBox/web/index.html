@@ -1,0 +1,1320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GTermBox Web Terminal</title>
+  <link rel="stylesheet" href="lib/xterm.css" />
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background-color: #0b0f19;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      background: #1e293b;
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #334155;
+      flex-shrink: 0;
+      gap: 12px;
+    }
+    .title {
+      font-weight: 600;
+      font-size: 15px;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      font-size: 11px;
+      background: #0284c7;
+      color: #ffffff;
+      padding: 2px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .subtitle {
+      font-size: 12px;
+      color: #94a3b8;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header-btn {
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.15s ease;
+    }
+    .header-btn:hover {
+      background: #1e293b;
+      border-color: #64748b;
+      color: #38bdf8;
+    }
+    #tabs-bar {
+      background: #0f172a;
+      display: flex;
+      align-items: center;
+      border-bottom: 1px solid #1e293b;
+      padding: 4px 8px 0 8px;
+      overflow-x: auto;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+    .tab {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #1e293b;
+      color: #94a3b8;
+      padding: 6px 14px;
+      font-size: 12px;
+      font-weight: 500;
+      border-top-left-radius: 6px;
+      border-top-right-radius: 6px;
+      cursor: pointer;
+      user-select: none;
+      border: 1px solid #334155;
+      border-bottom: none;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .tab:hover {
+      background: #273549;
+      color: #f8fafc;
+    }
+    .tab.active {
+      background: #0c0c0c;
+      color: #38bdf8;
+      border-color: #0284c7;
+      border-bottom: 1px solid #0c0c0c;
+      font-weight: 600;
+    }
+    .tab-close {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      font-size: 13px;
+      line-height: 1;
+      color: #94a3b8;
+      transition: all 0.15s ease;
+    }
+    .tab-close:hover {
+      background: #ef4444;
+      color: #ffffff;
+    }
+    #new-tab-btn {
+      background: transparent;
+      border: 1px dashed #475569;
+      color: #94a3b8;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 14px;
+      line-height: 1;
+      cursor: pointer;
+      margin-left: 4px;
+      margin-bottom: 2px;
+      transition: all 0.15s ease;
+    }
+    #new-tab-btn:hover {
+      background: #1e293b;
+      color: #38bdf8;
+      border-color: #0284c7;
+    }
+    #terminal-wrapper {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      background: #0c0c0c;
+      overflow: hidden;
+      position: relative;
+    }
+    .tab-pane {
+      width: 100%;
+      height: 100%;
+      padding: 4px;
+      position: absolute;
+      inset: 0;
+      display: none;
+    }
+    .tab-pane.active {
+      display: block;
+    }
+    .xterm {
+      width: 100%;
+      height: 100%;
+    }
+    .xterm-viewport {
+      overflow-y: auto;
+    }
+    .xterm .xterm-cursor.xterm-cursor-outline {
+      outline: none !important;
+      box-shadow: inset 0 0 0 1px #ffffff !important;
+    }
+    #drop-overlay {
+      position: absolute;
+      inset: 8px;
+      background: rgba(15, 23, 42, 0.9);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 12px;
+      border: 2px dashed #0284c7;
+      border-radius: 10px;
+      z-index: 50;
+      pointer-events: none;
+    }
+    #drop-overlay.active {
+      display: flex;
+    }
+    #toast-container {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 9999;
+      pointer-events: none;
+    }
+    .toast {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #f8fafc;
+      font-size: 13px;
+      padding: 10px 16px;
+      border-radius: 8px;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+      animation: fadeIn 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .toast.success {
+      border-left: 4px solid #10b981;
+    }
+    .toast.error {
+      border-left: 4px solid #ef4444;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(11, 15, 25, 0.85);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 999;
+    }
+    .modal-content {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      max-height: 85vh;
+      overflow-y: auto;
+    }
+    .sessions-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      text-align: left;
+    }
+    .sessions-table th {
+      background: #0f172a;
+      color: #94a3b8;
+      padding: 8px 12px;
+      border-bottom: 1px solid #334155;
+    }
+    .sessions-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid #273549;
+      color: #e2e8f0;
+    }
+    .sessions-table tr:hover td {
+      background: #273549;
+    }
+    .kill-btn {
+      background: #ef4444;
+      color: #ffffff;
+      border: none;
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .kill-btn:hover {
+      background: #dc2626;
+    }
+  </style>
+  <script src="lib/xterm.js"></script>
+  <script src="lib/addon-fit.js"></script>
+</head>
+<body>
+  <div id="login-overlay" style="position:fixed; inset:0; background:rgba(11,15,25,0.85); backdrop-filter:blur(8px); display:none; align-items:center; justify-content:center; z-index:9999;">
+    <div style="background:#1e293b; border:1px solid #334155; border-radius:12px; padding:32px; width:360px; box-shadow:0 20px 40px rgba(0,0,0,0.6); display:flex; flex-direction:column; gap:20px;">
+      <div style="text-align:center;">
+        <h2 style="font-size:20px; font-weight:700; color:#f8fafc; margin-bottom:6px;">GTermBox Login</h2>
+        <p style="font-size:13px; color:#94a3b8;">Enter credentials to enter your sandbox</p>
+      </div>
+      <form id="login-form" style="display:flex; flex-direction:column; gap:14px;">
+        <div id="login-error" style="display:none; background:rgba(239,68,68,0.15); border:1px solid #ef4444; color:#fca5a5; font-size:12px; padding:8px 12px; border-radius:6px; text-align:center;"></div>
+        <div>
+          <label style="display:block; font-size:12px; color:#cbd5e1; margin-bottom:4px;" for="login-username">Username</label>
+          <input type="text" id="login-username" required autocomplete="username" style="width:100%; box-sizing:border-box; background:#0f172a; border:1px solid #334155; border-radius:6px; padding:8px 12px; color:#f8fafc; font-size:14px; outline:none;" />
+        </div>
+        <div>
+          <label style="display:block; font-size:12px; color:#cbd5e1; margin-bottom:4px;" for="login-password">Password</label>
+          <input type="password" id="login-password" required autocomplete="current-password" style="width:100%; box-sizing:border-box; background:#0f172a; border:1px solid #334155; border-radius:6px; padding:8px 12px; color:#f8fafc; font-size:14px; outline:none;" />
+        </div>
+        <button type="submit" id="login-submit-btn" style="width:100%; background:#0284c7; color:#ffffff; font-weight:600; border:none; border-radius:6px; padding:10px; font-size:14px; cursor:pointer; margin-top:6px;">Sign In</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="sessions-modal" class="modal-overlay">
+    <div class="modal-content" style="width:720px;">
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <h3 style="font-size:16px; font-weight:700; color:#f8fafc;">Active Server Sessions</h3>
+        <div style="display:flex; gap:8px;">
+          <button id="sessions-refresh-btn" class="header-btn">Refresh</button>
+          <button id="sessions-close-btn" class="header-btn">Close</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table class="sessions-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Application</th>
+              <th>PID</th>
+              <th>Resolution</th>
+              <th>Connected</th>
+              <th>Idle</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-tbody">
+            <tr><td colspan="7" style="text-align:center; color:#94a3b8;">Loading sessions...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="download-modal" class="modal-overlay">
+    <div class="modal-content" style="width:420px;">
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <h3 style="font-size:16px; font-weight:700; color:#f8fafc;">Download File</h3>
+        <button id="download-close-btn" class="header-btn">Close</button>
+      </div>
+      <p style="font-size:12px; color:#94a3b8;">
+        Specify filename located in your private sandbox:
+      </p>
+      <form id="download-form" style="display:flex; flex-direction:column; gap:12px;">
+        <input type="text" id="download-filename" required placeholder="e.g. filename.txt" style="width:100%; box-sizing:border-box; background:#0f172a; border:1px solid #334155; border-radius:6px; padding:8px 12px; color:#f8fafc; font-size:14px; outline:none;" />
+        <div style="display:flex; justify-content:flex-end; gap:8px;">
+          <button type="button" id="download-cancel-btn" class="header-btn">Cancel</button>
+          <button type="submit" id="download-submit-btn" style="background:#0284c7; color:#ffffff; border:none; border-radius:6px; padding:6px 14px; font-size:13px; font-weight:600; cursor:pointer;">Download</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <header>
+    <div class="title">
+      <span>GTermBox</span>
+      <span class="badge" id="transport-badge">Connecting</span>
+    </div>
+    <div class="subtitle">
+      <button id="download-file-btn" class="header-btn" title="Download a file from sandbox">
+        <span>📥</span>
+        <span>Download</span>
+      </button>
+      <button id="sessions-view-btn" class="header-btn" title="Inspect active server sessions">
+        <span>🖥️</span>
+        <span>Sessions</span>
+      </button>
+      <label for="appSelector" style="font-size:12px; color:#94a3b8; font-weight:500;">Application:</label>
+      <select id="appSelector" style="background:#0f172a; color:#f8fafc; border:1px solid #334155; border-radius:6px; padding:5px 10px; font-size:12px; cursor:pointer; outline:none; min-width:140px; font-weight:500;">
+      </select>
+      <span id="user-info" style="display:none; font-size:12px; color:#38bdf8; background:#0f172a; border:1px solid #334155; padding:4px 10px; border-radius:6px;"></span>
+      <button id="logout-btn" style="display:none; background:#ef4444; color:#ffffff; border:none; border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer; font-weight:600;">Log Out</button>
+    </div>
+  </header>
+
+  <nav id="tabs-bar">
+    <button id="new-tab-btn" title="Open new session tab">+</button>
+  </nav>
+
+  <main id="terminal-wrapper">
+    <div id="drop-overlay">
+      <div style="font-size:36px;">📁</div>
+      <div style="font-size:16px; font-weight:600; color:#f8fafc;">Drop files here to upload to sandbox</div>
+      <div style="font-size:12px; color:#94a3b8;">Files will be securely written to your private sandbox directory</div>
+    </div>
+  </main>
+
+  <div id="toast-container"></div>
+
+  <script>
+(function(window, document) {
+  'use strict';
+
+  function showToast(message, type) {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const toast = document.createElement('div');
+    toast.className = 'toast ' + (type || 'success');
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transition = 'opacity 0.3s ease';
+      setTimeout(() => toast.remove(), 300);
+    }, 3500);
+  }
+
+  class GTermBox {
+    constructor(containerElement, appName) {
+      this.container = containerElement;
+      this.appName = appName || 'testapp';
+      this.container.innerHTML = '';
+
+      this.term = new Terminal({
+        cursorBlink: false,
+        cursorStyle: 'block',
+        cursorWidth: 2,
+        cursorInactiveStyle: 'block',
+        fontFamily: '"Cascadia Code", "Consolas", "Courier New", monospace',
+        fontSize: 15,
+        letterSpacing: 0,
+        lineHeight: 1.0,
+        theme: {
+          background: '#0c0c0c',
+          foreground: '#cccccc',
+          cursor: '#ffffff',
+          cursorAccent: '#000000',
+          selectionBackground: 'rgba(255, 255, 255, 0.3)'
+        },
+        allowProposedApi: true
+      });
+
+      this.fitAddon = new FitAddon.FitAddon();
+      this.term.loadAddon(this.fitAddon);
+      this.term.open(this.container);
+
+      try {
+        this.fitAddon.fit();
+      } catch (_) {}
+
+      try {
+        this.term.focus();
+      } catch (_) {}
+
+      this.transportMode = 'unknown';
+      this.wt = null;
+      this.wtBidiStream = null;
+      this.wtWriter = null;
+      this.wtReader = null;
+      this.isDestroyed = false;
+
+      this.initListeners();
+      this.connect();
+    }
+
+    initListeners() {
+      this.container.addEventListener('click', () => {
+        if (this.term) {
+          try {
+            this.term.focus();
+          } catch (_) {}
+        }
+      });
+
+      this.term.attachCustomKeyEventHandler((e) => {
+        if (e.type === 'keydown') {
+          if (e.ctrlKey && !e.altKey && !e.shiftKey) {
+            const key = e.key.toLowerCase();
+            if (key === 'o' || key === 's' || key === 'p') {
+              e.preventDefault();
+              const code = key === 'o' ? '\x0f' : (key === 's' ? '\x13' : '\x10');
+              this.sendInput(code);
+              return false;
+            }
+          }
+        }
+        return true;
+      });
+
+      this.term.onData((data) => {
+        this.sendInput(data);
+      });
+
+      this.term.onResize(({ cols, rows }) => {
+        this.send({ type: 'resize', cols, rows });
+      });
+
+      this.term.onSelectionChange(() => {
+        const selection = this.term.getSelection();
+        if (selection && selection.length > 0 && navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(selection).catch(() => {});
+        }
+      });
+
+      this.windowResizeHandler = () => {
+        if (this.isDestroyed) return;
+        try {
+          this.fitAddon.fit();
+        } catch (_) {}
+      };
+      window.addEventListener('resize', this.windowResizeHandler);
+    }
+
+    async connect() {
+      if (this.isDestroyed) return;
+      this.updateBadge('Connecting', '#0284c7');
+
+      if (window.WebTransport) {
+        const ok = await this.connectWebTransport();
+        if (ok) return;
+      }
+
+      this.handleDisconnect('Connection lost.');
+    }
+
+    async connectWebTransport() {
+      try {
+        let wtOptions = undefined;
+        try {
+          const res = await fetch('/api/certificate-hash');
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.hash && Array.isArray(data.hash) && data.hash.length === 32) {
+              wtOptions = {
+                serverCertificateHashes: [{ algorithm: 'sha-256', value: new Uint8Array(data.hash) }]
+              };
+            }
+          }
+        } catch (_) {}
+
+        const token = sessionStorage.getItem('gtermbox_token') || '';
+        if (!token) {
+          this.handleDisconnect('Please sign in.');
+          return false;
+        }
+        let sessionId = '';
+        try {
+          const sRes = await fetch('/api/terminal/session', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + token
+            },
+            body: JSON.stringify({ app: this.appName, cols: this.term.cols || 120, rows: this.term.rows || 30 })
+          });
+          if (sRes.status === 401) {
+            sessionStorage.removeItem('gtermbox_token');
+            sessionStorage.removeItem('gtermbox_user');
+            sessionStorage.removeItem('gtermbox_sandbox');
+            if (typeof window.showLoginGlobal === 'function') {
+              window.showLoginGlobal('Invalid or expired token. Please sign in again.');
+            }
+            return false;
+          }
+          if (sRes.ok) {
+            const sData = await sRes.json();
+            sessionId = sData.sessionId || '';
+          }
+        } catch (_) {}
+
+        let wtUrl = `https://${window.location.host}/wt/terminal?cols=${this.term.cols || 120}&rows=${this.term.rows || 30}&token=${encodeURIComponent(token)}`;
+        if (sessionId) {
+          wtUrl += `&session=${encodeURIComponent(sessionId)}`;
+        } else {
+          wtUrl += `&app=${encodeURIComponent(this.appName)}`;
+        }
+
+        this.wt = wtOptions ? new WebTransport(wtUrl, wtOptions) : new WebTransport(wtUrl);
+        await this.wt.ready;
+
+        this.wtBidiStream = await this.wt.createBidirectionalStream();
+        this.wtWriter = this.wtBidiStream.writable.getWriter();
+        this.wtReader = this.wtBidiStream.readable.getReader();
+        this.transportMode = 'webtransport';
+
+        this.updateBadge('WebTransport', '#10b981');
+        try {
+          this.term.focus();
+        } catch (_) {}
+
+        this.readWebTransportStream();
+        this.send({ type: 'init', app: this.appName, cols: this.term.cols, rows: this.term.rows });
+
+        this.wt.closed.then(() => {
+          if (!this.isDestroyed) {
+            this.handleDisconnect('Disconnected from server.');
+          }
+        }).catch(() => {
+          if (!this.isDestroyed) {
+            this.handleDisconnect('Disconnected from server.');
+          }
+        });
+
+        return true;
+      } catch (err) {
+        if (this.wt) {
+          try { this.wt.close(); } catch (_) {}
+          this.wt = null;
+        }
+        this.handleDisconnect('Connection rejected by server (invalid token or server error).');
+        return false;
+      }
+    }
+
+    async readWebTransportStream() {
+      try {
+        while (!this.isDestroyed && this.wtReader) {
+          const { value, done } = await this.wtReader.read();
+          if (done) break;
+          if (value && value.length > 0) {
+            if (value[0] === 123) {
+              const str = new TextDecoder().decode(value);
+              if (str.includes('"type":"logout"')) {
+                let reason = 'Logged out.';
+                try {
+                  const msg = JSON.parse(str.trim());
+                  if (msg.reason === 'idle_timeout') {
+                    reason = 'Logged out due to inactivity.';
+                  } else if (msg.reason === 'terminated') {
+                    reason = 'Session terminated.';
+                  }
+                } catch (_) {
+                  if (str.includes('idle_timeout')) {
+                    reason = 'Logged out due to inactivity.';
+                  } else if (str.includes('terminated')) {
+                    reason = 'Session terminated.';
+                  }
+                }
+                this.handleDisconnect(reason);
+                return;
+              }
+            }
+            this.term.write(value);
+          }
+        }
+      } catch (_) {
+      } finally {
+        if (!this.isDestroyed) {
+          this.handleDisconnect('Disconnected from server.');
+        }
+      }
+    }
+
+    sendInput(data) {
+      if (this.isDestroyed || !this.wtWriter) return;
+      let payload;
+      if (typeof data === 'string') {
+        payload = new TextEncoder().encode(data);
+      } else {
+        payload = data;
+      }
+      this.wtWriter.write(payload).catch(() => {});
+    }
+
+    send(msgObj) {
+      const jsonStr = JSON.stringify(msgObj) + '\n';
+      this.sendInput(jsonStr);
+    }
+
+    updateBadge(text, color) {
+      const badge = document.getElementById('transport-badge');
+      if (badge) {
+        badge.textContent = text;
+        badge.style.background = color;
+      }
+    }
+
+    handleDisconnect(reason) {
+      if (this.isDisconnecting) return;
+      this.isDisconnecting = true;
+      const msg = reason || 'Disconnected from server.';
+      this.updateBadge('Disconnected', '#64748b');
+      this.destroy(true);
+      sessionStorage.removeItem('gtermbox_token');
+      sessionStorage.removeItem('gtermbox_user');
+      sessionStorage.removeItem('gtermbox_sandbox');
+      if (typeof window.showLoginGlobal === 'function') {
+        window.showLoginGlobal(msg);
+      }
+    }
+
+    destroy(clearDom = true) {
+      this.isDestroyed = true;
+      if (this.windowResizeHandler) {
+        window.removeEventListener('resize', this.windowResizeHandler);
+        this.windowResizeHandler = null;
+      }
+      if (this.wtReader) {
+        try { this.wtReader.cancel(); } catch (_) {}
+        try { this.wtReader.releaseLock(); } catch (_) {}
+        this.wtReader = null;
+      }
+      if (this.wtWriter) {
+        try { this.wtWriter.close().catch(() => {}); } catch (_) {}
+        try { this.wtWriter.releaseLock(); } catch (_) {}
+        this.wtWriter = null;
+      }
+      if (this.wt) {
+        try { this.wt.close(); } catch (_) {}
+        this.wt = null;
+      }
+      if (this.term) {
+        try { this.term.dispose(); } catch (_) {}
+        this.term = null;
+      }
+      if (clearDom && this.container) {
+        this.container.innerHTML = '';
+      }
+    }
+  }
+
+  class TabManager {
+    constructor(tabsBarEl, containerWrapperEl) {
+      this.tabsBar = tabsBarEl;
+      this.wrapper = containerWrapperEl;
+      this.tabs = [];
+      this.activeTabId = null;
+      this.counter = 0;
+    }
+
+    createTab(appName) {
+      this.counter++;
+      const tabId = 'tab-' + this.counter;
+      const pane = document.createElement('div');
+      pane.id = 'pane-' + tabId;
+      pane.className = 'tab-pane';
+      this.wrapper.appendChild(pane);
+
+      const tabEl = document.createElement('div');
+      tabEl.id = tabId;
+      tabEl.className = 'tab';
+      tabEl.innerHTML = `
+        <span>${appName} (#${this.counter})</span>
+        <span class="tab-close" title="Close tab">&times;</span>
+      `;
+
+      const newBtn = document.getElementById('new-tab-btn');
+      this.tabsBar.insertBefore(tabEl, newBtn);
+
+      const instance = new GTermBox(pane, appName);
+      const tabObj = {
+        id: tabId,
+        app: appName,
+        paneEl: pane,
+        tabEl: tabEl,
+        instance: instance
+      };
+
+      tabEl.addEventListener('click', (e) => {
+        if (e.target.classList.contains('tab-close')) return;
+        this.setActiveTab(tabId);
+      });
+
+      tabEl.querySelector('.tab-close').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.closeTab(tabId);
+      });
+
+      this.tabs.push(tabObj);
+      this.setActiveTab(tabId);
+      return tabObj;
+    }
+
+    setActiveTab(tabId) {
+      const target = this.tabs.find(t => t.id === tabId);
+      if (!target) return;
+      this.activeTabId = tabId;
+
+      this.tabs.forEach(t => {
+        if (t.id === tabId) {
+          t.tabEl.classList.add('active');
+          t.paneEl.classList.add('active');
+          try {
+            t.instance.fitAddon.fit();
+            t.instance.term.focus();
+          } catch (_) {}
+          const appSelector = document.getElementById('appSelector');
+          if (appSelector) {
+            appSelector.value = t.app;
+          }
+          const badge = document.getElementById('transport-badge');
+          if (badge) {
+            if (t.instance && t.instance.isDestroyed) {
+              badge.textContent = 'Disconnected';
+              badge.style.background = '#64748b';
+            } else if (t.instance && t.instance.transportMode === 'webtransport') {
+              badge.textContent = 'WebTransport';
+              badge.style.background = '#10b981';
+            }
+          }
+        } else {
+          t.tabEl.classList.remove('active');
+          t.paneEl.classList.remove('active');
+        }
+      });
+    }
+
+    closeTab(tabId) {
+      const idx = this.tabs.findIndex(t => t.id === tabId);
+      if (idx === -1) return;
+      const tab = this.tabs[idx];
+      try { tab.instance.send({ type: 'close' }); } catch (_) {}
+      tab.instance.destroy();
+      tab.paneEl.remove();
+      tab.tabEl.remove();
+      this.tabs.splice(idx, 1);
+
+      if (this.tabs.length === 0) {
+        this.activeTabId = null;
+        sessionStorage.removeItem('gtermbox_token');
+        sessionStorage.removeItem('gtermbox_user');
+        sessionStorage.removeItem('gtermbox_sandbox');
+        if (typeof window.showLoginGlobal === 'function') {
+          window.showLoginGlobal('All session tabs closed.');
+        }
+      } else if (this.activeTabId === tabId) {
+        const nextIdx = Math.max(0, idx - 1);
+        this.setActiveTab(this.tabs[nextIdx].id);
+      }
+    }
+
+    getActiveTab() {
+      return this.tabs.find(t => t.id === this.activeTabId) || null;
+    }
+
+    closeAll() {
+      this.tabs.forEach(t => {
+        try { t.instance.send({ type: 'close' }); } catch (_) {}
+        t.instance.destroy();
+        t.paneEl.remove();
+        t.tabEl.remove();
+      });
+      this.tabs = [];
+      this.activeTabId = null;
+    }
+  }
+
+  window.GTermBox = GTermBox;
+
+  document.addEventListener('DOMContentLoaded', () => {
+    let currentApp = sessionStorage.getItem('gtermbox_app') || '';
+    const appSelector = document.getElementById('appSelector');
+    const loginOverlay = document.getElementById('login-overlay');
+    const loginForm = document.getElementById('login-form');
+    const loginUsername = document.getElementById('login-username');
+    const loginPassword = document.getElementById('login-password');
+    const loginError = document.getElementById('login-error');
+    const userInfo = document.getElementById('user-info');
+    const logoutBtn = document.getElementById('logout-btn');
+    const tabsBar = document.getElementById('tabs-bar');
+    const termWrapper = document.getElementById('terminal-wrapper');
+    const newTabBtn = document.getElementById('new-tab-btn');
+    const dropOverlay = document.getElementById('drop-overlay');
+    const downloadModal = document.getElementById('download-modal');
+    const downloadFileBtn = document.getElementById('download-file-btn');
+    const downloadCloseBtn = document.getElementById('download-close-btn');
+    const downloadCancelBtn = document.getElementById('download-cancel-btn');
+    const downloadForm = document.getElementById('download-form');
+    const downloadFilename = document.getElementById('download-filename');
+    const sessionsModal = document.getElementById('sessions-modal');
+    const sessionsViewBtn = document.getElementById('sessions-view-btn');
+    const sessionsCloseBtn = document.getElementById('sessions-close-btn');
+    const sessionsRefreshBtn = document.getElementById('sessions-refresh-btn');
+    const sessionsTbody = document.getElementById('sessions-tbody');
+
+    const tabManager = new TabManager(tabsBar, termWrapper);
+    window.tabManager = tabManager;
+
+    if (newTabBtn) {
+      newTabBtn.addEventListener('click', () => {
+        const app = appSelector && appSelector.value ? appSelector.value : (currentApp || 'far');
+        tabManager.createTab(app);
+      });
+    }
+
+    window.addEventListener('paste', (e) => {
+      if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+        return;
+      }
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData('text');
+      if (text) {
+        const active = tabManager.getActiveTab();
+        if (active && active.instance && active.instance.term) {
+          active.instance.term.paste(text);
+          try { active.instance.term.focus(); } catch (_) {}
+          showToast('Pasted ' + text.length + ' characters from clipboard', 'success');
+        }
+      }
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && !e.altKey && !e.shiftKey) {
+        const key = e.key.toLowerCase();
+        if (key === 'o' || key === 's' || key === 'p') {
+          e.preventDefault();
+          const active = tabManager.getActiveTab();
+          if (active && active.instance) {
+            const code = key === 'o' ? '\x0f' : (key === 's' ? '\x13' : '\x10');
+            active.instance.sendInput(code);
+            if (active.instance.term) {
+              try { active.instance.term.focus(); } catch (_) {}
+            }
+          }
+        }
+      }
+    });
+
+    let dragCounter = 0;
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+      window.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+    });
+
+    window.addEventListener('dragenter', (e) => {
+      dragCounter++;
+      if (dropOverlay) dropOverlay.classList.add('active');
+    });
+
+    window.addEventListener('dragleave', (e) => {
+      dragCounter--;
+      if (dragCounter <= 0 && dropOverlay) {
+        dragCounter = 0;
+        dropOverlay.classList.remove('active');
+      }
+    });
+
+    window.addEventListener('drop', async (e) => {
+      dragCounter = 0;
+      if (dropOverlay) dropOverlay.classList.remove('active');
+      const files = e.dataTransfer && e.dataTransfer.files;
+      if (!files || files.length === 0) return;
+
+      const token = sessionStorage.getItem('gtermbox_token') || '';
+      if (!token) {
+        showToast('Please sign in to upload files to sandbox', 'error');
+        return;
+      }
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        try {
+          showToast(`Uploading ${file.name} (${file.size} bytes)...`, 'success');
+          const resp = await fetch(`/api/sandbox/file?name=${encodeURIComponent(file.name)}`, {
+            method: 'POST',
+            headers: {
+              'Authorization': 'Bearer ' + token,
+              'Content-Type': 'application/octet-stream'
+            },
+            body: file
+          });
+          if (resp.status === 401) {
+            sessionStorage.removeItem('gtermbox_token');
+            sessionStorage.removeItem('gtermbox_user');
+            sessionStorage.removeItem('gtermbox_sandbox');
+            showLoginGlobal('Session expired. Please sign in again.');
+            return;
+          }
+          if (resp.ok) {
+            showToast(`Uploaded ${file.name} successfully to sandbox!`, 'success');
+          } else {
+            const err = await resp.json().catch(() => ({}));
+            showToast(`Upload failed for ${file.name}: ${err.error || resp.statusText}`, 'error');
+          }
+        } catch (err) {
+          showToast(`Upload error for ${file.name}: ${err.message}`, 'error');
+        }
+      }
+    });
+
+    async function loadActiveSessions() {
+      if (!sessionsTbody) return;
+      const token = sessionStorage.getItem('gtermbox_token') || '';
+      sessionsTbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#94a3b8;">Fetching active sessions...</td></tr>';
+      try {
+        const resp = await fetch('/api/admin/sessions', {
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        if (resp.status === 401) {
+          sessionStorage.removeItem('gtermbox_token');
+          sessionStorage.removeItem('gtermbox_user');
+          sessionStorage.removeItem('gtermbox_sandbox');
+          if (sessionsModal) sessionsModal.style.display = 'none';
+          showLoginGlobal('Session expired or unauthorized.');
+          return;
+        }
+        if (resp.ok) {
+          const data = await resp.json();
+          const list = data.sessions || [];
+          if (list.length === 0) {
+            sessionsTbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#94a3b8;">No active sessions on server.</td></tr>';
+            return;
+          }
+          sessionsTbody.innerHTML = '';
+          list.forEach(s => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td style="font-family:monospace; color:#38bdf8;">${s.sessionId}</td>
+              <td><strong>${s.app}</strong></td>
+              <td>${s.pid}</td>
+              <td>${s.cols}x${s.rows}</td>
+              <td>${s.connectedSeconds}s</td>
+              <td>${s.idleSeconds}s</td>
+              <td><button class="kill-btn" data-id="${s.sessionId}">Kill</button></td>
+            `;
+            sessionsTbody.appendChild(tr);
+          });
+
+          sessionsTbody.querySelectorAll('.kill-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+              const id = e.target.getAttribute('data-id');
+              if (!id) return;
+              try {
+                const kResp = await fetch('/api/admin/sessions/kill', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + token
+                  },
+                  body: JSON.stringify({ sessionId: id })
+                });
+                if (kResp.ok) {
+                  showToast('Session ' + id + ' terminated', 'success');
+                  loadActiveSessions();
+                } else {
+                  showToast('Failed to terminate session', 'error');
+                }
+              } catch (err) {
+                showToast('Termination error: ' + err.message, 'error');
+              }
+            });
+          });
+        } else {
+          sessionsTbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#ef4444;">Failed to load sessions.</td></tr>';
+        }
+      } catch (err) {
+        sessionsTbody.innerHTML = `<tr><td colspan="7" style="text-align:center; color:#ef4444;">Error: ${err.message}</td></tr>`;
+      }
+    }
+
+    if (sessionsViewBtn) {
+      sessionsViewBtn.addEventListener('click', () => {
+        if (sessionsModal) {
+          sessionsModal.style.display = 'flex';
+          loadActiveSessions();
+        }
+      });
+    }
+
+    if (sessionsCloseBtn) {
+      sessionsCloseBtn.addEventListener('click', () => {
+        if (sessionsModal) sessionsModal.style.display = 'none';
+      });
+    }
+
+    if (sessionsRefreshBtn) {
+      sessionsRefreshBtn.addEventListener('click', loadActiveSessions);
+    }
+
+    function openDownloadModal() {
+      if (downloadModal) {
+        if (downloadFilename) downloadFilename.value = '';
+        downloadModal.style.display = 'flex';
+        setTimeout(() => { if (downloadFilename) downloadFilename.focus(); }, 50);
+      }
+    }
+
+    function closeDownloadModal() {
+      if (downloadModal) downloadModal.style.display = 'none';
+      const active = tabManager.getActiveTab();
+      if (active && active.instance && active.instance.term) {
+        try { active.instance.term.focus(); } catch (_) {}
+      }
+    }
+
+    if (downloadFileBtn) downloadFileBtn.addEventListener('click', openDownloadModal);
+    if (downloadCloseBtn) downloadCloseBtn.addEventListener('click', closeDownloadModal);
+    if (downloadCancelBtn) downloadCancelBtn.addEventListener('click', closeDownloadModal);
+
+    if (downloadForm) {
+      downloadForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const fname = downloadFilename ? downloadFilename.value.trim() : '';
+        if (!fname) return;
+        const token = sessionStorage.getItem('gtermbox_token') || '';
+        const url = `/api/sandbox/file?name=${encodeURIComponent(fname)}&token=${encodeURIComponent(token)}`;
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        showToast('Initiating download for ' + fname, 'success');
+        closeDownloadModal();
+      });
+    }
+
+    function parseJwt(token) {
+      try {
+        const base64Url = token.split('.')[1];
+        const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+        const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+        return JSON.parse(jsonPayload);
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function isTokenValid(token) {
+      if (!token) return false;
+      const payload = parseJwt(token);
+      if (!payload) return false;
+      if (payload.exp && (payload.exp * 1000) < Date.now()) return false;
+      return true;
+    }
+
+    async function loadApps() {
+      let apps = [];
+      const token = sessionStorage.getItem('gtermbox_token');
+      if (!token || !isTokenValid(token)) {
+        sessionStorage.removeItem('gtermbox_token');
+        sessionStorage.removeItem('gtermbox_user');
+        sessionStorage.removeItem('gtermbox_sandbox');
+        showLogin(token ? 'Session expired or invalid token. Please sign in again.' : '');
+        return;
+      }
+
+      let allowedApps = null;
+      const payload = parseJwt(token);
+      if (payload && Array.isArray(payload.apps)) {
+        allowedApps = payload.apps;
+      }
+
+      try {
+        const headers = {};
+        if (token) {
+          headers['Authorization'] = 'Bearer ' + token;
+        }
+        const resp = await fetch('/api/apps', { headers });
+        if (resp.status === 401) {
+          sessionStorage.removeItem('gtermbox_token');
+          sessionStorage.removeItem('gtermbox_user');
+          sessionStorage.removeItem('gtermbox_sandbox');
+          showLogin('Session expired or invalid token. Please sign in again.');
+          return;
+        }
+        if (resp.ok) {
+          const data = await resp.json();
+          if (Array.isArray(data)) {
+            apps = data;
+          } else if (data && Array.isArray(data.apps)) {
+            apps = data.apps;
+          }
+        } else {
+          sessionStorage.removeItem('gtermbox_token');
+          sessionStorage.removeItem('gtermbox_user');
+          sessionStorage.removeItem('gtermbox_sandbox');
+          showLogin('Failed to authenticate session. Please sign in again.');
+          return;
+        }
+      } catch (err) {
+        showLogin('Cannot connect to server.');
+        return;
+      }
+
+      if (allowedApps && !allowedApps.includes('*')) {
+        apps = apps.filter(a => allowedApps.includes(a.id));
+      }
+
+      if (apps.length === 0) {
+        sessionStorage.removeItem('gtermbox_token');
+        sessionStorage.removeItem('gtermbox_user');
+        sessionStorage.removeItem('gtermbox_sandbox');
+        showLogin('No authorized apps available.');
+        return;
+      }
+
+      if (appSelector) {
+        appSelector.innerHTML = '';
+        apps.forEach(app => {
+          const opt = document.createElement('option');
+          opt.value = app.id;
+          opt.textContent = app.name || app.id;
+          appSelector.appendChild(opt);
+        });
+        if (apps.length > 0) {
+          const validId = apps.some(a => a.id === currentApp) ? currentApp : apps[0].id;
+          currentApp = validId;
+          sessionStorage.setItem('gtermbox_app', currentApp);
+          appSelector.value = validId;
+          appSelector.onchange = (e) => {
+            currentApp = e.target.value;
+            sessionStorage.setItem('gtermbox_app', currentApp);
+            const active = tabManager.getActiveTab();
+            if (active) {
+              active.instance.destroy();
+              active.app = currentApp;
+              active.tabEl.querySelector('span').textContent = currentApp + ` (#${active.id.replace('tab-','')})`;
+              active.instance = new GTermBox(active.paneEl, currentApp);
+            }
+          };
+        }
+      }
+
+      if (tabManager.tabs.length === 0) {
+        const initialApp = currentApp && apps.some(a => a.id === currentApp) ? currentApp : apps[0].id;
+        tabManager.createTab(initialApp);
+      }
+    }
+
+    function showLogin(reason) {
+      if (loginOverlay) {
+        loginOverlay.style.display = 'flex';
+      }
+      if (loginPassword) loginPassword.value = '';
+      if (loginError) {
+        if (reason) {
+          loginError.textContent = reason;
+          loginError.style.display = 'block';
+        } else {
+          loginError.style.display = 'none';
+        }
+      }
+      if (userInfo) userInfo.style.display = 'none';
+      if (logoutBtn) logoutBtn.style.display = 'none';
+      const badge = document.getElementById('transport-badge');
+      if (badge) {
+        badge.textContent = 'Disconnected';
+        badge.style.background = '#64748b';
+      }
+      tabManager.closeAll();
+      if (loginUsername) loginUsername.focus();
+    }
+    window.showLoginGlobal = showLogin;
+
+    function hideLogin() {
+      if (loginOverlay) {
+        loginOverlay.style.display = 'none';
+      }
+      const user = sessionStorage.getItem('gtermbox_user') || '';
+      const sandbox = sessionStorage.getItem('gtermbox_sandbox') || '';
+      if (userInfo) {
+        userInfo.textContent = user + ' (' + sandbox + ')';
+        userInfo.style.display = 'inline-block';
+      }
+      if (logoutBtn) {
+        logoutBtn.style.display = 'inline-block';
+      }
+    }
+
+    if (logoutBtn) {
+      logoutBtn.addEventListener('click', () => {
+        tabManager.closeAll();
+        sessionStorage.clear();
+        showLogin();
+      });
+    }
+
+    if (loginForm) {
+      loginForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        loginError.style.display = 'none';
+        const username = loginUsername.value.trim();
+        const password = loginPassword.value;
+        try {
+          const resp = await fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            sessionStorage.setItem('gtermbox_token', data.token);
+            sessionStorage.setItem('gtermbox_user', data.username);
+            sessionStorage.setItem('gtermbox_sandbox', data.sandbox);
+            hideLogin();
+            loadApps();
+          } else {
+            const err = await resp.json().catch(() => ({}));
+            loginError.textContent = err.error || 'Invalid username or password';
+            loginError.style.display = 'block';
+          }
+        } catch (err) {
+          loginError.textContent = 'Connection error during login';
+          loginError.style.display = 'block';
+        }
+      });
+    }
+
+    const currentToken = sessionStorage.getItem('gtermbox_token');
+    if (currentToken && isTokenValid(currentToken)) {
+      hideLogin();
+      loadApps();
+    } else {
+      sessionStorage.removeItem('gtermbox_token');
+      sessionStorage.removeItem('gtermbox_user');
+      sessionStorage.removeItem('gtermbox_sandbox');
+      showLogin(currentToken ? 'Session expired. Please sign in again.' : '');
+    }
+
+    window.addEventListener('beforeunload', () => {
+      tabManager.closeAll();
+    });
+
+    window.addEventListener('pagehide', () => {
+      tabManager.closeAll();
+    });
+  });
+})(window, document);
+  </script>
+</body>
+</html>
