@@ -2,6 +2,8 @@
 
 GTermBox is a secure web terminal gateway that streams native Windows console applications (such as PowerShell, Python TUI, and command-line editors) directly into modern web browsers over HTTP/3 WebTransport.
 
+![GTermBox WebTerminal](terminal.png)
+
 ---
 
 ## Key Features
