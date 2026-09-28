@@ -1,2 +1,36 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<BorlandProject/>
+<BorlandProject>
+	<ProjectSortOrder AutoSort="0" SortType="0">
+    <File Path="Http3DelphiV3"/>
+    <File Path="Http3DelphiV3\ls-qpack"/>
+    <File Path="Http3DelphiV3\ls-qpack\LsQpack.Loader.pas"/>
+    <File Path="Http3DelphiV3\ls-qpack\LsQpack.Types.pas"/>
+    <File Path="Http3DelphiV3\Http3.Connection.pas"/>
+    <File Path="Http3DelphiV3\Http3.Frames.pas"/>
+    <File Path="Http3DelphiV3\Http3.Request.pas"/>
+    <File Path="Http3DelphiV3\Http3.Response.pas"/>
+    <File Path="Http3DelphiV3\Http3.Server.pas"/>
+    <File Path="Http3DelphiV3\Http3.Types.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.ApiTable.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.Certificate.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.Configuration.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.Errors.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.Listener.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.Loader.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.Registration.pas"/>
+    <File Path="Http3DelphiV3\MsQuic.Types.pas"/>
+    <File Path="Http3DelphiV3\Quic.Server.pas"/>
+    <File Path="Http3DelphiV3\WebTransport.Server.pas"/>
+    <File Path="Http3DelphiV3\WebTransport.Session.pas"/>
+    <File Path="Http3DelphiV3\WebTransport.Types.pas"/>
+    <File Path="src"/>
+    <File Path="src\GHttpsServerIOCP.pas"/>
+    <File Path="src\GJWTManager.pas"/>
+    <File Path="src\GRequest.pas"/>
+    <File Path="src\GRequestBody.pas"/>
+    <File Path="src\GResponse.pas"/>
+    <File Path="src\GWebSocket.pas"/>
+    <File Path="src\OverlappedExPool.pas"/>
+    <File Path="src\WinApiAdditions.pas"/>
+  </ProjectSortOrder>
+</BorlandProject>

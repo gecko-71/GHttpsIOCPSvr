@@ -1,4 +1,4 @@
-﻿{
+{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -131,7 +131,9 @@ begin
   for i := 1 to ACount do
   begin
     New(Overlapped);
-    ZeroMemory(Overlapped, SizeOf(TOverlappedEx));
+    Finalize(Overlapped^);
+    FillChar(Overlapped^, SizeOf(TOverlappedEx), 0);
+    Initialize(Overlapped^);
     Overlapped^.InPool := 1;
     FAllAllocated.Add(Overlapped);
     FPool.Enqueue(Overlapped);
@@ -198,8 +200,9 @@ begin
   end;
   if Assigned(Result) then
   begin
-    SetLength(Result^.ClientReceiveBuffer, 0);
-    ZeroMemory(Result, SizeOf(TOverlappedEx));
+    Finalize(Result^);
+    FillChar(Result^, SizeOf(TOverlappedEx), 0);
+    Initialize(Result^);
     Result^.InPool := 0;
   end;
 end;

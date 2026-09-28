@@ -258,6 +258,7 @@ type
     FBuffer: TMemoryStream;
     FParsingHeaders: Boolean;
     FHeaderBuffer: TStringList;
+    FSecuritySettings: TSecuritySettings;
     FOnPartComplete: TPartCompleteEvent;
   protected
     function GetContentLength: Int64; override;
@@ -279,9 +280,14 @@ type
     function GetPart(Index: Integer): TBodyPart;
     function GetPartByName(const PartName: string): TBodyPart;
     function GetPartCount: Integer;
+    function ValidateFilename(const Filename: string): Boolean;
+    function ValidateMimeType(const MimeType: string): Boolean;
+    function SaveToFile(const FileName: string): Boolean; override;
+    function MoveTo(const DestFileName: string): Boolean; override;
     property Boundary: string read FBoundary;
     property Parts: TObjectList<TBodyPart> read FParts;
     property PartCount: Integer read GetPartCount;
+    property SecuritySettings: TSecuritySettings read FSecuritySettings write FSecuritySettings;
     property OnPartComplete: TPartCompleteEvent read FOnPartComplete write FOnPartComplete;
   end;
 
@@ -381,6 +387,7 @@ type
     property ProgressReportInterval: Integer read FProgressReportInterval write FProgressReportInterval;
     property UseDiskStorage: Boolean read FUseDiskStorage write FUseDiskStorage;
     property DiskFileManager: TDiskFileManager read FDiskFileManager;
+    property SecuritySettings: TSecuritySettings read FSecuritySettings;
   end;
 
 function GetTempDir: string;
@@ -431,6 +438,11 @@ begin
   MaxFilenameLength := 255;
   AllowedFileExtensions := TStringList.Create;
   BlockedMimeTypes := TStringList.Create;
+  BlockedMimeTypes.Add('application/x-msdownload');
+  BlockedMimeTypes.Add('application/x-msdos-program');
+  BlockedMimeTypes.Add('application/x-executable');
+  BlockedMimeTypes.Add('application/x-sh');
+  BlockedMimeTypes.Add('application/x-bat');
   MaxNestingLevel := 10;
 end;
 
@@ -1446,6 +1458,8 @@ end;
 function TBinaryBodyPart.MoveTo(const DestFileName: string): Boolean;
 begin
   Result := False;
+  if (FParseState = bpsError) or (ErrorMessage <> '') then
+    Exit;
   try
     if FUseDiskStorage and (FTempFilePath <> '') and TFile.Exists(FTempFilePath) then
     begin
@@ -1590,6 +1604,8 @@ end;
 function TBinaryBodyPart.SaveToFile(const FileName: string): Boolean;
 begin
   Result := False;
+  if (FParseState = bpsError) or (ErrorMessage <> '') then
+    Exit;
   try
     if FUseDiskStorage and (FTempFilePath <> '') and TFile.Exists(FTempFilePath) then
     begin
@@ -1880,6 +1896,7 @@ begin
   FCurrentPart := nil;
   FBuffer := TMemoryStream.Create;
   FHeaderBuffer := TStringList.Create;
+  FSecuritySettings := nil;
   FParseState := bpsWaitingData;
 end;
 
@@ -2211,10 +2228,56 @@ begin
   begin
     FCurrentPart.Name := PartName;
     if (FCurrentPart is TBinaryBodyPart) then
+    begin
       TBinaryBodyPart(FCurrentPart).FileName := Filename;
+      if (Filename <> '') and not ValidateFilename(Filename) then
+      begin
+        FCurrentPart.SetError('Disallowed file extension: ' + Filename);
+        SetError('Disallowed file extension: ' + Filename);
+      end;
+      if (FCurrentPart.ContentType <> '') and not ValidateMimeType(FCurrentPart.ContentType) then
+      begin
+        FCurrentPart.SetError('Blocked MIME type: ' + FCurrentPart.ContentType);
+        SetError('Blocked MIME type: ' + FCurrentPart.ContentType);
+      end;
+    end;
     FParts.Add(FCurrentPart);
   end else
     SetError('Failed to create body part from headers.');
+end;
+
+function TMultipartBodyPart.SaveToFile(const FileName: string): Boolean;
+begin
+  Result := False;
+end;
+
+function TMultipartBodyPart.MoveTo(const DestFileName: string): Boolean;
+begin
+  Result := False;
+end;
+
+function TMultipartBodyPart.ValidateFilename(const Filename: string): Boolean;
+var
+  Extension: string;
+begin
+  Result := True;
+  if (Filename = '') or not Assigned(FSecuritySettings) then
+    Exit;
+  if Length(Filename) > FSecuritySettings.MaxFilenameLength then
+    Exit(False);
+  if FSecuritySettings.AllowedFileExtensions.Count > 0 then
+  begin
+    Extension := LowerCase(ExtractFileExt(Filename));
+    Result := FSecuritySettings.AllowedFileExtensions.IndexOf(Extension) >= 0;
+  end;
+end;
+
+function TMultipartBodyPart.ValidateMimeType(const MimeType: string): Boolean;
+begin
+  Result := True;
+  if (MimeType = '') or not Assigned(FSecuritySettings) then
+    Exit;
+  Result := FSecuritySettings.BlockedMimeTypes.IndexOf(LowerCase(MimeType)) = -1;
 end;
 
 function TMultipartBodyPart.CreatePartFromHeaders: TBodyPart;
@@ -2530,6 +2593,7 @@ begin
       begin
         FMainPart := TMultipartBodyPart.Create(FBoundary, 'main', FMaxBodySize,
                                               FDiskFileManager, FUseDiskStorage);
+        TMultipartBodyPart(FMainPart).SecuritySettings := FSecuritySettings;
         if Assigned(FOnPartComplete) then
           TMultipartBodyPart(FMainPart).OnPartComplete := FOnPartComplete;
       end
@@ -2539,7 +2603,14 @@ begin
     bctApplicationOctetStream, bctApplicationPdf, bctImagePng, bctImageJpeg,
     bctImageGif, bctImageWebp, bctImageSvg, bctApplicationZip,
     bctApplicationRar, bctVideo, bctAudio:
+    begin
+      if not ValidateMimeType(FContentType) then
+      begin
+        SetError('Blocked MIME type: ' + FContentType);
+        Exit;
+      end;
       FMainPart := TBinaryBodyPart.Create('main', FMaxBodySize, FDiskFileManager, FUseDiskStorage);
+    end;
 
   else
     FMainPart := TTextBodyPart.Create('main', FMaxBodySize, FDiskFileManager, FUseDiskStorage);
@@ -2633,6 +2704,11 @@ begin
           if LineEndPos > -1 then
           begin
             var LineLen := LineEndPos - FBuffer.Position;
+            if LineLen > 1024 then
+            begin
+              SetError('Chunk size line exceeds maximum allowed length');
+              Exit;
+            end;
             SetString(ChunkHeader, PAnsiChar(P), LineLen);
             FBuffer.Position := LineEndPos + 2;
             FCurrentChunkSize := ExtractChunkSize(string(ChunkHeader));
@@ -2647,7 +2723,14 @@ begin
               FChunkState := 1;
             end;
           end else
+          begin
+            if (EndPtr - P) > 1024 then
+            begin
+              SetError('Chunk size line exceeds maximum allowed length');
+              Exit;
+            end;
             Break;
+          end;
         end;
         1:
         begin
@@ -2655,6 +2738,11 @@ begin
           var BytesToRead := Min(FCurrentChunkSize - FCurrentChunkReceived, BytesAvailable);
           if BytesToRead > 0 then
           begin
+            if (FMaxBodySize > 0) and (FCurrentSize + BytesToRead > FMaxBodySize) then
+            begin
+              SetError(Format('Chunked body size exceeds maximum allowed (%d bytes)', [FMaxBodySize]));
+              Exit;
+            end;
             SetLength(DataToProcess, BytesToRead);
             FBuffer.ReadBuffer(DataToProcess[0], BytesToRead);
             if Assigned(FMainPart) and not FMainPart.AppendData(DataToProcess, BytesToRead) then
@@ -2781,6 +2869,11 @@ begin
         if ChunkHeader <> '' then
         begin
           FCurrentChunkSize := ExtractChunkSize(ChunkHeader);
+          if FCurrentChunkSize < 0 then
+          begin
+            SetError('Invalid chunk size format');
+            Exit;
+          end;
           FCurrentChunkReceived := 0;
           if FCurrentChunkSize = 0 then
           begin
@@ -2825,21 +2918,44 @@ function THttpBodyParser.ExtractChunkSize(const ChunkHeader: string): Integer;
 var
   HexSize: string;
   SemicolonPos: Integer;
+  I: Integer;
+  C: Char;
 begin
-  Result := 0;
+  Result := -1;
   try
     HexSize := Trim(ChunkHeader);
+    if HexSize = '' then
+      Exit;
     SemicolonPos := Pos(';', HexSize);
     if SemicolonPos > 0 then
-       HexSize := Copy(HexSize, 1, SemicolonPos - 1);
+      HexSize := Copy(HexSize, 1, SemicolonPos - 1);
     HexSize := Trim(HexSize);
-    if HexSize <> '' then
-       Result := StrToInt('$' + HexSize);
+    if HexSize = '' then
+      Exit;
+
+    for I := 1 to Length(HexSize) do
+    begin
+      C := UpCase(HexSize[I]);
+      if not (C in ['0'..'9', 'A'..'F']) then
+        Exit;
+    end;
+
+    if Length(HexSize) > 8 then
+      Exit;
+
+    try
+      Result := StrToInt('$' + HexSize);
+    except
+      Result := -1;
+    end;
+
+    if Result < 0 then
+      Result := -1;
   except
     on E: Exception do
     begin
       Logger.Error('Failed to parse chunk size: ' + ChunkHeader + ', error: ' + E.Message);
-      Result := 0;
+      Result := -1;
     end;
   end;
 end;

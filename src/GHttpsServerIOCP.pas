@@ -140,6 +140,14 @@ type
     property AuthorizationType: TAuthorizationType read FAuthorizationType;
   end;
 
+  TIPClientInfo = class
+  public
+    ActiveConnections: Integer;
+    RequestCount: Integer;
+    WindowStartTick: UInt64;
+    constructor Create;
+  end;
+
   TGHttpsServerIOCP = class
   private
     OverlappedExG: POverlappedEx;
@@ -193,6 +201,33 @@ type
     FHttp3Server: THttp3Server;
     FServerCertStore: HCERTSTORE;
     FWebSocketManager: TWebSocketManager;
+    FAlpnData: TBytes;
+    FEnableCORS: Boolean;
+    FCORSAllowedOrigins: string;
+    FCORSAllowedMethods: string;
+    FCORSAllowedHeaders: string;
+    FCORSExposeHeaders: string;
+    FCORSAllowCredentials: Boolean;
+    FCORSMaxAge: Integer;
+    FMaxConnectionsPerIP: Integer;
+    FEnableIPRateLimiting: Boolean;
+    FMaxRequestsPerIPPerSecond: Integer;
+    FEnableTLSSessionResumption: Boolean;
+    FEnableTLSSessionTickets: Boolean;
+    FIPTracker: TDictionary<string, TIPClientInfo>;
+    FIPTrackerLock: TCriticalSection;
+    FIPTrackerInactiveTimeoutMs: UInt64;
+    FLastIPPruneTick: UInt64;
+    FAllowedFileExtensions: TStringList;
+    FBlockedMimeTypes: TStringList;
+    function TrackIPConnect(const AIP: string): Boolean;
+    procedure TrackIPDisconnect(const AIP: string);
+    function CheckIPRateLimit(const AIP: string): Boolean;
+    function ExtractClientIP(ClientSocket: TSocket; ListenSocket: TSocket): string;
+    function IsOriginAllowed(const AOrigin: string): Boolean;
+    function HandleCORSPreflight(Request: TRequest; Response: TResponse): Boolean;
+    procedure ApplyCORSHeaders(Request: TRequest; Response: TResponse);
+    procedure BuildAlpnBuffer;
     function InitializeWinsock: Boolean;
     function CreateListenSocket: Boolean;
     function CreateHttpListenSocket: Boolean;
@@ -203,8 +238,8 @@ type
     procedure CleanupWinsock;
     procedure ListCertificatesInStore(const StoreName: string);
     procedure AcceptConnection2(Socket: TSocket);
-    procedure HandleHttpsHandshake(ClientSocket: TSocket);
-    procedure HandleHttpPlainConnection(ClientSocket: TSocket);
+    procedure HandleHttpsHandshake(ClientSocket: TSocket; const AClientIP: string = '');
+    procedure HandleHttpPlainConnection(ClientSocket: TSocket; const AClientIP: string = '');
     function InitializeRequestProcessing(OverlappedEx: POverlappedEx): Boolean;
     procedure ContinueReadingRequest(OverlappedEx: POverlappedEx);
     function ProcessSSLHandshakeStep(var OverlappedEx: TOverlappedEx; BytesReceived: DWORD): Boolean;
@@ -305,6 +340,23 @@ type
     property HttpAction: THttpActionOnDualMode read FHttpAction write FHttpAction;
     property HttpsPort: Word read FHttpsPort;
     property HttpPort: Word read FHttpPort write FHttpPort;
+    property EnableCORS: Boolean read FEnableCORS write FEnableCORS;
+    property CORSAllowedOrigins: string read FCORSAllowedOrigins write FCORSAllowedOrigins;
+    property CORSAllowedMethods: string read FCORSAllowedMethods write FCORSAllowedMethods;
+    property CORSAllowedHeaders: string read FCORSAllowedHeaders write FCORSAllowedHeaders;
+    property CORSExposeHeaders: string read FCORSExposeHeaders write FCORSExposeHeaders;
+    property CORSAllowCredentials: Boolean read FCORSAllowCredentials write FCORSAllowCredentials;
+    property CORSMaxAge: Integer read FCORSMaxAge write FCORSMaxAge;
+    property MaxConnectionsPerIP: Integer read FMaxConnectionsPerIP write FMaxConnectionsPerIP;
+    property EnableIPRateLimiting: Boolean read FEnableIPRateLimiting write FEnableIPRateLimiting;
+    property MaxRequestsPerIPPerSecond: Integer read FMaxRequestsPerIPPerSecond write FMaxRequestsPerIPPerSecond;
+    property EnableTLSSessionResumption: Boolean read FEnableTLSSessionResumption write FEnableTLSSessionResumption;
+    property EnableTLSSessionTickets: Boolean read FEnableTLSSessionTickets write FEnableTLSSessionTickets;
+    procedure PruneInactiveIPTrackers;
+    function GetTrackedIPCount: Integer;
+    property IPTrackerInactiveTimeoutMs: UInt64 read FIPTrackerInactiveTimeoutMs write FIPTrackerInactiveTimeoutMs;
+    property AllowedFileExtensions: TStringList read FAllowedFileExtensions;
+    property BlockedMimeTypes: TStringList read FBlockedMimeTypes;
   end;
 
 
@@ -417,6 +469,9 @@ begin
     if AOverlapped^.Socket <> INVALID_SOCKET then
     begin
       InterlockedDecrement64(Server.FActiveConnections);
+      var ClientIP := string(PAnsiChar(@AOverlapped^.ClientIP[0]));
+      if ClientIP <> '' then
+        Server.TrackIPDisconnect(ClientIP);
       var IsAbrupt: Boolean := ContainsText(AReason, 'interrupted') or ContainsText(AReason, 'aborted') or ContainsText(AReason, 'reset');
       if AOverlapped^.SSLContextValid then
       begin
@@ -502,6 +557,14 @@ begin
   FAuthorizationType := AAuthorizationType;
 end;
 
+constructor TIPClientInfo.Create;
+begin
+  inherited Create;
+  ActiveConnections := 0;
+  RequestCount := 0;
+  WindowStartTick := GetTickCount64;
+end;
+
 
 
 { TGHttpsServerIOCP }
@@ -581,6 +644,24 @@ begin
   FWebSocketRouteHandlers := TDictionary<string, TWebSocketMessageProc>.Create;
   FWebTransportRoutes := TDictionary<string, TWebTransportRouteItem>.Create;
   FWebTransportSessionRoutes := TDictionary<TWTSessionId, string>.Create;
+  FEnableCORS := True;
+  FCORSAllowedOrigins := '*';
+  FCORSAllowedMethods := 'GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH';
+  FCORSAllowedHeaders := 'Content-Type, Authorization, Accept, X-Requested-With, Origin, Access-Control-Request-Method, Access-Control-Request-Headers';
+  FCORSExposeHeaders := 'Content-Length, Content-Encoding, Date, Server, Alt-Svc';
+  FCORSAllowCredentials := False;
+  FCORSMaxAge := 86400;
+  FMaxConnectionsPerIP := 100;
+  FEnableIPRateLimiting := True;
+  FMaxRequestsPerIPPerSecond := 150;
+  FEnableTLSSessionResumption := True;
+  FEnableTLSSessionTickets := True;
+  FIPTracker := TDictionary<string, TIPClientInfo>.Create;
+  FIPTrackerLock := TCriticalSection.Create;
+  FIPTrackerInactiveTimeoutMs := 60000;
+  FLastIPPruneTick := GetTickCount64;
+  FAllowedFileExtensions := TStringList.Create;
+  FBlockedMimeTypes := TStringList.Create;
   ZeroMemory(@FServerCredHandle, SizeOf(FServerCredHandle));
   Logger.Info(Format('Creating OverlappedEx pool. Max connections: %d', [AMaxConnections]));
   FOverlappedPool := TOverlappedExPool.Create(AMaxConnections div 4, AMaxConnections, AMinFreeMemoryMb, AMaxMemoryLoadPercent);
@@ -676,10 +757,22 @@ begin
 
   if Assigned(FJWTManager) then
      FreeAndNil(FJWTManager);
+  if Assigned(FIPTracker) then
+  begin
+    for var Item in FIPTracker.Values do
+      Item.Free;
+    FreeAndNil(FIPTracker);
+  end;
+  if Assigned(FIPTrackerLock) then
+     FreeAndNil(FIPTrackerLock);
   if Assigned(FActiveOverlapped) then
      FreeAndNil(FActiveOverlapped);
   if Assigned(FActiveOverlappedLock) then
      FreeAndNil(FActiveOverlappedLock);
+  if Assigned(FAllowedFileExtensions) then
+     FreeAndNil(FAllowedFileExtensions);
+  if Assigned(FBlockedMimeTypes) then
+     FreeAndNil(FBlockedMimeTypes);
 
   ElapsedMs := MilliSecondsBetween(Now, StartTime);
   Logger.Info('Cleanup TGHttpsServerIOCP end in %dms', [ElapsedMs]);
@@ -898,6 +991,9 @@ begin
     end;
     OverlappedEx^.Request := nil;
     ZeroMemory(@RemoteAddr, SizeOf(RemoteAddr));
+    var ClientIP := string(PAnsiChar(@OverlappedEx^.ClientIP[0]));
+    if ClientIP <> '' then
+      RemoteAddr.sin_addr.S_addr := inet_addr(PAnsiChar(AnsiString(ClientIP)));
     OverlappedEx^.Request := TRequest.Create(
       OverlappedEx^.Socket,
       RemoteAddr,
@@ -906,6 +1002,10 @@ begin
       vlModerate,
       False
     );
+    if Assigned(FAllowedFileExtensions) and (FAllowedFileExtensions.Count > 0) then
+      OverlappedEx^.Request.AllowedFileExtensions.Assign(FAllowedFileExtensions);
+    if Assigned(FBlockedMimeTypes) and (FBlockedMimeTypes.Count > 0) then
+      OverlappedEx^.Request.BlockedMimeTypes.Assign(FBlockedMimeTypes);
     Result := True;
   except
     on E: Exception do
@@ -1292,52 +1392,42 @@ end;
 function TGHttpsServerIOCP.InitializeSSLCredentials: Boolean;
 const
   SCH_CRED_NO_SYSTEM_MAPPER = $00000002;
-  SCH_CRED_CACHE_SESSION    = $00000020;
+  SCH_CRED_DISABLE_RECONNECTS = $00000080;
 var
-  SchannelCred: SCHANNEL_CRED;
+  SchCred: SCH_CREDENTIALS;
   Status: SECURITY_STATUS;
   Expiry: TTimeStamp;
   CertArray: PCCERT_CONTEXT;
-  CipherSuitePriorityList: WideString;
 begin
   Result := False;
-  Logger.Info('InitializeSSLCredentials START - Production setup for Windows 11/CNG...');
-  ZeroMemory(@SchannelCred, SizeOf(SchannelCred));
-  SchannelCred.dwVersion := SCHANNEL_CRED_VERSION;
+  Logger.Info('InitializeSSLCredentials START - Production setup for Windows 11/CNG with SCH_CREDENTIALS...');
   if FCertContext = nil then
   begin
     Logger.Error('Critical error: Missing certificate.');
     Exit;
   end;
   CertArray := FCertContext;
-  SchannelCred.cCreds := 1;
-  SchannelCred.paCred := @CertArray;
-  SchannelCred.dwFlags := SCH_CRED_USE_DEFAULT_CREDS or SCH_CRED_MANUAL_CRED_VALIDATION or
-                          SCH_CRED_CIPHER_SUITE_PRIORITY or SCH_CRED_NO_SYSTEM_MAPPER or SCH_CRED_CACHE_SESSION;
-  Logger.Info('Flags set for CNG certificate (with NO_SYSTEM_MAPPER & CACHE_SESSION).');
-  SchannelCred.grbitEnabledProtocols := SP_PROT_TLS1_3_SERVER or SP_PROT_TLS1_2_SERVER;
-  Logger.Info('Protocol Policy: TLS ONLY Enabled 1.3 i TLS 1.2.');
-  CipherSuitePriorityList :=
-    'TLS_AES_128_GCM_SHA256;' +
-    'TLS_AES_256_GCM_SHA384;' +
-    'TLS_CHACHA20_POLY1305_SHA256;' +
-    'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384;' +
-    'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;' +
-    'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256;';
-
-  SchannelCred.pCipherSuitePriority := PWideChar(CipherSuitePriorityList);
-  Logger.Info('A priority, secure cipher list has been set.');
-  SchannelCred.dwMinimumCipherStrength := 0;
-  SchannelCred.dwMaximumCipherStrength := 0;
+  ZeroMemory(@SchCred, SizeOf(SchCred));
+  SchCred.dwVersion := SCH_CREDENTIALS_VERSION;
+  SchCred.dwCredFormat := 0;
+  SchCred.cCreds := 1;
+  SchCred.paCred := @CertArray;
+  SchCred.dwFlags := SCH_CRED_NO_DEFAULT_CREDS or SCH_CRED_MANUAL_CRED_VALIDATION or $00000002;
+  if not FEnableTLSSessionResumption then
+    SchCred.dwFlags := SchCred.dwFlags or SCH_CRED_DISABLE_RECONNECTS;
+  SchCred.dwSessionLifespan := 0;
+  Logger.Info('Flags set for CNG certificate (SCH_CREDENTIALS v5).');
   Logger.Info('Calling AcquireCredentialsHandle...');
   Status := AcquireCredentialsHandle(
     nil, 'Microsoft Unified Security Protocol Provider', SECPKG_CRED_INBOUND,
-    nil, @SchannelCred, nil, nil, @FServerCredHandle, @Expiry
+    nil, @SchCred, nil, nil, @FServerCredHandle, @Expiry
   );
 
   if Status = SEC_E_OK then
   begin
     Logger.Info('Server running');
+    BuildAlpnBuffer;
+    Logger.Info('ALPN buffer configured for HTTP/1.1 (TCP/TLS)');
     FCredentialsValid := True;
     Result := True;
   end
@@ -1346,6 +1436,27 @@ begin
     Logger.Error(Format('FATAL ERROR. Error code: 0x%x.', [Status]));
     Result := False;
   end;
+end;
+
+procedure TGHttpsServerIOCP.BuildAlpnBuffer;
+var
+  ProtoName: AnsiString;
+  ProtoLen: Byte;
+  ListSize: Word;
+  ListsSize: Cardinal;
+  ExtType: Cardinal;
+begin
+  ProtoName := 'http/1.1';
+  ProtoLen := Length(ProtoName);
+  ListSize := 1 + ProtoLen;
+  ListsSize := 4 + 2 + ListSize;
+  SetLength(FAlpnData, 4 + ListsSize);
+  Move(ListsSize, FAlpnData[0], 4);
+  ExtType := SecApplicationProtocolNegotiationExt_ALPN;
+  Move(ExtType, FAlpnData[4], 4);
+  Move(ListSize, FAlpnData[8], 2);
+  FAlpnData[10] := ProtoLen;
+  Move(ProtoName[1], FAlpnData[11], ProtoLen);
 end;
 
 procedure TGHttpsServerIOCP.ListCertificatesInStore(const StoreName: string);
@@ -1886,7 +1997,7 @@ begin
   end;
 end;
 
-procedure TGHttpsServerIOCP.HandleHttpsHandshake(ClientSocket: TSocket);
+procedure TGHttpsServerIOCP.HandleHttpsHandshake(ClientSocket: TSocket; const AClientIP: string);
 var
   OverlappedEx: POverlappedEx;
   WSABuf: TWSABUF;
@@ -1918,6 +2029,12 @@ begin
   OverlappedEx^.Socket := ClientSocket;
   OverlappedEx^.SSLHandshakeStep := 0;
   OverlappedEx^.SSLNeedsMoreData := True;
+  FillChar(OverlappedEx^.ClientIP, SizeOf(OverlappedEx^.ClientIP), 0);
+  if AClientIP <> '' then
+  begin
+    var AnsiIP := AnsiString(AClientIP);
+    Move(AnsiIP[1], OverlappedEx^.ClientIP[0], Min(Length(AnsiIP), SizeOf(OverlappedEx^.ClientIP) - 1));
+  end;
 
   WSABuf.len := SizeOf(OverlappedEx^.Buffer);
   WSABuf.buf := @OverlappedEx^.Buffer[0];
@@ -1935,7 +2052,7 @@ begin
   end;
 end;
 
-procedure TGHttpsServerIOCP.HandleHttpPlainConnection(ClientSocket: TSocket);
+procedure TGHttpsServerIOCP.HandleHttpPlainConnection(ClientSocket: TSocket; const AClientIP: string);
 var
   OverlappedEx: POverlappedEx;
   OptNoDelay: Integer;
@@ -1966,6 +2083,12 @@ begin
   OverlappedEx^.OpType := otRead;
   OverlappedEx^.KeepAliveActive := True;
   OverlappedEx^.LastActivityTime := GetTickCount64;
+  FillChar(OverlappedEx^.ClientIP, SizeOf(OverlappedEx^.ClientIP), 0);
+  if AClientIP <> '' then
+  begin
+    var AnsiIP := AnsiString(AClientIP);
+    Move(AnsiIP[1], OverlappedEx^.ClientIP[0], Min(Length(AnsiIP), SizeOf(OverlappedEx^.ClientIP) - 1));
+  end;
 
   if InitializeRequestProcessing(OverlappedEx) then
     ContinueReadingRequest(OverlappedEx);
@@ -1973,7 +2096,7 @@ end;
 
 function TGHttpsServerIOCP.ProcessSSLHandshakeStep(var OverlappedEx: TOverlappedEx; BytesReceived: DWORD): Boolean;
 var
-  InputBuffers: array[0..1] of TSecBuffer;
+  InputBuffers: array[0..2] of TSecBuffer;
   OutputBuffers: array[0..1] of TSecBuffer;
   InputBufferDesc, OutputBufferDesc: TSecBufferDesc;
   Status: SECURITY_STATUS;
@@ -1986,6 +2109,8 @@ var
   AllocatedSizes: array[0..1] of Cardinal;
   BuffersToFree: Integer;
   StartTime: Cardinal;
+  AlpnContext: SecPkgContext_ApplicationProtocol;
+  AlpnStatus: SECURITY_STATUS;
 begin
   Result := False;
   BuffersToFree := 0;
@@ -2009,8 +2134,22 @@ begin
     InputBuffers[1].cbBuffer := 0;
     InputBuffers[1].pvBuffer := nil;
 
+    if FirstCall and (Length(FAlpnData) > 0) then
+    begin
+      InputBuffers[2].BufferType := SECBUFFER_APPLICATION_PROTOCOLS;
+      InputBuffers[2].cbBuffer := Length(FAlpnData);
+      InputBuffers[2].pvBuffer := @FAlpnData[0];
+      InputBufferDesc.cBuffers := 3;
+    end
+    else
+    begin
+      InputBuffers[2].BufferType := SECBUFFER_EMPTY;
+      InputBuffers[2].cbBuffer := 0;
+      InputBuffers[2].pvBuffer := nil;
+      InputBufferDesc.cBuffers := 2;
+    end;
+
     InputBufferDesc.ulVersion := SECBUFFER_VERSION;
-    InputBufferDesc.cBuffers := 2;
     InputBufferDesc.pBuffers := @InputBuffers[0];
 
     FillChar(OutputBuffers, SizeOf(OutputBuffers), 0);
@@ -2030,19 +2169,22 @@ begin
     for i := 0 to 1 do
       OriginalBuffers[i] := OutputBuffers[i].pvBuffer;
 
+    var ContextReqFlags: ULONG := ASC_REQ_SEQUENCE_DETECT or ASC_REQ_REPLAY_DETECT or
+                                 ASC_REQ_CONFIDENTIALITY or ASC_REQ_STREAM;
+    if FEnableTLSSessionResumption then
+      ContextReqFlags := ContextReqFlags or ASC_REQ_SESSION_TICKET;
+
     if FirstCall then
     begin
       Status := AcceptSecurityContext(@FServerCredHandle, nil, @InputBufferDesc,
-                           ASC_REQ_SEQUENCE_DETECT or ASC_REQ_REPLAY_DETECT or
-                           ASC_REQ_CONFIDENTIALITY or ASC_REQ_STREAM,
+                           ContextReqFlags,
                            SECURITY_NATIVE_DREP, @OverlappedEx.SSLContext,
                            @OutputBufferDesc, @ContextAttr, @TimeStamp);
     end
     else
     begin
       Status := AcceptSecurityContext(@FServerCredHandle, @OverlappedEx.SSLContext, @InputBufferDesc,
-                                     ASC_REQ_SEQUENCE_DETECT or ASC_REQ_REPLAY_DETECT or
-                                     ASC_REQ_CONFIDENTIALITY or ASC_REQ_STREAM,
+                                     ContextReqFlags,
                                      SECURITY_NATIVE_DREP, @OverlappedEx.SSLContext,
                                      @OutputBufferDesc, @ContextAttr, @TimeStamp);
     end;
@@ -2075,11 +2217,20 @@ begin
       end;
     end;
     OverlappedEx.SSLOutputSize := OutputBuffers[0].cbBuffer;
+    Logger.Info(Format('AcceptSecurityContext Status: 0x%x OutputSize: %d FirstCall: %s', [Status, OverlappedEx.SSLOutputSize, BoolToStr(FirstCall, True)]));
     case Status of
       SEC_E_OK:
       begin
         OverlappedEx.SSLContextValid := True;
         OverlappedEx.SSLNeedsMoreData := False;
+        AlpnStatus := QueryContextAttributes(@OverlappedEx.SSLContext, SECPKG_ATTR_APPLICATION_PROTOCOL, @AlpnContext);
+        if (AlpnStatus = SEC_E_OK) and (AlpnContext.ProtoNegoStatus = SecApplicationProtocolNegotiationStatus_Success) and (AlpnContext.ProtocolIdSize > 0) then
+        begin
+          FillChar(OverlappedEx.ALPNProtocol, SizeOf(OverlappedEx.ALPNProtocol), 0);
+          Move(AlpnContext.ProtocolId[0], OverlappedEx.ALPNProtocol[0],
+            Min(Integer(AlpnContext.ProtocolIdSize), SizeOf(OverlappedEx.ALPNProtocol) - 1));
+          Logger.Debug('SChannel ALPN negotiated: ' + string(PAnsiChar(@OverlappedEx.ALPNProtocol[0])));
+        end;
         Result := True;
       end;
       SEC_I_CONTINUE_NEEDED:
@@ -2291,6 +2442,303 @@ begin
   end;
 end;
 
+function TGHttpsServerIOCP.IsOriginAllowed(const AOrigin: string): Boolean;
+var
+  AllowedList: TArray<string>;
+  AllowedItem: string;
+  TrimmedOrigin: string;
+begin
+  Result := False;
+  TrimmedOrigin := Trim(AOrigin);
+  if TrimmedOrigin = '' then
+    Exit;
+
+  if (FCORSAllowedOrigins = '*') or (FCORSAllowedOrigins = '') then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  AllowedList := FCORSAllowedOrigins.Split([',', ';']);
+  for AllowedItem in AllowedList do
+  begin
+    if SameText(Trim(AllowedItem), TrimmedOrigin) or (Trim(AllowedItem) = '*') then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function TGHttpsServerIOCP.HandleCORSPreflight(Request: TRequest; Response: TResponse): Boolean;
+var
+  Origin: string;
+  ReqHeaders: string;
+  AllowOriginValue: string;
+begin
+  Result := False;
+  if not FEnableCORS then
+    Exit;
+
+  if not Assigned(Request) or not Assigned(Response) then
+    Exit;
+
+  if Request.RequestInfo.Method <> hmOPTIONS then
+    Exit;
+
+  Origin := Request.Headers.GetHeader('Origin');
+  if Origin = '' then
+    Exit;
+
+  if not IsOriginAllowed(Origin) then
+  begin
+    Response.SetForbidden('CORS origin not allowed');
+    Result := True;
+    Exit;
+  end;
+
+  if FCORSAllowCredentials or (FCORSAllowedOrigins <> '*') then
+    AllowOriginValue := Origin
+  else
+    AllowOriginValue := '*';
+
+  Response.SetStatus(hsNoContent);
+  Response.SetOrUpdateHeader('Access-Control-Allow-Origin', AllowOriginValue);
+  Response.SetOrUpdateHeader('Access-Control-Allow-Methods', FCORSAllowedMethods);
+
+  ReqHeaders := Request.Headers.GetHeader('Access-Control-Request-Headers');
+  if ReqHeaders <> '' then
+    Response.SetOrUpdateHeader('Access-Control-Allow-Headers', ReqHeaders)
+  else if FCORSAllowedHeaders <> '' then
+    Response.SetOrUpdateHeader('Access-Control-Allow-Headers', FCORSAllowedHeaders);
+
+  if FCORSMaxAge > 0 then
+    Response.SetOrUpdateHeader('Access-Control-Max-Age', IntToStr(FCORSMaxAge));
+
+  if FCORSAllowCredentials then
+    Response.SetOrUpdateHeader('Access-Control-Allow-Credentials', 'true');
+
+  Response.SetOrUpdateHeader('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
+  Response.FinalizeContent;
+  Result := True;
+end;
+
+procedure TGHttpsServerIOCP.ApplyCORSHeaders(Request: TRequest; Response: TResponse);
+var
+  Origin: string;
+  AllowOriginValue: string;
+  CurrentVary: string;
+  i: Integer;
+begin
+  if not FEnableCORS then
+    Exit;
+
+  if not Assigned(Request) or not Assigned(Response) then
+    Exit;
+
+  Origin := Request.Headers.GetHeader('Origin');
+  if Origin = '' then
+    Exit;
+
+  if not IsOriginAllowed(Origin) then
+    Exit;
+
+  if FCORSAllowCredentials or (FCORSAllowedOrigins <> '*') then
+    AllowOriginValue := Origin
+  else
+    AllowOriginValue := '*';
+
+  Response.SetOrUpdateHeader('Access-Control-Allow-Origin', AllowOriginValue);
+
+  if FCORSExposeHeaders <> '' then
+    Response.SetOrUpdateHeader('Access-Control-Expose-Headers', FCORSExposeHeaders);
+
+  if FCORSAllowCredentials then
+    Response.SetOrUpdateHeader('Access-Control-Allow-Credentials', 'true');
+
+  CurrentVary := '';
+  for i := 0 to Response.Headers.Count - 1 do
+  begin
+    if StartsText('Vary:', Response.Headers[i]) then
+    begin
+      CurrentVary := Trim(Copy(Response.Headers[i], 6, MaxInt));
+      Break;
+    end;
+  end;
+
+  if CurrentVary = '' then
+    Response.AddHeader('Vary', 'Origin')
+  else if not ContainsText(CurrentVary, 'Origin') then
+    Response.SetOrUpdateHeader('Vary', CurrentVary + ', Origin');
+end;
+
+function TGHttpsServerIOCP.ExtractClientIP(ClientSocket: TSocket; ListenSocket: TSocket): string;
+var
+  PeerAddr: TSockAddrIn;
+  AddrLen: Integer;
+  P: PAnsiChar;
+begin
+  Result := '';
+  if ClientSocket = INVALID_SOCKET then
+    Exit;
+
+  if ListenSocket <> INVALID_SOCKET then
+    setsockopt(ClientSocket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, PAnsiChar(@ListenSocket), SizeOf(TSocket));
+
+  AddrLen := SizeOf(PeerAddr);
+  ZeroMemory(@PeerAddr, AddrLen);
+  if getpeername(ClientSocket, TSockAddr(PeerAddr), AddrLen) = 0 then
+  begin
+    P := inet_ntoa(PeerAddr.sin_addr);
+    if Assigned(P) then
+      Result := string(P);
+  end;
+end;
+
+function TGHttpsServerIOCP.TrackIPConnect(const AIP: string): Boolean;
+var
+  Info: TIPClientInfo;
+begin
+  Result := True;
+  if AIP = '' then
+    Exit;
+
+  FIPTrackerLock.Enter;
+  try
+    if not FIPTracker.TryGetValue(AIP, Info) then
+    begin
+      Info := TIPClientInfo.Create;
+      FIPTracker.Add(AIP, Info);
+    end;
+
+    if (FMaxConnectionsPerIP > 0) and (Info.ActiveConnections >= FMaxConnectionsPerIP) then
+    begin
+      Result := False;
+      Exit;
+    end;
+
+    Inc(Info.ActiveConnections);
+  finally
+    FIPTrackerLock.Leave;
+  end;
+end;
+
+procedure TGHttpsServerIOCP.TrackIPDisconnect(const AIP: string);
+var
+  Info: TIPClientInfo;
+begin
+  if AIP = '' then
+    Exit;
+
+  FIPTrackerLock.Enter;
+  try
+    if FIPTracker.TryGetValue(AIP, Info) then
+    begin
+      if Info.ActiveConnections > 0 then
+        Dec(Info.ActiveConnections);
+
+      if (Info.ActiveConnections <= 0) and (GetTickCount64 - Info.WindowStartTick > FIPTrackerInactiveTimeoutMs) then
+      begin
+        FIPTracker.Remove(AIP);
+        Info.Free;
+      end;
+    end;
+  finally
+    FIPTrackerLock.Leave;
+  end;
+end;
+
+procedure TGHttpsServerIOCP.PruneInactiveIPTrackers;
+var
+  IPList: TList<string>;
+  NowTick: UInt64;
+  Info: TIPClientInfo;
+begin
+  if not Assigned(FIPTracker) or not Assigned(FIPTrackerLock) then
+    Exit;
+
+  NowTick := GetTickCount64;
+  IPList := nil;
+
+  FIPTrackerLock.Enter;
+  try
+    for var Pair in FIPTracker do
+    begin
+      if (Pair.Value.ActiveConnections <= 0) and (NowTick - Pair.Value.WindowStartTick > FIPTrackerInactiveTimeoutMs) then
+      begin
+        if IPList = nil then
+          IPList := TList<string>.Create;
+        IPList.Add(Pair.Key);
+      end;
+    end;
+
+    if Assigned(IPList) then
+    begin
+      Logger.Debug(Format('MONITOR: Pruned %d inactive IP address(es) from tracker', [IPList.Count]));
+      for var IP in IPList do
+      begin
+        if FIPTracker.TryGetValue(IP, Info) then
+        begin
+          FIPTracker.Remove(IP);
+          Info.Free;
+        end;
+      end;
+    end;
+  finally
+    FIPTrackerLock.Leave;
+    if Assigned(IPList) then
+      IPList.Free;
+  end;
+end;
+
+function TGHttpsServerIOCP.GetTrackedIPCount: Integer;
+begin
+  Result := 0;
+  if Assigned(FIPTrackerLock) and Assigned(FIPTracker) then
+  begin
+    FIPTrackerLock.Enter;
+    try
+      Result := FIPTracker.Count;
+    finally
+      FIPTrackerLock.Leave;
+    end;
+  end;
+end;
+
+function TGHttpsServerIOCP.CheckIPRateLimit(const AIP: string): Boolean;
+var
+  Info: TIPClientInfo;
+  NowTick: UInt64;
+begin
+  Result := True;
+  if not FEnableIPRateLimiting or (AIP = '') or (FMaxRequestsPerIPPerSecond <= 0) then
+    Exit;
+
+  NowTick := GetTickCount64;
+  FIPTrackerLock.Enter;
+  try
+    if not FIPTracker.TryGetValue(AIP, Info) then
+    begin
+      Info := TIPClientInfo.Create;
+      FIPTracker.Add(AIP, Info);
+    end;
+
+    if NowTick - Info.WindowStartTick >= 1000 then
+    begin
+      Info.WindowStartTick := NowTick;
+      Info.RequestCount := 1;
+    end
+    else
+    begin
+      Inc(Info.RequestCount);
+      if Info.RequestCount > FMaxRequestsPerIPPerSecond then
+        Result := False;
+    end;
+  finally
+    FIPTrackerLock.Leave;
+  end;
+end;
+
 procedure TGHttpsServerIOCP.ProcessHttpRequest(OverlappedEx: POverlappedEx);
 var
   Response: TResponse;
@@ -2325,6 +2773,18 @@ begin
     Response.KeepAlive := FEnableKeepAlive and Assigned(Request) and Request.IsKeepAlive and (OverlappedEx^.KeepAliveRequestsCount < FMaxKeepAliveRequests);
     Response.SetMaxMemorySize(1 * 1024 * 1024);
 
+    var ClientIP := string(PAnsiChar(@OverlappedEx^.ClientIP[0]));
+    if not CheckIPRateLimit(ClientIP) then
+    begin
+      Logger.Warn('Rate limit exceeded for IP: %s (%d req/s)', [ClientIP, FMaxRequestsPerIPPerSecond]);
+      Response.SetStatus(hsTooManyRequests);
+      Response.SetOrUpdateHeader('Retry-After', '1');
+      Response.AddTextContent('application/json', '{"error":"Too Many Requests","message":"Rate limit exceeded per IP"}');
+      ApplyCORSHeaders(Request, Response);
+      ContinueSendingResponse(OverlappedEx);
+      Exit;
+    end;
+
     if FEnableHttp3 and (FHttpsPort > 0) and (FProtocolMode in [pmHttpsOnly, pmDualHttpAndHttps]) then
       Response.AddHeader('Alt-Svc', Format('h3=":%d"; ma=86400', [FHttpsPort]));
 
@@ -2342,6 +2802,12 @@ begin
 
       var RedirectUrl := Format('https://%s:%d%s', [HostHeader, FHttpsPort, Request.RequestInfo.RawUri]);
       Response.SetMovedPermanently(RedirectUrl);
+      ContinueSendingResponse(OverlappedEx);
+      Exit;
+    end;
+
+    if HandleCORSPreflight(Request, Response) then
+    begin
       ContinueSendingResponse(OverlappedEx);
       Exit;
     end;
@@ -2470,7 +2936,12 @@ begin
       finally
         EmptyStream.Free;
       end;
+    end
+    else
+    begin
+      Response.ApplyContentEncoding(Request.Headers.GetHeader('Accept-Encoding'));
     end;
+    ApplyCORSHeaders(Request, Response);
     ContinueSendingResponse(OverlappedEx);
   except
     on E: Exception do
@@ -2481,6 +2952,7 @@ begin
         if not Assigned(OverlappedEx^.Response) then
           OverlappedEx^.Response := TResponse.Create(OverlappedEx^.Socket);
         OverlappedEx^.Response.SetInternalServerError('Server error while processing the request: ' + E.Message);
+        ApplyCORSHeaders(OverlappedEx^.Request, OverlappedEx^.Response);
         ContinueSendingResponse(OverlappedEx);
       end
       else
@@ -2511,6 +2983,10 @@ var
   isAuthorized: Boolean;
   Hdr: TPair<string, string>;
   RemoteAddr: TSockAddrIn;
+  H3Origin: string;
+  H3ReqHeaders: string;
+  H3AllowOrigin: string;
+  HdrList: TList<TPair<string, string>>;
 begin
   AStatusCode := 404;
   AContentType := 'text/plain';
@@ -2526,6 +3002,55 @@ begin
       AStatusCode := 400;
       AContentType := 'text/plain';
       AResponseBody := TEncoding.UTF8.GetBytes('400 Bad Request');
+      Exit;
+    end;
+
+    H3Origin := '';
+    H3ReqHeaders := '';
+    for Hdr in AHeaders do
+    begin
+      if SameText(Hdr.Key, 'origin') then
+        H3Origin := Hdr.Value
+      else if SameText(Hdr.Key, 'access-control-request-headers') then
+        H3ReqHeaders := Hdr.Value;
+    end;
+
+    if FEnableCORS and SameText(AMethod, 'OPTIONS') and (H3Origin <> '') then
+    begin
+      if not IsOriginAllowed(H3Origin) then
+      begin
+        AStatusCode := 403;
+        AContentType := 'text/plain';
+        AResponseBody := TEncoding.UTF8.GetBytes('403 Forbidden');
+        Exit;
+      end;
+
+      if FCORSAllowCredentials or (FCORSAllowedOrigins <> '*') then
+        H3AllowOrigin := H3Origin
+      else
+        H3AllowOrigin := '*';
+
+      AStatusCode := 204;
+      AContentType := '';
+      SetLength(AResponseBody, 0);
+
+      HdrList := TList<TPair<string, string>>.Create;
+      try
+        HdrList.Add(TPair<string, string>.Create('access-control-allow-origin', H3AllowOrigin));
+        HdrList.Add(TPair<string, string>.Create('access-control-allow-methods', FCORSAllowedMethods));
+        if H3ReqHeaders <> '' then
+          HdrList.Add(TPair<string, string>.Create('access-control-allow-headers', H3ReqHeaders))
+        else if FCORSAllowedHeaders <> '' then
+          HdrList.Add(TPair<string, string>.Create('access-control-allow-headers', FCORSAllowedHeaders));
+        if FCORSMaxAge > 0 then
+          HdrList.Add(TPair<string, string>.Create('access-control-max-age', IntToStr(FCORSMaxAge)));
+        if FCORSAllowCredentials then
+          HdrList.Add(TPair<string, string>.Create('access-control-allow-credentials', 'true'));
+        HdrList.Add(TPair<string, string>.Create('vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'));
+        AExtraHeaders := HdrList.ToArray;
+      finally
+        HdrList.Free;
+      end;
       Exit;
     end;
 
@@ -2570,6 +3095,10 @@ begin
 
     FillChar(RemoteAddr, SizeOf(RemoteAddr), 0);
     Request := TRequest.Create(INVALID_SOCKET, RemoteAddr, FMaxRequestHederSize, FMaxRequestSize);
+    if Assigned(FAllowedFileExtensions) and (FAllowedFileExtensions.Count > 0) then
+      Request.AllowedFileExtensions.Assign(FAllowedFileExtensions);
+    if Assigned(FBlockedMimeTypes) and (FBlockedMimeTypes.Count > 0) then
+      Request.BlockedMimeTypes.Assign(FBlockedMimeTypes);
     Response := TResponse.Create(INVALID_SOCKET);
     try
       Request.RequestInfo.ParseRequestLine(AMethod + ' ' + APath + ' HTTP/1.1');
@@ -2632,9 +3161,28 @@ begin
 
       AResponseBody := Response.GetBodyBytes;
 
-      SetLength(AExtraHeaders, 2);
-      AExtraHeaders[0] := TPair<string, string>.Create('etag', '"h3-static-etag"');
-      AExtraHeaders[1] := TPair<string, string>.Create('cache-control', 'max-age=3600, public');
+      HdrList := TList<TPair<string, string>>.Create;
+      try
+        HdrList.Add(TPair<string, string>.Create('etag', '"h3-static-etag"'));
+        HdrList.Add(TPair<string, string>.Create('cache-control', 'max-age=3600, public'));
+        if FEnableCORS and (H3Origin <> '') and IsOriginAllowed(H3Origin) then
+        begin
+          if FCORSAllowCredentials or (FCORSAllowedOrigins <> '*') then
+            H3AllowOrigin := H3Origin
+          else
+            H3AllowOrigin := '*';
+
+          HdrList.Add(TPair<string, string>.Create('access-control-allow-origin', H3AllowOrigin));
+          if FCORSExposeHeaders <> '' then
+            HdrList.Add(TPair<string, string>.Create('access-control-expose-headers', FCORSExposeHeaders));
+          if FCORSAllowCredentials then
+            HdrList.Add(TPair<string, string>.Create('access-control-allow-credentials', 'true'));
+          HdrList.Add(TPair<string, string>.Create('vary', 'Origin'));
+        end;
+        AExtraHeaders := HdrList.ToArray;
+      finally
+        HdrList.Free;
+      end;
     finally
       Request.Free;
       Response.Free;
@@ -2690,6 +3238,7 @@ begin
           begin
             if Server.FRunning then
               Server.AcceptConnection2(OverlappedEx^.Socket);
+            var ClientIP := Server.ExtractClientIP(OverlappedEx^.ClientSocket, OverlappedEx^.Socket);
             if Server.FActiveConnections >= Server.FMaxConnections then
             begin
               Logger.Warn('New connection REJECTED due to connection limit reached (%d).', [Server.FMaxConnections]);
@@ -2700,14 +3249,19 @@ begin
               Logger.Warn('New connection REJECTED due to system overload (monitor flag).');
               closesocket(OverlappedEx^.ClientSocket);
             end
+            else if not Server.TrackIPConnect(ClientIP) then
+            begin
+              Logger.Warn('New connection from %s REJECTED: per-IP connection limit reached (%d).', [ClientIP, Server.FMaxConnectionsPerIP]);
+              closesocket(OverlappedEx^.ClientSocket);
+            end
             else
             begin
               TInterlocked.Increment(Server.FRequestsPerSecondCounter);
               InterlockedIncrement64(Server.FActiveConnections);
               if (Server.FListenSocketHTTP <> INVALID_SOCKET) and (OverlappedEx^.Socket = Server.FListenSocketHTTP) then
-                Server.HandleHttpPlainConnection(OverlappedEx^.ClientSocket)
+                Server.HandleHttpPlainConnection(OverlappedEx^.ClientSocket, ClientIP)
               else
-                Server.HandleHttpsHandshake(OverlappedEx^.ClientSocket);
+                Server.HandleHttpsHandshake(OverlappedEx^.ClientSocket, ClientIP);
             end;
             Server.FActiveOverlappedLock.Enter;
             try
@@ -3773,6 +4327,11 @@ begin
     ShouldReject := False;
     RejectReason := '';
     try
+      if (GetTickCount64 - Server.FLastIPPruneTick) >= 5000 then
+      begin
+        Server.FLastIPPruneTick := GetTickCount64;
+        Server.PruneInactiveIPTrackers;
+      end;
       if GetProcessTimes(ProcessHandle, CreationTime, ExitTime, KernelTime, UserTime) then
       begin
         GetSystemTimeAsFileTime(Now);
@@ -3941,6 +4500,7 @@ begin
   WriteOverlapped^.SSLContextValid := OverlappedEx^.SSLContextValid;
   WriteOverlapped^.OpType := otWebSocketWrite;
   WriteOverlapped^.WebSocketSession := Session;
+  WriteOverlapped^.ClientIP := OverlappedEx^.ClientIP;
 
   OverlappedEx^.OpType := otWebSocketRead;
   OverlappedEx^.WebSocketSession := Session;
@@ -4163,6 +4723,12 @@ begin
     if LocalSocket <> INVALID_SOCKET then
     begin
       InterlockedDecrement64(FActiveConnections);
+      if Assigned(Session.ReadOverlapped) then
+      begin
+        var ClientIP := string(PAnsiChar(@Session.ReadOverlapped^.ClientIP[0]));
+        if ClientIP <> '' then
+          TrackIPDisconnect(ClientIP);
+      end;
       try
         shutdown(LocalSocket, SD_BOTH);
       except

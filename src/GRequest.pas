@@ -30,7 +30,7 @@ uses
   Quick.Logger, System.SysUtils, System.Classes, System.Threading, System.SyncObjs,
   System.Generics.Collections, System.Math, System.StrUtils, System.Character,
   Winapi.Windows, Winapi.WinSock2,
-  System.NetEncoding, GRequestBody, System.Generics.Defaults;
+  System.NetEncoding, GRequestBody, System.Generics.Defaults, System.ZLib;
 
 type
   TCaseInsensitiveStringComparer = class(TInterfacedObject, IEqualityComparer<string>)
@@ -263,6 +263,9 @@ type
     FLargeHeaderWarnings: Integer;
     FMalformedLineCount: Integer;
     FSecurityViolationDetected: Boolean;
+    FAllowedFileExtensions: TStringList;
+    FBlockedMimeTypes: TStringList;
+    procedure ConfigureBodyParserSecurity;
     function GetHeadersSize: Integer;
     function StartsWithHTTPMethod(const Data: string): Boolean;
     function IsValidHTTPRequestLine(const RequestLine: string): Boolean;
@@ -350,6 +353,8 @@ type
     property BodyPartCount: Integer read GetBodyPartCount;
     property BodyContentType: TBodyContentType read GetBodyContentType;
     property ContentLength: Int64 read GetContentLength;
+    property AllowedFileExtensions: TStringList read FAllowedFileExtensions;
+    property BlockedMimeTypes: TStringList read FBlockedMimeTypes;
     property RawBuffer: TBytes read FRawBuffer;
     property RawBufferSize: Integer read FRawBufferSize write  FRawBufferSize;
     function IsComplete: Boolean;
@@ -889,11 +894,25 @@ var
   SQLPatterns: TArray<string>;
   Pattern: string;
   LowerValue: string;
+  NoWsValue: string;
+  CollapsedValue: string;
+  CleanComments: string;
   I: Integer;
+  SelPos: Integer;
+  UpdPos: Integer;
+  LastWasSpace: Boolean;
   C: Char;
 begin
   Result := False;
-  LowerValue := LowerCase(Value);
+  if Value = '' then
+    Exit;
+
+  if (Pos('%00', Value) > 0) or (Pos(#0, Value) > 0) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
   for C in Value do
   begin
     if (Ord(C) < 32) and (C <> #9) then
@@ -906,8 +925,50 @@ begin
     end;
   end;
 
+  LowerValue := LowerCase(Value);
+
+  for I := 1 to Length(LowerValue) do
+  begin
+    if LowerValue[I] = #9 then
+    begin
+      if (I > 1) and (I < Length(LowerValue)) and
+         CharInSet(LowerValue[I - 1], ['a'..'z', '0'..'9', '_', '<', '/', '$', '.']) and
+         CharInSet(LowerValue[I + 1], ['a'..'z', '0'..'9', '_', '>', '/', ':', '=']) then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+  end;
+
+  NoWsValue := '';
+  for I := 1 to Length(LowerValue) do
+  begin
+    if not CharInSet(LowerValue[I], [' ', #9, #10, #13]) then
+      NoWsValue := NoWsValue + LowerValue[I];
+  end;
+
+  CollapsedValue := '';
+  LastWasSpace := False;
+  for I := 1 to Length(LowerValue) do
+  begin
+    if CharInSet(LowerValue[I], [' ', #9]) then
+    begin
+      if not LastWasSpace then
+      begin
+        CollapsedValue := CollapsedValue + ' ';
+        LastWasSpace := True;
+      end;
+    end
+    else
+    begin
+      CollapsedValue := CollapsedValue + LowerValue[I];
+      LastWasSpace := False;
+    end;
+  end;
+
   SuspiciousPatterns := [
-    'javascript:', 'data:', 'vbscript:', '<script', '</script>', '<svg', '<iframe',
+    'javascript:', 'data:text/html', 'vbscript:', '<script', '</script>', '<svg', '<iframe',
     'onload=', 'onerror=', 'onclick=', 'onmouseover=',
     'x-injected-header', 'x-forwarded-host', 'x-original-host',
     '../..', '..%2f', '%252e%252e', '%c0%af', '%c0', '%e0%80%af', '%f0%80%80%af',
@@ -919,39 +980,70 @@ begin
   ];
   for Pattern in SuspiciousPatterns do
   begin
-    if Pos(Pattern, LowerValue) > 0 then
+    if (Pos(Pattern, LowerValue) > 0) or
+       (Pos(Pattern, NoWsValue) > 0) or
+       (Pos(Pattern, CollapsedValue) > 0) then
     begin
       Result := True;
       Exit;
     end;
   end;
 
+  CleanComments := StringReplace(LowerValue, '*/*', '', [rfReplaceAll]);
+  if (Pos('/*', CleanComments) > 0) or (Pos('*/', CleanComments) > 0) or (Pos('/*!', LowerValue) > 0) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
   SQLPatterns := [
-    'union', 'select', 'insert', 'delete', 'update', 'drop', 'alter', 'truncate', 'create',
     'or 1=1', 'or ''1''=''1''', 'or ''1''=''1', 'or ''1'' = ''1''', 'or ''a''=''a',
     'and 1=1', 'and 1=2', '1''=''1', '1=1--', ''' or ''=''',
-    'waitfor', 'waitfor delay', 'sleep(', 'pg_sleep(', 'benchmark(', 'dbms_pipe.receive_message',
-    'exec', 'execute', 'sp_', 'xp_', 'sp_executesql', 'xp_cmdshell', '; shutdown', '; drop',
+    'waitfor delay', 'sleep(', 'pg_sleep(', 'benchmark(', 'dbms_pipe.receive_message',
+    'sp_executesql', 'xp_cmdshell', '; shutdown', '; drop',
     'information_schema', 'sys.tables', 'sys.objects', 'sys.user_tables', 'all_tables',
     'extractvalue(', 'updatexml(', 'utl_inaddr.', 'ctxsys.driths.',
-    '/*', '*/', '/*!', '1;--', 'admin''--', 'admin''#', 'admin''/*'
+    '1;--', 'admin''--', 'admin''#', 'admin''/*',
+    'union select', 'union all select', 'union distinct select',
+    'insert into', 'delete from',
+    'drop table', 'drop database', 'alter table', 'truncate table'
   ];
   for Pattern in SQLPatterns do
   begin
-    if Pos(Pattern, LowerValue) > 0 then
+    if (Pos(Pattern, CollapsedValue) > 0) or
+       (Pos(StringReplace(Pattern, ' ', '', [rfReplaceAll]), NoWsValue) > 0) then
     begin
-      if (Pattern = 'select') and (Pos('user-agent', LowerValue) > 0) then
-        Continue;
-      if ((Pattern = '/*') or (Pattern = '*/')) and (Pos('*/*', LowerValue) > 0) then
-        Continue;
       Result := True;
       Exit;
     end;
   end;
-  if (Pos('%00', Value) > 0) or (Pos(#0, Value) > 0) then
+
+  SelPos := Pos('select', NoWsValue);
+  if SelPos > 0 then
   begin
-    Result := True;
-    Exit;
+    if Pos('from', Copy(NoWsValue, SelPos + 6, MaxInt)) > 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+    if (Pos('select*', NoWsValue) > 0) or
+       (Pos('select@@', NoWsValue) > 0) or
+       (Pos('selectnull', NoWsValue) > 0) or
+       (Pos('selectchar(', NoWsValue) > 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+
+  UpdPos := Pos('update', NoWsValue);
+  if UpdPos > 0 then
+  begin
+    if Pos('set', Copy(NoWsValue, UpdPos + 6, MaxInt)) > 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
   end;
 end;
 
@@ -959,24 +1051,16 @@ end;
 class function THeaderValidator.DetectInjectionAttempt(const Value: string): Boolean;
 var
   I: Integer;
-  ConsecutiveControlChars: Integer;
 begin
   Result := False;
-  ConsecutiveControlChars := 0;
   for I := 1 to Length(Value) do
   begin
-    if Ord(Value[I]) < 32 then
+    if (Value[I] = #13) or (Value[I] = #10) or (Value[I] = #0) then
     begin
-      Inc(ConsecutiveControlChars);
-      if ConsecutiveControlChars > 2 then
-      begin
-        Result := True;
-        Exit;
-      end;
-    end
-    else
-      ConsecutiveControlChars := 0;
-    if (Value[I] = #13) or (Value[I] = #10) then
+      Result := True;
+      Exit;
+    end;
+    if (Ord(Value[I]) < 32) and (Value[I] <> #9) then
     begin
       Result := True;
       Exit;
@@ -1241,10 +1325,34 @@ begin
 end;
 
 function TContentEncodingHandler.DecompressGzip(const Data: TBytes): TBytes;
+var
+  InStream: TBytesStream;
+  OutStream: TBytesStream;
+  Decompressor: TZDecompressionStream;
 begin
+  if Length(Data) = 0 then
+  begin
+    SetLength(Result, 0);
+    Exit;
+  end;
   try
-    SetLength(Result, Length(Data));
-    Move(Data[0], Result[0], Length(Data));
+    InStream := TBytesStream.Create(Data);
+    try
+      OutStream := TBytesStream.Create;
+      try
+        Decompressor := TZDecompressionStream.Create(InStream, 15 + 16);
+        try
+          OutStream.CopyFrom(Decompressor, 0);
+        finally
+          Decompressor.Free;
+        end;
+        Result := Copy(OutStream.Bytes, 0, OutStream.Size);
+      finally
+        OutStream.Free;
+      end;
+    finally
+      InStream.Free;
+    end;
   except
     on E: Exception do
     begin
@@ -1255,15 +1363,59 @@ begin
 end;
 
 function TContentEncodingHandler.DecompressDeflate(const Data: TBytes): TBytes;
+var
+  InStream: TBytesStream;
+  OutStream: TBytesStream;
+  Decompressor: TZDecompressionStream;
 begin
+  if Length(Data) = 0 then
+  begin
+    SetLength(Result, 0);
+    Exit;
+  end;
   try
-    SetLength(Result, Length(Data));
-    Move(Data[0], Result[0], Length(Data));
+    InStream := TBytesStream.Create(Data);
+    try
+      OutStream := TBytesStream.Create;
+      try
+        Decompressor := TZDecompressionStream.Create(InStream, 15);
+        try
+          OutStream.CopyFrom(Decompressor, 0);
+        finally
+          Decompressor.Free;
+        end;
+        Result := Copy(OutStream.Bytes, 0, OutStream.Size);
+      finally
+        OutStream.Free;
+      end;
+    finally
+      InStream.Free;
+    end;
   except
     on E: Exception do
     begin
-      SetLength(Result, Length(Data));
-      Move(Data[0], Result[0], Length(Data));
+      try
+        InStream := TBytesStream.Create(Data);
+        try
+          OutStream := TBytesStream.Create;
+          try
+            Decompressor := TZDecompressionStream.Create(InStream, -15);
+            try
+              OutStream.CopyFrom(Decompressor, 0);
+            finally
+              Decompressor.Free;
+            end;
+            Result := Copy(OutStream.Bytes, 0, OutStream.Size);
+          finally
+            OutStream.Free;
+          end;
+        finally
+          InStream.Free;
+        end;
+      except
+        SetLength(Result, Length(Data));
+        Move(Data[0], Result[0], Length(Data));
+      end;
     end;
   end;
 end;
@@ -2216,10 +2368,7 @@ end;
 
 procedure THttpRequestInfo.ValidateUriComponents;
 var
-  SQLPatterns: TArray<string>;
-  XSSPatterns: TArray<string>;
-  Pattern: string;
-  LowerQuery, LowerPath: string;
+  DecodedQuery, DecodedPath: string;
 begin
   try
     if Length(FPath) > 2048 then
@@ -2238,61 +2387,20 @@ begin
 
     if FQueryString <> '' then
     begin
-      LowerQuery := LowerCase(FQueryString);
-
-
-      if (Pos(';cat ', LowerQuery) > 0) or (Pos(';cat', LowerQuery) > 0) then
-        FUriValidationErrors.Add('Potential command injection in query string');
-      if (Pos('*(|', LowerQuery) > 0) or (Pos('mail=*', LowerQuery) > 0) then
-        FUriValidationErrors.Add('Potential LDAP injection in query string');
-      if Pos('%s%s', LowerQuery) > 0 then
-        FUriValidationErrors.Add('Potential format string attack in query string');
-      SQLPatterns := [
-        'union', 'select', 'insert', 'delete', 'update', 'drop',
-        'or 1=1', 'or ''1''=''1''', '--', '/*', '*/',
-        'exec', 'execute', 'sp_', 'xp_', '; drop',
-        'union select', 'order by', 'group by', 'having',
-        'information_schema', 'sys.', 'master.', 'msdb.',
-        'declare @', 'cast(', 'convert(', 'waitfor delay'
-      ];
-      for Pattern in SQLPatterns do
-      begin
-        if Pos(Pattern, LowerQuery) > 0 then
-        begin
-          FUriValidationErrors.Add('Potential SQL injection in query string: ' + Pattern);
-          Break;
-        end;
-      end;
+      DecodedQuery := TNetEncoding.URL.Decode(FQueryString);
+      if THeaderValidator.HasSuspiciousPatterns(FQueryString) or
+         THeaderValidator.HasSuspiciousPatterns(DecodedQuery) then
+        FUriValidationErrors.Add('Potential attack detected in query string');
     end;
+
     if FPath <> '' then
     begin
-      LowerPath := LowerCase(FPath);
-      for Pattern in SQLPatterns do
-      begin
-        if Pos(Pattern, LowerPath) > 0 then
-        begin
-          FUriValidationErrors.Add('Potential SQL injection in path: ' + Pattern);
-          Break;
-        end;
-      end;
+      DecodedPath := TNetEncoding.URL.Decode(FPath);
+      if THeaderValidator.HasSuspiciousPatterns(FPath) or
+         THeaderValidator.HasSuspiciousPatterns(DecodedPath) then
+        FUriValidationErrors.Add('Potential attack detected in path');
     end;
-    if FQueryString <> '' then
-    begin
-      XSSPatterns := [
-        'script', 'javascript:', 'vbscript:', 'data:', 'onload',
-        'onerror', 'onclick', 'onmouseover', 'onfocus', 'onblur',
-        '<img', '<iframe', '<object', '<embed', '<form',
-        'document.cookie', 'document.location', 'window.location'
-      ];
-      for Pattern in XSSPatterns do
-      begin
-        if Pos(Pattern, LowerQuery) > 0 then
-        begin
-          FUriValidationErrors.Add('Potential XSS in query string: ' + Pattern);
-          Break;
-        end;
-      end;
-    end;
+
     if FQueryString <> '' then
     begin
       var Params := FQueryString.Split(['&']);
@@ -2468,6 +2576,8 @@ begin
     FRequestInfo := THttpRequestInfo.Create;
     FContentEncodingHandler := TContentEncodingHandler.Create;
     FRecovery := TRequestRecovery.Create(MAX_RECOVERY_ATTEMPTS);
+    FAllowedFileExtensions := TStringList.Create;
+    FBlockedMimeTypes := TStringList.Create;
     FBodyParser := nil;
     FBodyStream := TMemoryStream.Create;
     FDecompressedBodyStream := TMemoryStream.Create;
@@ -2481,6 +2591,8 @@ begin
         FreeAndNil(FRequestInfo);
         FreeAndNil(FContentEncodingHandler);
         FreeAndNil(FRecovery);
+        FreeAndNil(FAllowedFileExtensions);
+        FreeAndNil(FBlockedMimeTypes);
         FreeAndNil(FBodyStream);
         FreeAndNil(FDecompressedBodyStream);
       except
@@ -2499,6 +2611,8 @@ begin
     FreeAndNil(FRequestInfo);
     FreeAndNil(FContentEncodingHandler);
     FreeAndNil(FRecovery);
+    FreeAndNil(FAllowedFileExtensions);
+    FreeAndNil(FBlockedMimeTypes);
     FreeAndNil(FBodyStream);
     FreeAndNil(FDecompressedBodyStream);
     FreeAndNil(FBodyParser);
@@ -2866,13 +2980,6 @@ begin
              FSecurityThreats := FSecurityThreats + [stHeaderInjection];
         end;
     end;
-  end;
-  if FHeaders.HasHeader('fail') or FHeaders.HasHeader('injected') then
-  begin
-    if not HasExistingThreat(stHeaderInjection) then
-       FSecurityThreats := FSecurityThreats + [stHeaderInjection];
-    if FErrorMessage = '' then
-       FErrorMessage := 'Suspicious header found, indicating a potential successful CRLF Injection.';
   end;
   if DetectSlowlorisInCompleteHeaders then
   begin
@@ -3306,18 +3413,16 @@ begin
       begin
         Inc(I); Continue;
       end;
+      if (Length(Line) > 0) and (Line[1] in [' ', #9]) then
+      begin
+        SetError('Obsolete line folding (obs-fold) is not permitted: ' + Line, stRequestSmuggling);
+        Exit;
+      end;
       var ColonPos := Pos(':', Line);
       if ColonPos > 0 then
       begin
         CurrentHeaderName := Trim(Copy(Line, 1, ColonPos - 1));
         CurrentHeaderValue := Trim(Copy(Line, ColonPos + 1, MaxInt));
-        var J := I + 1;
-        while (J < HeaderLines.Count) and (Length(HeaderLines[J]) > 0) and (HeaderLines[J][1] in [' ', #9]) do
-        begin
-          CurrentHeaderValue := CurrentHeaderValue + ' ' + Trim(HeaderLines[J]);
-          Inc(J);
-        end;
-        I := J - 1;
         if not THeaderValidator.ValidateHeaderName(CurrentHeaderName, ErrorMsg) then
         begin
           SetError('Header name validation failed: ' + ErrorMsg, stHeaderInjection);
@@ -3335,13 +3440,14 @@ begin
     FRequestInfo.ParseFromHeaders(FHeaders);
     if FErrorParsing then
        Exit;
-    DetermineBodySize;
     AnalyzeSecurity;
     if HasSecurityThreats then
     begin
       FErrorParsing := True;
       FState := rsError;
+      Exit;
     end;
+    DetermineBodySize;
   finally
     HeaderLines.Free;
   end;
@@ -3466,6 +3572,17 @@ begin
   end;
 end;
 
+procedure TRequest.ConfigureBodyParserSecurity;
+begin
+  if Assigned(FBodyParser) then
+  begin
+    if Assigned(FAllowedFileExtensions) and (FAllowedFileExtensions.Count > 0) then
+      FBodyParser.SecuritySettings.AllowedFileExtensions.Assign(FAllowedFileExtensions);
+    if Assigned(FBlockedMimeTypes) and (FBlockedMimeTypes.Count > 0) then
+      FBodyParser.SecuritySettings.BlockedMimeTypes.Assign(FBlockedMimeTypes);
+  end;
+end;
+
 procedure TRequest.DetermineBodySize;
 begin
   try
@@ -3484,6 +3601,7 @@ begin
           True,
           ''
         );
+        ConfigureBodyParserSecurity;
       except
         on E: Exception do
         begin
@@ -3511,6 +3629,7 @@ begin
           True,
           ''
         );
+        ConfigureBodyParserSecurity;
       except
         on E: Exception do
         begin
@@ -3532,6 +3651,7 @@ begin
           True,
           ''
         );
+        ConfigureBodyParserSecurity;
       except
         on E: Exception do
         begin
@@ -3655,32 +3775,54 @@ begin
 end;
 
 function TRequest.GetBodyAsString: string;
+var
+  RawBytes: TBytes;
+  Enc: TContentEncoding;
 begin
   try
     if Assigned(FBodyParser) then
-       Result := FBodyParser.GetMainPartAsString
+      RawBytes := FBodyParser.GetMainPartAsBytes
     else
-      Result := GetBodyString;
+      RawBytes := GetBodyBytes;
+
+    if Length(RawBytes) > 0 then
+    begin
+      for Enc in FRequestInfo.ContentEncodings do
+      begin
+        if FContentEncodingHandler.IsCompressionSupported(Enc) then
+          RawBytes := FContentEncodingHandler.DecompressData(RawBytes, Enc);
+      end;
+      Result := TEncoding.UTF8.GetString(RawBytes);
+    end
+    else
+      Result := '';
   except
     on E: Exception do
-    begin
       Result := '';
-    end;
   end;
 end;
 
 function TRequest.GetBodyAsBytes: TBytes;
+var
+  Enc: TContentEncoding;
 begin
   try
     if Assigned(FBodyParser) then
       Result := FBodyParser.GetMainPartAsBytes
     else
       Result := GetBodyBytes;
+
+    if Length(Result) > 0 then
+    begin
+      for Enc in FRequestInfo.ContentEncodings do
+      begin
+        if FContentEncodingHandler.IsCompressionSupported(Enc) then
+          Result := FContentEncodingHandler.DecompressData(Result, Enc);
+      end;
+    end;
   except
     on E: Exception do
-    begin
       SetLength(Result, 0);
-    end;
   end;
 end;
 

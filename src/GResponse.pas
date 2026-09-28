@@ -30,6 +30,7 @@ uses
   Quick.Logger,
   System.SysUtils, System.Classes, System.Threading, System.SyncObjs,
   System.Generics.Collections, System.Math, System.IOUtils, System.DateUtils,
+  System.StrUtils, System.ZLib,
   Winapi.Windows, Winapi.WinSock2;
 
 type
@@ -230,6 +231,9 @@ type
     procedure Write(const Data: TBytes); overload;
     procedure Write(const Data: string); overload;
     function GetBodyBytes: TBytes;
+    function IsContentTypeCompressible(const AContentType: string): Boolean;
+    function Compress(const AEncoding: string = 'gzip'): Boolean;
+    function ApplyContentEncoding(const AAcceptEncoding: string): Boolean;
     property Headers: TStringList read FHeaders;
     property ContentType: string read FContentType;
     property Socket: TSocket read FSocket;
@@ -244,8 +248,6 @@ type
   end;
 
 implementation
-
-uses System.StrUtils;
 
 const
   DEFAULT_MAX_MEMORY_SIZE = 10 * 1024 * 1024;
@@ -1780,6 +1782,288 @@ begin
   finally
     Stream.Free;
   end;
+end;
+
+function CompressBytesGzip(const Input: TBytes): TBytes;
+var
+  InStream: TBytesStream;
+  OutStream: TBytesStream;
+  Compressor: TZCompressionStream;
+begin
+  if Length(Input) = 0 then
+  begin
+    SetLength(Result, 0);
+    Exit;
+  end;
+  InStream := TBytesStream.Create(Input);
+  try
+    OutStream := TBytesStream.Create;
+    try
+      Compressor := TZCompressionStream.Create(OutStream, zcDefault, 15 + 16);
+      try
+        Compressor.CopyFrom(InStream, InStream.Size);
+      finally
+        Compressor.Free;
+      end;
+      Result := Copy(OutStream.Bytes, 0, OutStream.Size);
+    finally
+      OutStream.Free;
+    end;
+  finally
+    InStream.Free;
+  end;
+end;
+
+function CompressBytesDeflate(const Input: TBytes): TBytes;
+var
+  InStream: TBytesStream;
+  OutStream: TBytesStream;
+  Compressor: TZCompressionStream;
+begin
+  if Length(Input) = 0 then
+  begin
+    SetLength(Result, 0);
+    Exit;
+  end;
+  InStream := TBytesStream.Create(Input);
+  try
+    OutStream := TBytesStream.Create;
+    try
+      Compressor := TZCompressionStream.Create(OutStream, zcDefault, 15);
+      try
+        Compressor.CopyFrom(InStream, InStream.Size);
+      finally
+        Compressor.Free;
+      end;
+      Result := Copy(OutStream.Bytes, 0, OutStream.Size);
+    finally
+      OutStream.Free;
+    end;
+  finally
+    InStream.Free;
+  end;
+end;
+
+function TResponse.IsContentTypeCompressible(const AContentType: string): Boolean;
+var
+  CT: string;
+  Idx: Integer;
+begin
+  CT := LowerCase(Trim(AContentType));
+  Idx := Pos(';', CT);
+  if Idx > 0 then
+    CT := Trim(Copy(CT, 1, Idx - 1));
+  if CT = '' then
+  begin
+    Result := False;
+    Exit;
+  end;
+  if StartsText('text/', CT) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if (CT = 'application/json') or
+     (CT = 'application/xml') or
+     (CT = 'application/javascript') or
+     (CT = 'application/x-javascript') or
+     (CT = 'application/xhtml+xml') or
+     (CT = 'application/ld+json') or
+     (CT = 'application/graphql+json') or
+     (CT = 'application/geo+json') or
+     (CT = 'image/svg+xml') or
+     (CT = 'image/x-icon') or
+     (CT = 'image/vnd.microsoft.icon') or
+     (CT = 'application/rss+xml') or
+     (CT = 'application/atom+xml') or
+     (CT = 'application/manifest+json') or
+     EndsText('+xml', CT) or
+     EndsText('+json', CT) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := False;
+end;
+
+function TResponse.Compress(const AEncoding: string): Boolean;
+var
+  TargetEncoding: string;
+  Compressed: TBytes;
+  RawBytes: TBytes;
+  CurrentVary: string;
+  i: Integer;
+begin
+  Result := False;
+  if FHeadersBuilt or FHeadersSent then
+    Exit;
+  if HasHeader('Content-Encoding') then
+    Exit;
+  if (FStatus = hsNoContent) or (FStatus = hsNotModified) or (FStatus = hsSwitchingProtocols) then
+    Exit;
+  TargetEncoding := LowerCase(Trim(AEncoding));
+  if (TargetEncoding <> 'gzip') and (TargetEncoding <> 'deflate') then
+    Exit;
+  if not FContentFinalized then
+    FinalizeContent;
+  if FUseSourceFile then
+  begin
+    if (FSourceFileSize < 128) or not FileExists(FSourceFilePath) then
+      Exit;
+    try
+      RawBytes := TFile.ReadAllBytes(FSourceFilePath);
+      if TargetEncoding = 'gzip' then
+        Compressed := CompressBytesGzip(RawBytes)
+      else
+        Compressed := CompressBytesDeflate(RawBytes);
+      if (Length(Compressed) > 0) and (Length(Compressed) < Length(RawBytes)) then
+      begin
+        CleanupSourceFile;
+        FStorageMode := csmMemory;
+        FContentBytes := Compressed;
+        FTotalContentSize := Length(Compressed);
+        FContentPosition := 0;
+        SetOrUpdateHeader('Content-Encoding', TargetEncoding);
+        SetOrUpdateHeader('Content-Length', IntToStr(FTotalContentSize));
+        CurrentVary := '';
+        for i := 0 to FHeaders.Count - 1 do
+        begin
+          if StartsText('Vary:', FHeaders[i]) then
+          begin
+            CurrentVary := Trim(Copy(FHeaders[i], 6, MaxInt));
+            Break;
+          end;
+        end;
+        if CurrentVary = '' then
+          AddHeader('Vary', 'Accept-Encoding')
+        else if not ContainsText(CurrentVary, 'Accept-Encoding') then
+          SetOrUpdateHeader('Vary', CurrentVary + ', Accept-Encoding');
+        Result := True;
+      end;
+    except
+      Result := False;
+    end;
+    Exit;
+  end;
+  if FStorageMode = csmMemory then
+  begin
+    if Length(FContentBytes) < 128 then
+      Exit;
+    try
+      if TargetEncoding = 'gzip' then
+        Compressed := CompressBytesGzip(FContentBytes)
+      else
+        Compressed := CompressBytesDeflate(FContentBytes);
+      if (Length(Compressed) > 0) and (Length(Compressed) < Length(FContentBytes)) then
+      begin
+        FContentBytes := Compressed;
+        FTotalContentSize := Length(Compressed);
+        FContentPosition := 0;
+        SetOrUpdateHeader('Content-Encoding', TargetEncoding);
+        SetOrUpdateHeader('Content-Length', IntToStr(FTotalContentSize));
+        CurrentVary := '';
+        for i := 0 to FHeaders.Count - 1 do
+        begin
+          if StartsText('Vary:', FHeaders[i]) then
+          begin
+            CurrentVary := Trim(Copy(FHeaders[i], 6, MaxInt));
+            Break;
+          end;
+        end;
+        if CurrentVary = '' then
+          AddHeader('Vary', 'Accept-Encoding')
+        else if not ContainsText(CurrentVary, 'Accept-Encoding') then
+          SetOrUpdateHeader('Vary', CurrentVary + ', Accept-Encoding');
+        Result := True;
+      end;
+    except
+      Result := False;
+    end;
+  end
+  else if FStorageMode = csmFile then
+  begin
+    if (FTotalContentSize < 128) or not FileExists(FTempFilePath) then
+      Exit;
+    try
+      CleanupTempFile;
+      RawBytes := TFile.ReadAllBytes(FTempFilePath);
+      if TargetEncoding = 'gzip' then
+        Compressed := CompressBytesGzip(RawBytes)
+      else
+        Compressed := CompressBytesDeflate(RawBytes);
+      if (Length(Compressed) > 0) and (Length(Compressed) < Length(RawBytes)) then
+      begin
+        TFile.Delete(FTempFilePath);
+        FTempFilePath := '';
+        FStorageMode := csmMemory;
+        FContentBytes := Compressed;
+        FTotalContentSize := Length(Compressed);
+        FContentPosition := 0;
+        SetOrUpdateHeader('Content-Encoding', TargetEncoding);
+        SetOrUpdateHeader('Content-Length', IntToStr(FTotalContentSize));
+        CurrentVary := '';
+        for i := 0 to FHeaders.Count - 1 do
+        begin
+          if StartsText('Vary:', FHeaders[i]) then
+          begin
+            CurrentVary := Trim(Copy(FHeaders[i], 6, MaxInt));
+            Break;
+          end;
+        end;
+        if CurrentVary = '' then
+          AddHeader('Vary', 'Accept-Encoding')
+        else if not ContainsText(CurrentVary, 'Accept-Encoding') then
+          SetOrUpdateHeader('Vary', CurrentVary + ', Accept-Encoding');
+        Result := True;
+      end
+      else
+      begin
+        EnsureTempFile;
+        FTempFileStream.WriteBuffer(RawBytes[0], Length(RawBytes));
+      end;
+    except
+      Result := False;
+    end;
+  end;
+end;
+
+function TResponse.ApplyContentEncoding(const AAcceptEncoding: string): Boolean;
+var
+  EncodingList: TArray<string>;
+  Part: string;
+  Enc: string;
+  SemiPos: Integer;
+  ChosenEncoding: string;
+begin
+  Result := False;
+  if FHeadersBuilt or FHeadersSent then
+    Exit;
+  if HasHeader('Content-Encoding') then
+    Exit;
+  if not IsContentTypeCompressible(FContentType) then
+    Exit;
+  if Trim(AAcceptEncoding) = '' then
+    Exit;
+
+  ChosenEncoding := '';
+  EncodingList := AAcceptEncoding.Split([',']);
+  for Part in EncodingList do
+  begin
+    Enc := LowerCase(Trim(Part));
+    SemiPos := Pos(';', Enc);
+    if SemiPos > 0 then
+      Enc := Trim(Copy(Enc, 1, SemiPos - 1));
+    if Enc = 'gzip' then
+    begin
+      ChosenEncoding := 'gzip';
+      Break;
+    end
+    else if (Enc = 'deflate') and (ChosenEncoding = '') then
+      ChosenEncoding := 'deflate';
+  end;
+
+  if ChosenEncoding <> '' then
+    Result := Compress(ChosenEncoding);
 end;
 
 end.

@@ -90,18 +90,22 @@ type
     WebSocketSession: TObject;
     WebSocketState: Integer;
     InPool: LongInt;
+    ALPNProtocol: array[0..31] of AnsiChar;
+    ClientIP: array[0..45] of AnsiChar;
   end;
 
 
 const
-  //WORKER_THREAD_COUNT = 8;
+  SO_UPDATE_ACCEPT_CONTEXT = $700B;
+  ASC_REQ_SESSION_TICKET = $00000040;
+
   WORKER_THREAD_COUNT = 48;
-  //WORKER_THREAD_COUNT = 256;
 
   DEFAULT_REQUEST_TIMEOUT = 30;
 
   SECBUFFER_VERSION = 0;
   SCHANNEL_CRED_VERSION = 4;
+  SCH_CREDENTIALS_VERSION = 5;
   SECURITY_NATIVE_DREP = $00000010;
 
   SECPKG_CRED_INBOUND = 1;
@@ -115,12 +119,24 @@ const
 
   SECPKG_ATTR_STREAM_SIZES = 4;
   SECPKG_ATTR_CONNECTION_INFO = 90;
+  SECPKG_ATTR_APPLICATION_PROTOCOL = 35;
   SECBUFFER_EMPTY = 0;
   SECBUFFER_DATA = 1;
   SECBUFFER_TOKEN = 2;
   SECBUFFER_EXTRA = 5;
   SECBUFFER_STREAM_TRAILER = 6;
   SECBUFFER_STREAM_HEADER = 7;
+  SECBUFFER_APPLICATION_PROTOCOLS = 18;
+
+  SecApplicationProtocolNegotiationExt_None = 0;
+  SecApplicationProtocolNegotiationExt_NPN  = 1;
+  SecApplicationProtocolNegotiationExt_ALPN = 2;
+
+  SecApplicationProtocolNegotiationStatus_None = 0;
+  SecApplicationProtocolNegotiationStatus_Success = 1;
+  SecApplicationProtocolNegotiationStatus_SelectedClientOnly = 2;
+
+  MAX_PROTOCOL_ID_SIZE = 255;
   ISC_REQ_SEQUENCE_DETECT = $00000008;
   ISC_REQ_REPLAY_DETECT = $00000010;
   ISC_REQ_CONFIDENTIALITY = $00000020;
@@ -236,6 +252,64 @@ type
   end;
   PSCHANNEL_CRED = ^SCHANNEL_CRED;
 
+  SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT = DWORD;
+  SEC_APPLICATION_PROTOCOL_NEGOTIATION_STATUS = DWORD;
+
+  SEC_APPLICATION_PROTOCOL_LIST = packed record
+    ProtoNegoExt: SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT;
+    ProtocolListSize: Word;
+    ProtocolList: array[0..255] of Byte;
+  end;
+  PSEC_APPLICATION_PROTOCOL_LIST = ^SEC_APPLICATION_PROTOCOL_LIST;
+
+  SEC_APPLICATION_PROTOCOLS = packed record
+    ProtocolListsSize: Cardinal;
+    ProtocolLists: array[0..0] of SEC_APPLICATION_PROTOCOL_LIST;
+  end;
+  PSEC_APPLICATION_PROTOCOLS = ^SEC_APPLICATION_PROTOCOLS;
+
+  SecPkgContext_ApplicationProtocol = packed record
+    ProtoNegoStatus: SEC_APPLICATION_PROTOCOL_NEGOTIATION_STATUS;
+    ProtoNegoExt: SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT;
+    ProtocolIdSize: Byte;
+    ProtocolId: array[0..254] of AnsiChar;
+  end;
+  PSecPkgContext_ApplicationProtocol = ^SecPkgContext_ApplicationProtocol;
+
+  CRYPTO_SETTINGS = record
+    eAlgorithmId: DWORD;
+    cChainingModes: DWORD;
+    rgstrChainingModes: Pointer;
+    dwMinBitLength: DWORD;
+    dwMaxBitLength: DWORD;
+  end;
+  PCRYPTO_SETTINGS = ^CRYPTO_SETTINGS;
+
+  TLS_PARAMETERS = record
+    cAlpnIds: DWORD;
+    rgstrAlpnIds: Pointer;
+    grbitDisabledProtocols: DWORD;
+    cDisabledCrypto: DWORD;
+    pDisabledCrypto: PCRYPTO_SETTINGS;
+    dwFlags: DWORD;
+  end;
+  PTLS_PARAMETERS = ^TLS_PARAMETERS;
+
+  SCH_CREDENTIALS = record
+    dwVersion: DWORD;
+    dwCredFormat: DWORD;
+    cCreds: DWORD;
+    paCred: Pointer;
+    hRootStore: HCERTSTORE;
+    cMappers: DWORD;
+    aphMappers: Pointer;
+    dwSessionLifespan: DWORD;
+    dwFlags: DWORD;
+    cTlsParameters: DWORD;
+    pTlsParameters: PTLS_PARAMETERS;
+  end;
+  PSCH_CREDENTIALS = ^SCH_CREDENTIALS;
+
   SecPkgContext_StreamSizes = record
     cbHeader: ULONG;
     cbTrailer: ULONG;
@@ -289,12 +363,22 @@ const
   CERT_FIND_ANY = 0;
   CERT_FIND_SUBJECT_STR = $00080007;
   SCHANNEL_SHUTDOWN = 1;
+  SCHANNEL_SESSION = 3;
+  SSL_SESSION_ENABLE_RECONNECTS = 1;
+  SSL_SESSION_DISABLE_RECONNECTS = 2;
   CERT_STORE_PROV_MEMORY = LPCSTR(2);
   CERT_STORE_PROV_SYSTEM_A = LPCSTR(10);
   CERT_STORE_READONLY_FLAG = $00008000;
   CERT_FIND_SUBJECT_STR_W = $00070007;
   CERT_FIND_SHA1_HASH = $00010000;
   CERT_STORE_ADD_ALWAYS = 4;
+
+type
+  TSchannelSessionToken = record
+    dwTokenType: DWORD;
+    dwFlags: DWORD;
+  end;
+  PSchannelSessionToken = ^TSchannelSessionToken;
 
 type
   PCRYPT_DATA_BLOB = ^CRYPT_DATA_BLOB;

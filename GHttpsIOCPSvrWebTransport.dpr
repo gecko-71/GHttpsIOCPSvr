@@ -1,4 +1,4 @@
-﻿{
+{
   MIT License
 
   Copyright (c) 2026 GECKO-71
@@ -203,6 +203,7 @@ const
    DOWNLAD_FILE = 'largefile_10mb.bin';
 
 begin
+  SetInOutRes(0);
   if FindCmdLineSwitch('help', True) or FindCmdLineSwitch('h', True) or
      FindCmdLineSwitch('?', True) or FindCmdLineSwitch('-help', True) then
   begin
@@ -348,6 +349,21 @@ begin
       Server.SetSSLShutdownOptions(True, 200);
       Server.EnableKeepAlive := KeepAliveParam;
       Server.EnableHttp3 := True;
+
+      var IpTimeoutStr: string;
+      if FindCmdLineSwitch('iptimeout', IpTimeoutStr, True) then
+      begin
+        var TimeoutVal := StrToInt64Def(IpTimeoutStr, 60000);
+        if TimeoutVal > 0 then
+          Server.IPTrackerInactiveTimeoutMs := TimeoutVal;
+      end;
+      Server.AllowedFileExtensions.Add('.txt');
+      Server.AllowedFileExtensions.Add('.json');
+      Server.AllowedFileExtensions.Add('.png');
+      Server.AllowedFileExtensions.Add('.jpg');
+      Server.BlockedMimeTypes.Add('application/x-msdownload');
+      Server.BlockedMimeTypes.Add('application/x-sh');
+      Server.BlockedMimeTypes.Add('application/x-bat');
       Server.RegisterWebTransportRoute(
         '/webtransport',
         nil,
@@ -860,6 +876,7 @@ begin
             MetricsJson.AddPair('pool_count', TJSONNumber.Create(AServer.OverlappedPool.Count));
             MetricsJson.AddPair('total_created', TJSONNumber.Create(AServer.OverlappedPool.TotalCreated));
             MetricsJson.AddPair('active_connections', TJSONNumber.Create(AServer.ActiveConnections));
+            MetricsJson.AddPair('tracked_ips', TJSONNumber.Create(AServer.GetTrackedIPCount));
             AResponse.AddJSONContent(MetricsJson.ToJSON);
           finally
             MetricsJson.Free;
