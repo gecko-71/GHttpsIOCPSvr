@@ -84,6 +84,7 @@ type
     Origin:        string;
     Active:        Boolean;
     StreamCount:   Integer;
+    Server:        TObject;
   end;
 
   TWTSessionInfo = record

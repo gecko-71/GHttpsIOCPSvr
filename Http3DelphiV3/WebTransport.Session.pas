@@ -45,7 +45,7 @@ uses
 
 function AllocWTSendContext(ConnCtx: PConnectionContext; Size: Integer): PQuicSendContext;
 procedure FreeWTSendContextOnError(SendCtx: PQuicSendContext);
-procedure WTSendConnect200(Api: PQuicApiTable; ConnCtx: Pointer; Stream: HQUIC; SessionId: TWTSessionId);
+procedure WTSendConnect200(Api: PQuicApiTable; ConnCtx: Pointer; Stream: HQUIC; SessionId: TWTSessionId; IncludeDraft02: Boolean = False);
 procedure WTSendOnStream(Api: PQuicApiTable; ConnCtx: Pointer; Stream: HQUIC; const Data: TBytes; CloseSend: Boolean = False);
 procedure WTSendDatagram(Api: PQuicApiTable; ConnCtx: Pointer; Connection: HQUIC; const Data: TBytes); overload;
 procedure WTSendDatagram(Api: PQuicApiTable; ConnCtx: Pointer; Connection: HQUIC; SessionId: TWTSessionId; const Data: TBytes); overload;
@@ -62,6 +62,7 @@ type
 implementation
 
 uses
+  WebTransport.Server,
   Quick.Logger;
 
 function AllocWTSendContext(ConnCtx: PConnectionContext; Size: Integer): PQuicSendContext;
@@ -112,21 +113,34 @@ begin
   Dispose(SendCtx);
 end;
 
-procedure WTSendConnect200(Api: PQuicApiTable; ConnCtx: Pointer; Stream: HQUIC; SessionId: TWTSessionId);
+procedure WTSendConnect200(Api: PQuicApiTable; ConnCtx: Pointer; Stream: HQUIC; SessionId: TWTSessionId; IncludeDraft02: Boolean = False);
+var
+  SendCtx: PQuicSendContext;
+  Status: QUIC_STATUS;
+  Connect200Frame: TBytes;
 const
-  Connect200Frame: array[0..42] of Byte = (
+  Draft02Connect200: array[0..42] of Byte = (
     $01, $29, $00, $00, $D9, $27, $15,
     Ord('s'), Ord('e'), Ord('c'), Ord('-'), Ord('w'), Ord('e'), Ord('b'), Ord('t'), Ord('r'),
     Ord('a'), Ord('n'), Ord('s'), Ord('p'), Ord('o'), Ord('r'), Ord('t'), Ord('-'), Ord('h'),
     Ord('t'), Ord('t'), Ord('p'), Ord('3'), Ord('-'), Ord('d'), Ord('r'), Ord('a'), Ord('f'),
     Ord('t'), $07, Ord('d'), Ord('r'), Ord('a'), Ord('f'), Ord('t'), Ord('0'), Ord('2')
   );
-var
-  SendCtx: PQuicSendContext;
-  Status: QUIC_STATUS;
+  StandardConnect200: array[0..4] of Byte = ($01, $03, $00, $00, $D9);
 begin
   if (Api = nil) or (Stream = nil) or (ConnCtx = nil) then 
      Exit;
+
+  if IncludeDraft02 then
+  begin
+    SetLength(Connect200Frame, Length(Draft02Connect200));
+    Move(Draft02Connect200[0], Connect200Frame[0], Length(Draft02Connect200));
+  end
+  else
+  begin
+    SetLength(Connect200Frame, Length(StandardConnect200));
+    Move(StandardConnect200[0], Connect200Frame[0], Length(StandardConnect200));
+  end;
 
   SendCtx := AllocWTSendContext(PConnectionContext(ConnCtx), Length(Connect200Frame));
   Move(Connect200Frame[0], SendCtx.QuicBuffer.Buffer^, Length(Connect200Frame));
@@ -195,11 +209,19 @@ end;
 
 procedure WTCloseSession(Api: PQuicApiTable; Session: PWTSessionContext; ErrorCode: UInt64 = WT_SESSION_GONE);
 const
-  QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
+  QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
 begin
-  if (Api = nil) or (Session = nil) or (Session.ConnectStream = nil) then Exit;
-  Api.StreamShutdown(Session.ConnectStream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, ErrorCode);
-  Session.Active := False;
+  if (Session = nil) or (Session.ConnectStream = nil) then Exit;
+  if (Session.Server <> nil) and (Session.Server is TWebTransportServer) then
+  begin
+    TWebTransportServer(Session.Server).CloseSession(Session.ConnectStream, ErrorCode);
+    Session.Active := False;
+  end
+  else if Api <> nil then
+  begin
+    Api.StreamShutdown(Session.ConnectStream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, ErrorCode);
+    Session.Active := False;
+  end;
 end;
 
 procedure TWTSessionContextHelper.SendOnStream(Stream: HQUIC; const Data: TBytes; CloseSend: Boolean);

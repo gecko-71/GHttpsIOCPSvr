@@ -364,6 +364,8 @@ begin
       Server.BlockedMimeTypes.Add('application/x-msdownload');
       Server.BlockedMimeTypes.Add('application/x-sh');
       Server.BlockedMimeTypes.Add('application/x-bat');
+      Server.AllowedWebSocketOrigins := 'http://localhost:8080,https://localhost:8443,http://127.0.0.1:8080,https://127.0.0.1:8443,https://trusted-app.local';
+      Server.AllowedWebTransportOrigins := 'http://localhost:8080,https://localhost:8443,http://127.0.0.1:8080,https://127.0.0.1:8443,https://trusted-app.local';
       Server.RegisterWebTransportRoute(
         '/webtransport',
         nil,
@@ -398,10 +400,46 @@ begin
           if Opcode = wsOpText then
             Session.SendText(MessageText);
           AServer.TriggerWebSocketWrite(Session);
-        end
+        end,
+        atNone,
+        ['chat', 'superchat', 'graphql-ws']
+      );
+
+      Server.RegisterWebSocketRoute('/chat-auth',
+        procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const MessageText: string; Opcode: TWebSocketOpcode)
+        begin
+          if Opcode = wsOpText then
+            Session.SendText('authenticated:' + MessageText);
+          AServer.TriggerWebSocketWrite(Session);
+        end,
+        atJWTBearer
       );
 
       Server.RegisterWebSocketRoute('/ws');
+
+      Server.RegisterEndpointProc('/api/jwt/revoke', hmPOST,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        var
+          TokenToRevoke: string;
+        begin
+          TokenToRevoke := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
+          if TokenToRevoke = '' then
+            TokenToRevoke := Trim(ARequest.BodyAsString);
+          if TokenToRevoke = '' then
+            ARequest.RequestInfo.QueryParameters.TryGetValue('token', TokenToRevoke);
+
+          if TokenToRevoke <> '' then
+          begin
+            AServer.RevokeJWTToken(TokenToRevoke);
+            AResponse.SetStatus(200);
+            AResponse.AddJSONContent('{"status":"revoked"}');
+          end
+          else
+            AResponse.SetBadRequest('Missing token to revoke');
+        end
+      );
 
       Server.RegisterEndpointProc('/status', hmGET,
         procedure(Sender: TObject; const ARequest: TRequest;
@@ -808,6 +846,14 @@ begin
             AResponse.AddTextContent('text/plain', ARequest.BodyAsString)
           else
             AResponse.AddTextContent('text/plain', 'h3_echo_ok');
+        end);
+
+      Server.RegisterEndpointProc('/proxy', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.AddTextContent('text/plain', 'user_custom_proxy_handler');
         end);
 
       Server.RegisterEndpointProc('/400_check', hmGET,

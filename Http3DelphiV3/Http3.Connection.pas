@@ -36,7 +36,8 @@ uses
   MsQuic.ApiTable,
   Quic.Server,
   LsQpack.Encoder,
-  LsQpack.Decoder;
+  LsQpack.Decoder,
+  Http3.Types;
 
 type
   THttp3StreamType = (h3stUnknown, h3stBidirectional, h3stControl, h3stQpackEncoder, h3stQpackDecoder, h3stPush);
@@ -48,15 +49,19 @@ type
 
   THttp3RequestData = record
   private
-    FHeaders: array[0..31] of THttp3HeaderEntry;
+    FHeaders: TArray<THttp3HeaderEntry>;
     FHeaderCount: Integer;
     FMethod: string;
     FPath: string;
     FScheme: string;
     FAuthority: string;
+    FHasInvalidHeader: Boolean;
+    FHasRegularHeaderSeen: Boolean;
+    FErrorMessage: string;
+    FErrorCode: UInt64;
   public
     procedure Clear;
-    procedure AddHeader(const AName, AValue: string);
+    function AddHeader(const AName, AValue: string): Boolean;
     function TryGetHeader(const AName: string; out AValue: string): Boolean;
     function HasHeader(const AName: string): Boolean;
 
@@ -65,6 +70,9 @@ type
     property Scheme: string read FScheme write FScheme;
     property Authority: string read FAuthority write FAuthority;
     property HeaderCount: Integer read FHeaderCount;
+    property HasInvalidHeader: Boolean read FHasInvalidHeader;
+    property ErrorMessage: string read FErrorMessage;
+    property ErrorCode: UInt64 read FErrorCode;
   end;
 
   THttp3StreamState = class
@@ -78,6 +86,7 @@ type
     FResponseSent: Boolean;
     FRequestBody: TBytes;
     FHeaderPairs: TArray<TPair<string, string>>;
+    FSettingsReceived: Boolean;
   public
     constructor Create(AStream: HQUIC; AIsBidirectional: Boolean);
     destructor Destroy; override;
@@ -93,6 +102,7 @@ type
     property IsTypeIdentified: Boolean read FIsTypeIdentified write FIsTypeIdentified;
     property IsBidirectional: Boolean read FIsBidirectional;
     property ResponseSent: Boolean read FResponseSent write FResponseSent;
+    property SettingsReceived: Boolean read FSettingsReceived write FSettingsReceived;
   end;
 
   THttp3ConnectionState = class
@@ -104,16 +114,41 @@ type
     FControlStream: HQUIC;
     FQpackEncoderStream: HQUIC;
     FQpackDecoderStream: HQUIC;
+    FClientControlStream: HQUIC;
+    FClientQpackEncoderStream: HQUIC;
+    FClientQpackDecoderStream: HQUIC;
+    FPeerQpackMaxTableCapacity: UInt64;
+    FPeerQpackBlockedStreams: UInt64;
+    FPeerMaxFieldSectionSize: UInt64;
+    FPeerEnableConnectProtocol: Boolean;
+    FPeerH3Datagram: Boolean;
+    FClientGoAwayReceived: Boolean;
+    FClientGoAwayStreamId: UInt64;
+    FHasMaxPushId: Boolean;
+    FClientMaxPushId: UInt64;
     FStreams: TObjectDictionary<HQUIC, THttp3StreamState>;
     FLock: TCriticalSection;
   public
     constructor Create(AApi: PQuicApiTable; AConnection: HQUIC);
     destructor Destroy; override;
+    procedure ApplyPeerSettings;
 
     property Connection: HQUIC read FConnection;
     property ControlStream: HQUIC read FControlStream write FControlStream;
     property QpackEncoderStream: HQUIC read FQpackEncoderStream write FQpackEncoderStream;
     property QpackDecoderStream: HQUIC read FQpackDecoderStream write FQpackDecoderStream;
+    property ClientControlStream: HQUIC read FClientControlStream write FClientControlStream;
+    property ClientQpackEncoderStream: HQUIC read FClientQpackEncoderStream write FClientQpackEncoderStream;
+    property ClientQpackDecoderStream: HQUIC read FClientQpackDecoderStream write FClientQpackDecoderStream;
+    property PeerQpackMaxTableCapacity: UInt64 read FPeerQpackMaxTableCapacity write FPeerQpackMaxTableCapacity;
+    property PeerQpackBlockedStreams: UInt64 read FPeerQpackBlockedStreams write FPeerQpackBlockedStreams;
+    property PeerMaxFieldSectionSize: UInt64 read FPeerMaxFieldSectionSize write FPeerMaxFieldSectionSize;
+    property PeerEnableConnectProtocol: Boolean read FPeerEnableConnectProtocol write FPeerEnableConnectProtocol;
+    property PeerH3Datagram: Boolean read FPeerH3Datagram write FPeerH3Datagram;
+    property ClientGoAwayReceived: Boolean read FClientGoAwayReceived write FClientGoAwayReceived;
+    property ClientGoAwayStreamId: UInt64 read FClientGoAwayStreamId write FClientGoAwayStreamId;
+    property HasMaxPushId: Boolean read FHasMaxPushId write FHasMaxPushId;
+    property ClientMaxPushId: UInt64 read FClientMaxPushId write FClientMaxPushId;
     property QpackEncoder: TQpackEncoder read FQpackEncoder;
     property QpackDecoder: TQpackDecoder read FQpackDecoder;
     property Streams: TObjectDictionary<HQUIC, THttp3StreamState> read FStreams;
@@ -125,17 +160,56 @@ implementation
 procedure THttp3RequestData.Clear;
 begin
   FHeaderCount := 0;
+  SetLength(FHeaders, 32);
   FMethod := '';
   FPath := '';
   FScheme := '';
   FAuthority := '';
+  FHasInvalidHeader := False;
+  FHasRegularHeaderSeen := False;
+  FErrorMessage := '';
+  FErrorCode := 0;
 end;
 
-procedure THttp3RequestData.AddHeader(const AName, AValue: string);
+function THttp3RequestData.AddHeader(const AName, AValue: string): Boolean;
 var
   LowerName: string;
 begin
-  LowerName := LowerCase(AName);
+  Result := False;
+  LowerName := LowerCase(Trim(AName));
+
+  if (LowerName = 'connection') or (LowerName = 'keep-alive') or
+     (LowerName = 'proxy-connection') or (LowerName = 'transfer-encoding') or
+     (LowerName = 'upgrade') or ((LowerName = 'te') and (LowerCase(Trim(AValue)) <> 'trailers')) then
+  begin
+    FHasInvalidHeader := True;
+    FErrorMessage := 'Prohibited connection-specific header: ' + LowerName;
+    FErrorCode := H3_MESSAGE_ERROR;
+    Exit(False);
+  end;
+
+  if (Length(LowerName) > 0) and (LowerName[1] = ':') then
+  begin
+    if FHasRegularHeaderSeen then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Pseudo-header appeared after regular header: ' + LowerName;
+      FErrorCode := H3_MESSAGE_ERROR;
+      Exit(False);
+    end;
+    if not ((LowerName = ':method') or (LowerName = ':path') or
+            (LowerName = ':scheme') or (LowerName = ':authority') or
+            (LowerName = ':protocol') or (LowerName = ':status')) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Unknown pseudo-header: ' + LowerName;
+      FErrorCode := H3_MESSAGE_ERROR;
+      Exit(False);
+    end;
+  end
+  else
+    FHasRegularHeaderSeen := True;
+
   if LowerName = ':method' then
     FMethod := AValue
   else if LowerName = ':path' then
@@ -144,12 +218,26 @@ begin
     FScheme := AValue
   else if LowerName = ':authority' then
     FAuthority := AValue
-  else if FHeaderCount < Length(FHeaders) then
+  else
   begin
+    if Length(FHeaders) = 0 then
+      SetLength(FHeaders, 32);
+    if FHeaderCount >= Length(FHeaders) then
+    begin
+      if Length(FHeaders) >= 128 then
+      begin
+        FHasInvalidHeader := True;
+        FErrorMessage := 'Header count limit exceeded';
+        FErrorCode := H3_EXCESSIVE_LOAD;
+        Exit(False);
+      end;
+      SetLength(FHeaders, Length(FHeaders) * 2);
+    end;
     FHeaders[FHeaderCount].Name := LowerName;
     FHeaders[FHeaderCount].Value := AValue;
     Inc(FHeaderCount);
   end;
+  Result := True;
 end;
 
 function THttp3RequestData.TryGetHeader(const AName: string; out AValue: string): Boolean;
@@ -258,6 +346,17 @@ begin
   FStreams.Free;
   FLock.Free;
   inherited Destroy;
+end;
+
+procedure THttp3ConnectionState.ApplyPeerSettings;
+begin
+  FLock.Enter;
+  try
+    FQpackEncoder.Free;
+    FQpackEncoder := TQpackEncoder.Create(Cardinal(FPeerQpackMaxTableCapacity), Cardinal(FPeerQpackBlockedStreams));
+  finally
+    FLock.Leave;
+  end;
 end;
 
 end.

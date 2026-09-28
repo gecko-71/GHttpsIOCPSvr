@@ -1,4 +1,4 @@
-﻿{
+{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -69,6 +69,7 @@ type
     FRefCount: Integer;
     FOverlappedPool: TOverlappedExPool;
     FRoutePath: string;
+    FSubProtocol: string;
     procedure Unmask(var Frame: TWebSocketFrame);
     function GetIsTLS: Boolean;
   public
@@ -92,6 +93,7 @@ type
     property WriteOverlapped: POverlappedEx read FWriteOverlapped write FWriteOverlapped;
     property LastActivityTime: UInt64 read FLastActivityTime write FLastActivityTime;
     property RoutePath: string read FRoutePath write FRoutePath;
+    property SubProtocol: string read FSubProtocol write FSubProtocol;
     property LastReceivedOpcode: TWebSocketOpcode read FCurrentOpcode;
     property IsTLS: Boolean read GetIsTLS;
     property IsSecure: Boolean read GetIsTLS;
@@ -129,6 +131,11 @@ begin
     Exit;
 
   Frame.Fin := (RawData[LocalOffset] and $80) <> 0;
+  if (RawData[LocalOffset] and $70) <> 0 then
+  begin
+    ErrorMsg := 'Non-zero RSV bits received without negotiated extension (RFC 6455 5.2)';
+    Exit;
+  end;
   var OpVal: Byte := RawData[LocalOffset] and $0F;
   case OpVal of
     $0: Frame.Opcode := wsOpContinuation;
@@ -475,6 +482,7 @@ begin
         begin
           if ErrorMsg <> '' then
           begin
+            QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
             CloseConnection := True;
             Exit;
           end;
@@ -487,6 +495,7 @@ begin
 
         if not Frame.Masked then
         begin
+          QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
           CloseConnection := True;
           Exit;
         end;
@@ -520,7 +529,51 @@ begin
             end;
             wsOpClose:
             begin
-              QueueSendFrame(wsOpClose, Frame.Payload);
+              var ClosePayloadLen := Length(Frame.Payload);
+              if ClosePayloadLen = 1 then
+              begin
+                QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
+                CloseReceived := True;
+                CloseConnection := True;
+                Exit;
+              end
+              else if ClosePayloadLen >= 2 then
+              begin
+                var StatusCode: Word := (Word(Frame.Payload[0]) shl 8) or Word(Frame.Payload[1]);
+                var IsValidCode: Boolean := False;
+                if (StatusCode = 1000) or (StatusCode = 1001) or (StatusCode = 1002) or
+                   (StatusCode = 1003) or (StatusCode = 1007) or (StatusCode = 1008) or
+                   (StatusCode = 1009) or (StatusCode = 1010) or (StatusCode = 1011) or
+                   ((StatusCode >= 3000) and (StatusCode <= 4999)) then
+                  IsValidCode := True;
+
+                if not IsValidCode then
+                begin
+                  QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
+                  CloseReceived := True;
+                  CloseConnection := True;
+                  Exit;
+                end;
+
+                if ClosePayloadLen > 2 then
+                begin
+                  var ReasonBytes := Copy(Frame.Payload, 2, ClosePayloadLen - 2);
+                  if not TWebSocketFrame.IsValidUTF8(ReasonBytes) then
+                  begin
+                    QueueSendFrame(wsOpClose, TBytes.Create($03, $EF));
+                    CloseReceived := True;
+                    CloseConnection := True;
+                    Exit;
+                  end;
+                end;
+
+                QueueSendFrame(wsOpClose, Copy(Frame.Payload, 0, 2));
+              end
+              else
+              begin
+                QueueSendFrame(wsOpClose, nil);
+              end;
+
               CloseReceived := True;
               CloseConnection := True;
               Exit;

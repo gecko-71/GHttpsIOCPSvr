@@ -55,15 +55,21 @@ type
     FStreamToSession: TDictionary<HQUIC, HQUIC>;
     FLock: TCriticalSection;
     FNextSessionId: Int64;
+    FAllowedOrigins: string;
+    FDefaultAllowSessionWithoutHandler: Boolean;
+    FSendDraft02Header: Boolean;
+    FApi: PQuicApiTable;
     FOnSessionRequest: TOnWTSessionRequest;
     FOnSessionReady:   TOnWTSessionReady;
     FOnSessionClosed:  TOnWTSessionClosed;
     FOnStreamData:     TOnWTStreamData;
     FOnDatagram:       TOnWTDatagram;
+    function IsOriginAllowed(const AOrigin: string): Boolean;
     procedure Send403(Api: PQuicApiTable; ConnCtx: PConnectionContext; ConnectStream: HQUIC);
   public
     constructor Create;
     destructor Destroy; override;
+    procedure CloseSession(ConnectStream: HQUIC; ErrorCode: UInt64 = WT_SESSION_GONE);
     function HandleConnectRequest(Api: PQuicApiTable;
       H3State: THttp3ConnectionState;
       StreamState: THttp3StreamState;
@@ -75,6 +81,10 @@ type
     function HandleStreamData(Connection: HQUIC; Stream: HQUIC; const Data: TBytes): Boolean; overload;
     function HandleStreamData(Stream: HQUIC; const Data: TBytes): Boolean; overload;
     procedure HandleDatagram(Connection: HQUIC; const Data: TBytes);
+    property AllowedOrigins: string read FAllowedOrigins write FAllowedOrigins;
+    property DefaultAllowSessionWithoutHandler: Boolean read FDefaultAllowSessionWithoutHandler write FDefaultAllowSessionWithoutHandler;
+    property SendDraft02Header: Boolean read FSendDraft02Header write FSendDraft02Header;
+    property Api: PQuicApiTable read FApi write FApi;
     property OnSessionRequest: TOnWTSessionRequest read FOnSessionRequest write FOnSessionRequest;
     property OnSessionReady:   TOnWTSessionReady   read FOnSessionReady   write FOnSessionReady;
     property OnSessionClosed:  TOnWTSessionClosed  read FOnSessionClosed  write FOnSessionClosed;
@@ -91,6 +101,28 @@ uses
 const
   QUIC_SEND_FLAG_NONE = 0;
 
+function TWebTransportServer.IsOriginAllowed(const AOrigin: string): Boolean;
+var
+  AllowedList: TArray<string>;
+  AllowedItem: string;
+  TrimmedOrigin: string;
+begin
+  Result := False;
+  TrimmedOrigin := Trim(AOrigin);
+  if TrimmedOrigin = '' then
+    Exit(True);
+
+  if (FAllowedOrigins = '*') or (FAllowedOrigins = '') then
+    Exit(True);
+
+  AllowedList := FAllowedOrigins.Split([',', ';']);
+  for AllowedItem in AllowedList do
+  begin
+    if SameText(Trim(AllowedItem), TrimmedOrigin) or (Trim(AllowedItem) = '*') then
+      Exit(True);
+  end;
+end;
+
 constructor TWebTransportServer.Create;
 begin
   inherited Create;
@@ -98,6 +130,9 @@ begin
   FSessions        := TDictionary<HQUIC, TWTSessionContext>.Create;
   FStreamToSession := TDictionary<HQUIC, HQUIC>.Create;
   FNextSessionId   := 0;
+  FAllowedOrigins  := '*';
+  FDefaultAllowSessionWithoutHandler := False;
+  FSendDraft02Header := False;
 end;
 
 destructor TWebTransportServer.Destroy;
@@ -111,6 +146,82 @@ begin
   end;
   FLock.Free;
   inherited Destroy;
+end;
+
+procedure TWebTransportServer.CloseSession(ConnectStream: HQUIC; ErrorCode: UInt64 = WT_SESSION_GONE);
+const
+  QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
+var
+  ChildStreams: TList<HQUIC>;
+  ChildStream: HQUIC;
+  Pair: TPair<HQUIC, HQUIC>;
+  SessCtx: TWTSessionContext;
+  Api: PQuicApiTable;
+  SessionId: TWTSessionId;
+  HasSession: Boolean;
+begin
+  if ConnectStream = nil then Exit;
+  ChildStreams := TList<HQUIC>.Create;
+  try
+    HasSession := False;
+    SessionId := 0;
+    Api := FApi;
+    FLock.Enter;
+    try
+      if FSessions.TryGetValue(ConnectStream, SessCtx) then
+      begin
+        HasSession := True;
+        SessionId := SessCtx.SessionId;
+        if (Api = nil) and (SessCtx.ConnCtx <> nil) and (PConnectionContext(SessCtx.ConnCtx).Server <> nil) then
+        begin
+          var Svr := TQuicServer(PConnectionContext(SessCtx.ConnCtx).Server);
+          if Svr.MsQuic <> nil then
+            Api := Svr.MsQuic.Api;
+        end;
+      end;
+
+      for Pair in FStreamToSession do
+      begin
+        if Pair.Value = ConnectStream then
+          ChildStreams.Add(Pair.Key);
+      end;
+
+      for ChildStream in ChildStreams do
+        FStreamToSession.Remove(ChildStream);
+
+      if HasSession then
+        FSessions.Remove(ConnectStream);
+    finally
+      FLock.Leave;
+    end;
+
+    if Api <> nil then
+    begin
+      for ChildStream in ChildStreams do
+      begin
+        try
+          Api.StreamShutdown(ChildStream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, ErrorCode);
+        except
+        end;
+      end;
+      try
+        Api.StreamShutdown(ConnectStream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, ErrorCode);
+      except
+      end;
+    end;
+
+    if HasSession and Assigned(FOnSessionClosed) then
+    begin
+      try
+        FOnSessionClosed(Self, SessionId);
+      except
+        on E: Exception do
+          Logger.Error('[WebTransport] Exception in OnSessionClosed: %s', [E.Message]);
+      end;
+    end;
+  finally
+    ChildStreams.Free;
+  end;
 end;
 
 function TWebTransportServer.HandleConnectRequest(Api: PQuicApiTable;
@@ -130,6 +241,9 @@ var
 begin
   Result := False;
 
+  if Api <> nil then
+    FApi := Api;
+
   if not SameText(Request.Method, 'CONNECT') then 
      Exit;
   if not Request.TryGetHeader(':protocol', ProtoVal) or 
@@ -138,6 +252,13 @@ begin
 
   OriginVal := '';
   Request.TryGetHeader('origin', OriginVal);
+
+  if not IsOriginAllowed(OriginVal) then
+  begin
+    Logger.Warn('[WebTransport] Session request rejected: disallowed origin "%s"', [OriginVal]);
+    Send403(Api, ConnCtx, StreamState.Stream);
+    Exit;
+  end;
 
   LocalStreamId := 0;
   StreamIdSize := SizeOf(LocalStreamId);
@@ -148,7 +269,7 @@ begin
   Info.SessionId := SessionId;
   Info.Path      := Request.Path;
   Info.Origin    := OriginVal;
-  Accepted := True;
+
   if Assigned(FOnSessionRequest) then
   begin
     try
@@ -159,7 +280,9 @@ begin
         Accepted := False;
       end;
     end;
-  end;
+  end
+  else
+    Accepted := FDefaultAllowSessionWithoutHandler;
 
   if not Accepted then
   begin
@@ -177,6 +300,7 @@ begin
   SessCtx.Origin        := OriginVal;
   SessCtx.Active        := True;
   SessCtx.StreamCount   := 0;
+  SessCtx.Server        := Self;
 
   FLock.Enter;
   try
@@ -185,7 +309,7 @@ begin
     FLock.Leave;
   end;
 
-  WTSendConnect200(Api, ConnCtx, StreamState.Stream, SessionId);
+  WTSendConnect200(Api, ConnCtx, StreamState.Stream, SessionId, FSendDraft02Header);
   if Assigned(FOnSessionReady) then
   begin
     FLock.Enter;
@@ -201,59 +325,21 @@ end;
 
 procedure TWebTransportServer.HandleStreamClosed(ConnectStreamOrDataStream: HQUIC);
 var
-  SessCtx: TWTSessionContext;
-  ConnectStream: HQUIC;
-  ClosedSessionId: TWTSessionId;
-  HasSessionClosed: Boolean;
-  DataStreamList: TList<HQUIC>;
-  Pair: TPair<HQUIC, HQUIC>;
+  IsConnectStream: Boolean;
 begin
-  HasSessionClosed := False;
-  ClosedSessionId  := 0;
-  DataStreamList   := TList<HQUIC>.Create;
+  if ConnectStreamOrDataStream = nil then Exit;
+  IsConnectStream := False;
+  FLock.Enter;
   try
-    FLock.Enter;
-    try
-      if FSessions.TryGetValue(ConnectStreamOrDataStream, SessCtx) then
-      begin
-        ClosedSessionId := SessCtx.SessionId;
-        HasSessionClosed := True;
-        FSessions.Remove(ConnectStreamOrDataStream);
-        for Pair in FStreamToSession do
-          if Pair.Value = ConnectStreamOrDataStream then
-            DataStreamList.Add(Pair.Key);
-
-        for ConnectStream in DataStreamList do
-          FStreamToSession.Remove(ConnectStream);
-      end
-      else
-      if FStreamToSession.TryGetValue(ConnectStreamOrDataStream, ConnectStream) then
-      begin
-        FStreamToSession.Remove(ConnectStreamOrDataStream);
-        if FSessions.TryGetValue(ConnectStream, SessCtx) then
-        begin
-          ClosedSessionId := SessCtx.SessionId;
-          HasSessionClosed := True;
-          FSessions.Remove(ConnectStream);
-        end;
-      end;
-    finally
-      FLock.Leave;
-    end;
-
-    if HasSessionClosed and Assigned(FOnSessionClosed) then
-    begin
-      try
-        FOnSessionClosed(Self, ClosedSessionId);
-      except
-        on E: Exception do
-          Logger.Error('[WebTransport] Exception in OnSessionClosed event (SessionId: %d): %s (%s)',
-            [ClosedSessionId, E.Message, E.ClassName]);
-      end;
-    end;
+    IsConnectStream := FSessions.ContainsKey(ConnectStreamOrDataStream);
+    if not IsConnectStream then
+      FStreamToSession.Remove(ConnectStreamOrDataStream);
   finally
-    DataStreamList.Free;
+    FLock.Leave;
   end;
+
+  if IsConnectStream then
+    CloseSession(ConnectStreamOrDataStream, WT_SESSION_GONE);
 end;
 
 procedure TWebTransportServer.HandleConnectionClosed(Connection: HQUIC);
@@ -377,7 +463,8 @@ begin
             begin
               for Pair in FSessions do
               begin
-                if Pair.Value.Connection = Connection then
+                if (Pair.Value.Connection = Connection) and
+                   ((Pair.Value.StreamId = SessionId) or (Pair.Value.SessionId = SessionId)) then
                 begin
                   TargetConnectStream := Pair.Key;
                   FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
@@ -388,20 +475,11 @@ begin
               end;
             end;
 
-            if (not Found) and (FSessions.Count = 1) then
-            begin
-              for Pair in FSessions do
-              begin
-                TargetConnectStream := Pair.Key;
-                FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
-                PayloadOffset := DecodeOffset;
-                Found := True;
-                Break;
-              end;
-            end;
-
             if not Found then 
-			   Exit;
+            begin
+              Logger.Warn('[WebTransport] Stream rejected: session %d not found on connection', [SessionId]);
+              Exit;
+            end;
           end;
         end;
       end;
@@ -455,10 +533,13 @@ begin
   if (Length(Data) = 0) or (not Assigned(FOnDatagram)) then Exit;
 
   DecodeOffset := 0;
-  if TQuicVarInt.Decode(Data, DecodeOffset, QuarterStreamId) then
-    TargetSessionId := QuarterStreamId shl 2
-  else
-    TargetSessionId := 0;
+  if not TQuicVarInt.Decode(Data, DecodeOffset, QuarterStreamId) then
+  begin
+    Logger.Warn('[WebTransport] Failed to decode Quarter Stream ID from datagram');
+    Exit;
+  end;
+
+  TargetSessionId := QuarterStreamId shl 2;
 
   Found := False;
   FLock.Enter;
@@ -466,7 +547,8 @@ begin
     for Pair in FSessions do
     begin
       if (Pair.Value.Connection = Connection) and
-         ((Pair.Value.StreamId = TargetSessionId) or (Pair.Value.SessionId = TargetSessionId) or (FSessions.Count = 1)) then
+         ((Pair.Value.StreamId = TargetSessionId) or (Pair.Value.SessionId = TargetSessionId) or
+          ((Pair.Value.StreamId shr 2) = QuarterStreamId)) then
       begin
         SessCtx := Pair.Value;
         Found := True;
@@ -475,6 +557,13 @@ begin
     end;
   finally
     FLock.Leave;
+  end;
+
+  if not Found then
+  begin
+    Logger.Warn('[WebTransport] Dropped datagram for unknown session (QuarterStreamId: %d, TargetSessionId: %d)',
+      [QuarterStreamId, TargetSessionId]);
+    Exit;
   end;
 
   if Found then

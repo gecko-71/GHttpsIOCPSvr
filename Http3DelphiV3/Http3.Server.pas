@@ -71,6 +71,11 @@ type
     FQpackLoader: TLsQpackLoader;
     FWebTransport: TWebTransportServer;
     FOnHttpRequest: THttp3HttpRequestEvent;
+    FSettingMaxFieldSectionSize: UInt64;
+    FSettingQpackMaxTableCapacity: UInt64;
+    FSettingQpackBlockedStreams: UInt64;
+    FEnableDemoEndpoints: Boolean;
+    procedure CloseConnectionWithError(Conn: HQUIC; ErrorCode: UInt64);
     procedure ConfigureQpack(ConnCtx: PConnectionContext; H3State: THttp3ConnectionState);
     procedure OnConnectionOpened(Sender: TObject; Connection: HQUIC; ConnCtx: PConnectionContext; const NegotiatedAlpn: AnsiString);
     procedure OnConnectionClosed(Sender: TObject; Connection: HQUIC; ConnCtx: PConnectionContext);
@@ -89,6 +94,10 @@ type
     procedure EnableWebTransport;
     property WebTransport: TWebTransportServer read FWebTransport;
     property OnHttpRequest: THttp3HttpRequestEvent read FOnHttpRequest write FOnHttpRequest;
+    property SettingMaxFieldSectionSize: UInt64 read FSettingMaxFieldSectionSize write FSettingMaxFieldSectionSize;
+    property SettingQpackMaxTableCapacity: UInt64 read FSettingQpackMaxTableCapacity write FSettingQpackMaxTableCapacity;
+    property SettingQpackBlockedStreams: UInt64 read FSettingQpackBlockedStreams write FSettingQpackBlockedStreams;
+    property EnableDemoEndpoints: Boolean read FEnableDemoEndpoints write FEnableDemoEndpoints;
   end;
 
 implementation
@@ -104,6 +113,10 @@ begin
   FQpackLoader.Start;
   Logger.Info('[HTTP/3] ls-qpack.dll loaded successfully.');
   Logger.Info('Initializing THttp3Server on port 8443...');
+  FSettingMaxFieldSectionSize := 32768;
+  FSettingQpackMaxTableCapacity := 4096;
+  FSettingQpackBlockedStreams := 100;
+  FEnableDemoEndpoints := True;
   FQuicServer := TQuicServer.Create(CertHashHex, CertStoreName, ServerCertStore, CertSubjectName);
   FQuicServer.AlpnProtocol := HTTP3_ALPN_H3;
   FQuicServer.OnConnectionOpened := OnConnectionOpened;
@@ -111,6 +124,21 @@ begin
   FQuicServer.OnPeerStreamStarted := OnPeerStreamStarted;
   FQuicServer.OnStreamReceive := OnStreamReceive;
   FQuicServer.OnStreamClosed := OnStreamClosed;
+end;
+
+procedure THttp3Server.CloseConnectionWithError(Conn: HQUIC; ErrorCode: UInt64);
+const
+  QUIC_CONNECTION_SHUTDOWN_FLAG_NONE = 0;
+begin
+  if (Conn <> nil) and Assigned(FQuicServer) and Assigned(FQuicServer.MsQuic) and Assigned(FQuicServer.MsQuic.Api) then
+  begin
+    try
+      FQuicServer.MsQuic.Api.ConnectionShutdown(Conn, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, ErrorCode);
+    except
+      on E: Exception do
+        Logger.Error('[HTTP/3] Error in ConnectionShutdown: %s', [E.Message]);
+    end;
+  end;
 end;
 
 destructor THttp3Server.Destroy;
@@ -126,6 +154,8 @@ procedure THttp3Server.EnableWebTransport;
 begin
   if Assigned(FWebTransport) then Exit;
   FWebTransport := TWebTransportServer.Create;
+  if (FQuicServer <> nil) and (FQuicServer.MsQuic <> nil) then
+    FWebTransport.Api := FQuicServer.MsQuic.Api;
 
   FQuicServer.OnDatagramReceived := OnDatagramReceived;
   //Logger.Info('[WT] WebTransport enabled.');
@@ -159,13 +189,13 @@ begin
   end;
   H3State.ControlStream := Stream;
   VarIntSettingId := TQuicVarInt.Encode(HTTP3_SETTING_MAX_FIELD_SECTION_SIZE);
-  VarIntSettingVal := TQuicVarInt.Encode(32768);
+  VarIntSettingVal := TQuicVarInt.Encode(FSettingMaxFieldSectionSize);
   SettingsFrame := VarIntSettingId + VarIntSettingVal;
   VarIntSettingId := TQuicVarInt.Encode(HTTP3_SETTING_QPACK_MAX_TABLE_CAPACITY);
-  VarIntSettingVal := TQuicVarInt.Encode(4096);
+  VarIntSettingVal := TQuicVarInt.Encode(FSettingQpackMaxTableCapacity);
   SettingsFrame := SettingsFrame + VarIntSettingId + VarIntSettingVal;
   VarIntSettingId := TQuicVarInt.Encode(HTTP3_SETTING_QPACK_BLOCKED_STREAMS);
-  VarIntSettingVal := TQuicVarInt.Encode(100);
+  VarIntSettingVal := TQuicVarInt.Encode(FSettingQpackBlockedStreams);
   SettingsFrame := SettingsFrame + VarIntSettingId + VarIntSettingVal;
 
   if Assigned(FWebTransport) then
@@ -449,21 +479,54 @@ begin
       case FrameType of
         HTTP3_STREAM_TYPE_CONTROL:
           begin
+            H3State.Lock.Enter;
+            try
+              if H3State.ClientControlStream <> nil then
+              begin
+                CloseConnectionWithError(ConnCtx.Connection, H3_STREAM_CREATION_ERROR);
+                Exit;
+              end;
+              H3State.ClientControlStream := StreamState.Stream;
+            finally
+              H3State.Lock.Leave;
+            end;
             StreamState.StreamType := h3stControl;
             StreamState.IsTypeIdentified := True;
           end;
         HTTP3_STREAM_TYPE_PUSH:
           begin
-            StreamState.StreamType := h3stPush;
-            StreamState.IsTypeIdentified := True;
+            CloseConnectionWithError(ConnCtx.Connection, H3_STREAM_CREATION_ERROR);
+            Exit;
           end;
         HTTP3_STREAM_TYPE_QPACK_ENCODER:
           begin
+            H3State.Lock.Enter;
+            try
+              if H3State.ClientQpackEncoderStream <> nil then
+              begin
+                CloseConnectionWithError(ConnCtx.Connection, H3_STREAM_CREATION_ERROR);
+                Exit;
+              end;
+              H3State.ClientQpackEncoderStream := StreamState.Stream;
+            finally
+              H3State.Lock.Leave;
+            end;
             StreamState.StreamType := h3stQpackEncoder;
             StreamState.IsTypeIdentified := True;
           end;
         HTTP3_STREAM_TYPE_QPACK_DECODER:
           begin
+            H3State.Lock.Enter;
+            try
+              if H3State.ClientQpackDecoderStream <> nil then
+              begin
+                CloseConnectionWithError(ConnCtx.Connection, H3_STREAM_CREATION_ERROR);
+                Exit;
+              end;
+              H3State.ClientQpackDecoderStream := StreamState.Stream;
+            finally
+              H3State.Lock.Leave;
+            end;
             StreamState.StreamType := h3stQpackDecoder;
             StreamState.IsTypeIdentified := True;
           end;
@@ -514,11 +577,103 @@ begin
           Move(TempBuf[Offset], Payload[0], FrameLength);
         Inc(Offset, FrameLength);
 
+        if not StreamState.SettingsReceived then
+        begin
+          if FrameType <> HTTP3_FRAME_SETTINGS then
+          begin
+            CloseConnectionWithError(ConnCtx.Connection, H3_FRAME_UNEXPECTED);
+            Exit;
+          end;
+          StreamState.SettingsReceived := True;
+        end
+        else if FrameType = HTTP3_FRAME_SETTINGS then
+        begin
+          CloseConnectionWithError(ConnCtx.Connection, H3_FRAME_UNEXPECTED);
+          Exit;
+        end;
+
         case FrameType of
-          HTTP3_FRAME_SETTINGS: ;
-          HTTP3_FRAME_GOAWAY: ;
-          HTTP3_FRAME_MAX_PUSH_ID: ;
-          HTTP3_FRAME_CANCEL_PUSH: ;
+          HTTP3_FRAME_SETTINGS:
+            begin
+              var SOff: Integer := 0;
+              var SettingId, SettingVal: UInt64;
+              while SOff < Length(Payload) do
+              begin
+                if not TQuicVarInt.Decode(Payload, SOff, SettingId) then Break;
+                if not TQuicVarInt.Decode(Payload, SOff, SettingVal) then Break;
+
+                if (SettingId = $00) or (SettingId = $02) or (SettingId = $03) or
+                   (SettingId = $04) or (SettingId = $05) then
+                begin
+                  CloseConnectionWithError(ConnCtx.Connection, H3_SETTINGS_ERROR);
+                  Exit;
+                end;
+
+                H3State.Lock.Enter;
+                try
+                  case SettingId of
+                    HTTP3_SETTING_QPACK_MAX_TABLE_CAPACITY:
+                      H3State.PeerQpackMaxTableCapacity := SettingVal;
+                    HTTP3_SETTING_QPACK_BLOCKED_STREAMS:
+                      H3State.PeerQpackBlockedStreams := SettingVal;
+                    HTTP3_SETTING_MAX_FIELD_SECTION_SIZE:
+                      H3State.PeerMaxFieldSectionSize := SettingVal;
+                    HTTP3_SETTING_ENABLE_CONNECT_PROTOCOL:
+                      H3State.PeerEnableConnectProtocol := (SettingVal = 1);
+                    HTTP3_SETTING_H3_DATAGRAM:
+                      H3State.PeerH3Datagram := (SettingVal = 1);
+                  end;
+                finally
+                  H3State.Lock.Leave;
+                end;
+              end;
+              H3State.ApplyPeerSettings;
+            end;
+          HTTP3_FRAME_GOAWAY:
+            begin
+              var GOff: Integer := 0;
+              var GoAwayStreamId: UInt64;
+              if TQuicVarInt.Decode(Payload, GOff, GoAwayStreamId) then
+              begin
+                H3State.Lock.Enter;
+                try
+                  H3State.ClientGoAwayReceived := True;
+                  H3State.ClientGoAwayStreamId := GoAwayStreamId;
+                finally
+                  H3State.Lock.Leave;
+                end;
+              end;
+            end;
+          HTTP3_FRAME_MAX_PUSH_ID:
+            begin
+              var MOff: Integer := 0;
+              var MaxPushId: UInt64;
+              if TQuicVarInt.Decode(Payload, MOff, MaxPushId) then
+              begin
+                H3State.Lock.Enter;
+                try
+                  if H3State.HasMaxPushId and (MaxPushId < H3State.ClientMaxPushId) then
+                  begin
+                    CloseConnectionWithError(ConnCtx.Connection, H3_ID_ERROR);
+                    Exit;
+                  end;
+                  H3State.ClientMaxPushId := MaxPushId;
+                  H3State.HasMaxPushId := True;
+                finally
+                  H3State.Lock.Leave;
+                end;
+              end;
+            end;
+          HTTP3_FRAME_CANCEL_PUSH:
+            begin
+              CloseConnectionWithError(ConnCtx.Connection, H3_FRAME_UNEXPECTED);
+              Exit;
+            end;
+          else
+            begin
+              CloseConnectionWithError(ConnCtx.Connection, H3_FRAME_UNEXPECTED);
+              Exit;
+            end;
         end;
       end;
     end
@@ -551,39 +706,69 @@ begin
         case FrameType of
           HTTP3_FRAME_HEADERS:
             begin
-              try
-                StreamIdSize := SizeOf(StreamId);
-                StreamId := 0;
-                if QuicFailed(FQuicServer.MsQuic.Api.GetParam(StreamState.Stream, $08000000, StreamIdSize, @StreamId)) then
-                  StreamId := UInt64(StreamState.Stream);
+              StreamIdSize := SizeOf(StreamId);
+              StreamId := 0;
+              if QuicFailed(FQuicServer.MsQuic.Api.GetParam(StreamState.Stream, $08000000, StreamIdSize, @StreamId)) then
+                StreamId := UInt64(StreamState.Stream);
 
-                H3State.Lock.Enter;
+              H3State.Lock.Enter;
+              try
+                if H3State.ClientGoAwayReceived and (StreamId >= H3State.ClientGoAwayStreamId) then
+                begin
+                  const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
+                  FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_REQUEST_REJECTED);
+                  Exit;
+                end;
+
                 try
                   HdrPairs := H3State.QpackDecoder.DecodeHeaderBlock(StreamId, Payload);
-                  ReqData := StreamState.Request;
-                  var HeaderList: TArray<TPair<string, string>>;
-                  SetLength(HeaderList, Length(HdrPairs));
-                  for HdrIdx := 0 to High(HdrPairs) do
+                except
+                  on E: Exception do
                   begin
-                    ReqData.AddHeader(string(HdrPairs[HdrIdx].Key), string(HdrPairs[HdrIdx].Value));
-                    HeaderList[HdrIdx] := TPair<string, string>.Create(string(HdrPairs[HdrIdx].Key), string(HdrPairs[HdrIdx].Value));
+                    CloseConnectionWithError(ConnCtx.Connection, QPACK_DECOMPRESSION_FAILED);
+                    Exit;
                   end;
-                  StreamState.HeaderPairs := HeaderList;
-                  StreamState.Request := ReqData;
-                finally
-                  H3State.Lock.Leave;
                 end;
-              except
-                on E: Exception do
-                begin
 
+                ReqData := StreamState.Request;
+                var HeaderList: TArray<TPair<string, string>>;
+                SetLength(HeaderList, Length(HdrPairs));
+                var HasHdrError: Boolean := False;
+                for HdrIdx := 0 to High(HdrPairs) do
+                begin
+                  var HName := string(HdrPairs[HdrIdx].Key);
+                  var HVal := string(HdrPairs[HdrIdx].Value);
+                  if not ReqData.AddHeader(HName, HVal) then
+                  begin
+                    HasHdrError := True;
+                    Break;
+                  end;
+                  HeaderList[HdrIdx] := TPair<string, string>.Create(HName, HVal);
                 end;
+
+                if HasHdrError or ReqData.HasInvalidHeader then
+                begin
+                  const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
+                  var ErrCode := ReqData.ErrorCode;
+                  if ErrCode = 0 then ErrCode := H3_MESSAGE_ERROR;
+                  FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, ErrCode);
+                  Exit;
+                end;
+
+                StreamState.HeaderPairs := HeaderList;
+                StreamState.Request := ReqData;
+              finally
+                H3State.Lock.Leave;
               end;
 
               ReqPath := StreamState.Request.Path;
               ReqMethod := UpperCase(StreamState.Request.Method);
               if ReqMethod = '' then
-                 ReqMethod := 'GET';
+              begin
+                const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
+                FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_MESSAGE_ERROR);
+                Exit;
+              end;
 
               if (ReqMethod = 'CONNECT') then
               begin
@@ -607,43 +792,9 @@ begin
                 end;
               end;
 
-              if StreamState.Request.HasHeader('early-data') and (Pos('/safe', ReqPath) = 0) then
-                SendResponse(H3State, StreamState, ConnCtx, 425, 'text/plain', TEncoding.UTF8.GetBytes('425 Too Early'))
-              else if StreamState.Request.TryGetHeader('if-none-match', ValStr) and ((ValStr = '"h3-static-etag"') or (ValStr = '*')) and (not StreamState.Request.HasHeader('cache-control')) then
+              if (ReqMethod <> 'POST') and (ReqMethod <> 'PUT') then
               begin
-                SetLength(ExtraHdrs, 1);
-                ExtraHdrs[0] := TPair<string, string>.Create('etag', '"h3-static-etag"');
-                SendResponse(H3State, StreamState, ConnCtx, 304, '', nil, ExtraHdrs);
-              end
-              else if (Pos('/bhttp', ReqPath) > 0) or (StreamState.Request.TryGetHeader('accept', ValStr) and (Pos('message/bhttp', ValStr) > 0) and (Pos('text/', ValStr) = 0)) then
-                SendResponse(H3State, StreamState, ConnCtx, 200, 'message/bhttp', TEncoding.UTF8.GetBytes(#0#1#0#2'BHTTP_BINARY_STREAM_OK'))
-              else if (Pos('/sfv', ReqPath) > 0) or StreamState.Request.HasHeader('sfv-dict') or StreamState.Request.HasHeader('example-dict') then
-              begin
-                SetLength(ExtraHdrs, 1);
-                ExtraHdrs[0] := TPair<string, string>.Create('sfv-processed', '?1');
-                SendResponse(H3State, StreamState, ConnCtx, 200, 'application/json', TEncoding.UTF8.GetBytes('{"sfv_parsed":true}'), ExtraHdrs);
-              end
-              else if StreamState.Request.HasHeader('cdn-cache-control') or StreamState.Request.HasHeader('surrogate-control') then
-              begin
-                SetLength(ExtraHdrs, 2);
-                ExtraHdrs[0] := TPair<string, string>.Create('cdn-cache-control', 'max-age=600');
-                ExtraHdrs[1] := TPair<string, string>.Create('surrogate-control', 'max-age=3600');
-                SendResponse(H3State, StreamState, ConnCtx, 200, 'text/plain', TEncoding.UTF8.GetBytes('CDN / Surrogate cache control handled'), ExtraHdrs);
-              end
-              else if StreamState.Request.HasHeader('proxy-status') or (Pos('/proxy', ReqPath) > 0) then
-              begin
-                SetLength(ExtraHdrs, 1);
-                ExtraHdrs[0] := TPair<string, string>.Create('proxy-status', 'http3delphi; hit');
-                SendResponse(H3State, StreamState, ConnCtx, 200, 'text/plain', TEncoding.UTF8.GetBytes('Proxy status verified'), ExtraHdrs);
-              end
-              else if StreamState.Request.HasHeader('capsule-protocol') or StreamState.Request.HasHeader('datagram-flow-id') or (Pos('/masque', ReqPath) > 0) then
-              begin
-                SetLength(ExtraHdrs, 1);
-                ExtraHdrs[0] := TPair<string, string>.Create('capsule-protocol', '?1');
-                SendResponse(H3State, StreamState, ConnCtx, 200, 'application/capsule', nil, ExtraHdrs);
-              end
-              else if (ReqMethod <> 'POST') and (ReqMethod <> 'PUT') then
-              begin
+                var AppHandled: Boolean := False;
                 if Assigned(FOnHttpRequest) then
                 begin
                   var OutStatus: Integer := 404;
@@ -651,12 +802,70 @@ begin
                   var OutBody: TBytes := nil;
                   var OutExtra: TArray<TPair<string, string>> := nil;
                   FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, nil, OutStatus, OutContentType, OutBody, OutExtra);
-                  SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
-                end
-                else if (ReqMethod = 'GET') and (ReqPath = '/') then
-                  SendHelloWorldResponse(H3State, StreamState, ConnCtx)
-                else
-                  SendResponse(H3State, StreamState, ConnCtx, 404, 'text/plain', TEncoding.UTF8.GetBytes('404 Not Found'));
+                  if OutStatus <> 404 then
+                  begin
+                    SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
+                    AppHandled := True;
+                  end;
+                end;
+
+                if not AppHandled and FEnableDemoEndpoints then
+                begin
+                  if StreamState.Request.HasHeader('early-data') and (Pos('/safe', ReqPath) = 0) then
+                  begin
+                    SendResponse(H3State, StreamState, ConnCtx, 425, 'text/plain', TEncoding.UTF8.GetBytes('425 Too Early'));
+                    AppHandled := True;
+                  end
+                  else if StreamState.Request.TryGetHeader('if-none-match', ValStr) and ((ValStr = '"h3-static-etag"') or (ValStr = '*')) and (not StreamState.Request.HasHeader('cache-control')) then
+                  begin
+                    SetLength(ExtraHdrs, 1);
+                    ExtraHdrs[0] := TPair<string, string>.Create('etag', '"h3-static-etag"');
+                    SendResponse(H3State, StreamState, ConnCtx, 304, '', nil, ExtraHdrs);
+                    AppHandled := True;
+                  end
+                  else if (Pos('/bhttp', ReqPath) > 0) or (StreamState.Request.TryGetHeader('accept', ValStr) and (Pos('message/bhttp', ValStr) > 0) and (Pos('text/', ValStr) = 0)) then
+                  begin
+                    SendResponse(H3State, StreamState, ConnCtx, 200, 'message/bhttp', TEncoding.UTF8.GetBytes(#0#1#0#2'BHTTP_BINARY_STREAM_OK'));
+                    AppHandled := True;
+                  end
+                  else if (Pos('/sfv', ReqPath) > 0) or StreamState.Request.HasHeader('sfv-dict') or StreamState.Request.HasHeader('example-dict') then
+                  begin
+                    SetLength(ExtraHdrs, 1);
+                    ExtraHdrs[0] := TPair<string, string>.Create('sfv-processed', '?1');
+                    SendResponse(H3State, StreamState, ConnCtx, 200, 'application/json', TEncoding.UTF8.GetBytes('{"sfv_parsed":true}'), ExtraHdrs);
+                    AppHandled := True;
+                  end
+                  else if StreamState.Request.HasHeader('cdn-cache-control') or StreamState.Request.HasHeader('surrogate-control') then
+                  begin
+                    SetLength(ExtraHdrs, 2);
+                    ExtraHdrs[0] := TPair<string, string>.Create('cdn-cache-control', 'max-age=600');
+                    ExtraHdrs[1] := TPair<string, string>.Create('surrogate-control', 'max-age=3600');
+                    SendResponse(H3State, StreamState, ConnCtx, 200, 'text/plain', TEncoding.UTF8.GetBytes('CDN / Surrogate cache control handled'), ExtraHdrs);
+                    AppHandled := True;
+                  end
+                  else if StreamState.Request.HasHeader('proxy-status') or (Pos('/proxy', ReqPath) > 0) then
+                  begin
+                    SetLength(ExtraHdrs, 1);
+                    ExtraHdrs[0] := TPair<string, string>.Create('proxy-status', 'http3delphi; hit');
+                    SendResponse(H3State, StreamState, ConnCtx, 200, 'text/plain', TEncoding.UTF8.GetBytes('Proxy status verified'), ExtraHdrs);
+                    AppHandled := True;
+                  end
+                  else if StreamState.Request.HasHeader('capsule-protocol') or StreamState.Request.HasHeader('datagram-flow-id') or (Pos('/masque', ReqPath) > 0) then
+                  begin
+                    SetLength(ExtraHdrs, 1);
+                    ExtraHdrs[0] := TPair<string, string>.Create('capsule-protocol', '?1');
+                    SendResponse(H3State, StreamState, ConnCtx, 200, 'application/capsule', nil, ExtraHdrs);
+                    AppHandled := True;
+                  end;
+                end;
+
+                if not AppHandled then
+                begin
+                  if (ReqMethod = 'GET') and (ReqPath = '/') then
+                    SendHelloWorldResponse(H3State, StreamState, ConnCtx)
+                  else
+                    SendResponse(H3State, StreamState, ConnCtx, 404, 'text/plain', TEncoding.UTF8.GetBytes('404 Not Found'));
+                end;
               end;
             end;
           HTTP3_FRAME_DATA:
@@ -851,7 +1060,7 @@ begin
 
       if (StreamHandle <> nil) and Assigned(FQuicServer) and Assigned(FQuicServer.MsQuic) and Assigned(FQuicServer.MsQuic.Api) then
       begin
-        const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
+        const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
         const H3_INTERNAL_ERROR = $0102;
         try
           FQuicServer.MsQuic.Api.StreamShutdown(StreamHandle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_INTERNAL_ERROR);

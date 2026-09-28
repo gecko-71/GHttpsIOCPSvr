@@ -37,7 +37,7 @@ type
     jeInvalidIssuer, jeInvalidAudience, jeNotYetValid, jeParsingError,
     jeEncodingError, jeInvalidHeader, jeInvalidPayload, jeTokenTooLarge,
     jeRateLimited, jeInvalidAlgorithm, jeInvalidTokenType, jeWeakKey,
-    jeTokenFromFuture
+    jeTokenFromFuture, jeTokenRevoked
   );
 
   TJWTToken = class
@@ -101,6 +101,8 @@ type
     FMaxValidationAttempts: Integer;
     FValidationWindowMinutes: Integer;
     FEnableSecurityLogging: Boolean;
+    FRevokedTokens: TDictionary<string, TDateTime>;
+    FRevocationLock: TCriticalSection;
     function ValidateAlgorithm(const Algorithm: string): Boolean;
     function CreateSignature(const HeaderPayload: string): string;
     function VerifySignature(const HeaderPayload, Signature: string): Boolean;
@@ -117,6 +119,7 @@ type
     procedure SecureZeroMemory(var Str: string);
     function ValidateTokenSize(const Token: string): Boolean;
     function ValidateHeaderSafely(const HeaderObj: TJSONObject): Boolean;
+    function NowUTC: TDateTime; inline;
   public
     constructor Create(const ASecretKey, AIssuer: string; ATokenExpiration: Integer = 60; const AAudience: string = '');
     destructor Destroy; override;
@@ -127,6 +130,11 @@ type
     function RefreshToken(const Token: string; out NewToken: string): Boolean; overload;
     function RefreshToken(const Token: string; out NewToken: string; const ClientId: string): Boolean; overload;
     procedure ClearValidationHistory;
+    procedure RevokeToken(const Token: string);
+    procedure RevokeTokenByJti(const AJti: string; AExpiresAt: TDateTime = 0);
+    function IsTokenRevoked(const Token: string): Boolean;
+    function IsJtiRevoked(const AJti: string): Boolean;
+    procedure PruneExpiredRevocations;
 
     property SecretKey: string read FSecretKey write FSecretKey;
     property Issuer: string read FIssuer write FIssuer;
@@ -244,6 +252,8 @@ begin
     FAllowedAlgorithms := ['HS256'];
     FValidationAttempts := TDictionary<string, TValidationAttempt>.Create;
     FValidationLock := TCriticalSection.Create;
+    FRevokedTokens := TDictionary<string, TDateTime>.Create;
+    FRevocationLock := TCriticalSection.Create;
     LogSecurityEvent('JWT Manager initialized', Format('Issuer: %s', [AIssuer]));
   except
     on E: Exception do
@@ -261,6 +271,10 @@ begin
       FValidationAttempts.Free;
     if Assigned(FValidationLock) then
       FValidationLock.Free;
+    if Assigned(FRevokedTokens) then
+      FRevokedTokens.Free;
+    if Assigned(FRevocationLock) then
+      FRevocationLock.Free;
   finally
     inherited Destroy;
   end;
@@ -779,6 +793,13 @@ begin
       if PayloadObj.TryGetValue<string>('jti', JtiValue) then
          JWT.JwtId := JtiValue;
 
+      if IsTokenRevoked(Token) or ((JtiValue <> '') and IsJtiRevoked(JtiValue)) then
+      begin
+        JWT.LastError := jeTokenRevoked;
+        JWT.ErrorMessage := 'Token has been revoked';
+        raise Exception.Create(JWT.ErrorMessage);
+      end;
+
       JWT.HeaderDecoded := HeaderObj;
       JWT.Decoded := PayloadObj;
       JWT.IsValid := True;
@@ -933,6 +954,141 @@ begin
     LogSecurityEvent('Validation history cleared.');
   finally
     FValidationLock.Leave;
+  end;
+end;
+
+procedure TJWTManager.RevokeToken(const Token: string);
+var
+  Parts: TArray<string>;
+  PayStr: string;
+  PayObj: TJSONObject;
+  ExpUnix: Int64;
+  ExpDate: TDateTime;
+  JtiVal: string;
+  SigKey: string;
+begin
+  if Token = '' then Exit;
+  ExpDate := IncHour(NowUTC, 24);
+  JtiVal := '';
+  Parts := Token.Split(['.']);
+  if Length(Parts) = 3 then
+  begin
+    SigKey := Parts[2];
+    PayStr := DecodeBase64Url(Parts[1]);
+    PayObj := ParseJsonSafely(PayStr);
+    if Assigned(PayObj) then
+    begin
+      try
+        if PayObj.TryGetValue<Int64>('exp', ExpUnix) then
+          ExpDate := UnixToDateTime(ExpUnix);
+        if PayObj.TryGetValue<string>('jti', JtiVal) then
+        begin
+          if JtiVal <> '' then
+            RevokeTokenByJti(JtiVal, ExpDate);
+        end;
+      finally
+        PayObj.Free;
+      end;
+    end;
+  end
+  else
+    SigKey := Token;
+
+  FRevocationLock.Enter;
+  try
+    FRevokedTokens.AddOrSetValue(SigKey, ExpDate);
+  finally
+    FRevocationLock.Leave;
+  end;
+  LogSecurityEvent('JWT token revoked', SigKey);
+end;
+
+function TJWTManager.NowUTC: TDateTime;
+begin
+  Result := TTimeZone.Local.ToUniversalTime(Now);
+end;
+
+procedure TJWTManager.RevokeTokenByJti(const AJti: string; AExpiresAt: TDateTime);
+begin
+  if AJti = '' then Exit;
+  if AExpiresAt = 0 then
+    AExpiresAt := IncHour(NowUTC, 24);
+
+  FRevocationLock.Enter;
+  try
+    FRevokedTokens.AddOrSetValue('jti:' + AJti, AExpiresAt);
+  finally
+    FRevocationLock.Leave;
+  end;
+  LogSecurityEvent('JWT JTI revoked', AJti);
+end;
+
+function TJWTManager.IsTokenRevoked(const Token: string): Boolean;
+var
+  Parts: TArray<string>;
+  SigKey: string;
+  ExpDate: TDateTime;
+begin
+  Result := False;
+  if Token = '' then Exit;
+  Parts := Token.Split(['.']);
+  if Length(Parts) = 3 then
+    SigKey := Parts[2]
+  else
+    SigKey := Token;
+
+  FRevocationLock.Enter;
+  try
+    if FRevokedTokens.TryGetValue(SigKey, ExpDate) then
+    begin
+      if (ExpDate = 0) or (ExpDate > NowUTC) then
+        Result := True;
+    end;
+  finally
+    FRevocationLock.Leave;
+  end;
+end;
+
+function TJWTManager.IsJtiRevoked(const AJti: string): Boolean;
+var
+  ExpDate: TDateTime;
+begin
+  Result := False;
+  if AJti = '' then Exit;
+
+  FRevocationLock.Enter;
+  try
+    if FRevokedTokens.TryGetValue('jti:' + AJti, ExpDate) then
+    begin
+      if (ExpDate = 0) or (ExpDate > NowUTC) then
+        Result := True;
+    end;
+  finally
+    FRevocationLock.Leave;
+  end;
+end;
+
+procedure TJWTManager.PruneExpiredRevocations;
+var
+  KeysToRemove: TList<string>;
+  Pair: TPair<string, TDateTime>;
+begin
+  KeysToRemove := TList<string>.Create;
+  try
+    FRevocationLock.Enter;
+    try
+      for Pair in FRevokedTokens do
+      begin
+        if (Pair.Value > 0) and (Pair.Value < NowUTC) then
+          KeysToRemove.Add(Pair.Key);
+      end;
+      for var K in KeysToRemove do
+        FRevokedTokens.Remove(K);
+    finally
+      FRevocationLock.Leave;
+    end;
+  finally
+    KeysToRemove.Free;
   end;
 end;
 

@@ -199,6 +199,10 @@ type
     FMaxKeepAliveRequests: Integer;
     FEnableHttp3: Boolean;
     FHttp3Server: THttp3Server;
+    FHttp3SettingMaxFieldSectionSize: UInt64;
+    FHttp3SettingQpackMaxTableCapacity: UInt64;
+    FHttp3SettingQpackBlockedStreams: UInt64;
+    FHttp3EnableDemoEndpoints: Boolean;
     FServerCertStore: HCERTSTORE;
     FWebSocketManager: TWebSocketManager;
     FAlpnData: TBytes;
@@ -220,6 +224,14 @@ type
     FLastIPPruneTick: UInt64;
     FAllowedFileExtensions: TStringList;
     FBlockedMimeTypes: TStringList;
+    FWebSocketRouteAuth: TDictionary<string, TAuthorizationType>;
+    FWebSocketRouteProtocols: TDictionary<string, TArray<string>>;
+    FSupportedWebSocketProtocols: TArray<string>;
+    FAllowedWebSocketOrigins: string;
+    FAllowedWebTransportOrigins: string;
+    function IsWebSocketOriginAllowed(const AOrigin: string): Boolean;
+    function IsWebTransportOriginAllowed(const AOrigin: string): Boolean;
+    function SelectWebSocketSubProtocol(const APath, AClientProtocols: string): string;
     function TrackIPConnect(const AIP: string): Boolean;
     procedure TrackIPDisconnect(const AIP: string);
     function CheckIPRateLimit(const AIP: string): Boolean;
@@ -310,6 +322,9 @@ type
                                       AAuthorizationType: TAuthorizationType = atNone );
     procedure RegisterWebSocketRoute(const APath: string); overload;
     procedure RegisterWebSocketRoute(const APath: string; AOnMessage: TWebSocketMessageProc); overload;
+    procedure RegisterWebSocketRoute(const APath: string; AOnMessage: TWebSocketMessageProc; AAuthType: TAuthorizationType; const ASupportedProtocols: TArray<string> = nil); overload;
+    procedure RevokeJWTToken(const AToken: string);
+    function IsJWTTokenRevoked(const AToken: string): Boolean;
 
     procedure RegisterWebTransportRoute(const APath: string); overload;
     procedure RegisterWebTransportRoute(
@@ -331,6 +346,10 @@ type
     property JWTManager: TJWTManager read FJWTManager;
     property EnableHttp3: Boolean read FEnableHttp3 write FEnableHttp3;
     property Http3Server: THttp3Server read FHttp3Server;
+    property Http3SettingMaxFieldSectionSize: UInt64 read FHttp3SettingMaxFieldSectionSize write FHttp3SettingMaxFieldSectionSize;
+    property Http3SettingQpackMaxTableCapacity: UInt64 read FHttp3SettingQpackMaxTableCapacity write FHttp3SettingQpackMaxTableCapacity;
+    property Http3SettingQpackBlockedStreams: UInt64 read FHttp3SettingQpackBlockedStreams write FHttp3SettingQpackBlockedStreams;
+    property Http3EnableDemoEndpoints: Boolean read FHttp3EnableDemoEndpoints write FHttp3EnableDemoEndpoints;
     property WebSocketManager: TWebSocketManager read FWebSocketManager;
     property ActiveConnections: Int64 read FActiveConnections;
     property EnableKeepAlive: Boolean read FEnableKeepAlive write FEnableKeepAlive;
@@ -357,6 +376,9 @@ type
     property IPTrackerInactiveTimeoutMs: UInt64 read FIPTrackerInactiveTimeoutMs write FIPTrackerInactiveTimeoutMs;
     property AllowedFileExtensions: TStringList read FAllowedFileExtensions;
     property BlockedMimeTypes: TStringList read FBlockedMimeTypes;
+    property AllowedWebSocketOrigins: string read FAllowedWebSocketOrigins write FAllowedWebSocketOrigins;
+    property AllowedWebTransportOrigins: string read FAllowedWebTransportOrigins write FAllowedWebTransportOrigins;
+    property SupportedWebSocketProtocols: TArray<string> read FSupportedWebSocketProtocols write FSupportedWebSocketProtocols;
   end;
 
 
@@ -636,12 +658,20 @@ begin
   FCertificateStore := ACertificateStore;
   FEnableHttp3 := (FProtocolMode <> pmHttpOnly);
   FHttp3Server := nil;
+  FHttp3SettingMaxFieldSectionSize := 32768;
+  FHttp3SettingQpackMaxTableCapacity := 4096;
+  FHttp3SettingQpackBlockedStreams := 100;
+  FHttp3EnableDemoEndpoints := False;
   FEnableKeepAlive := AEnableKeepAlive;
   FKeepAliveTimeoutMs := 5000;
   FMaxKeepAliveRequests := 1000;
   FWebSocketManager := TWebSocketManager.Create;
   FWebSocketRoutes := TDictionary<string, Boolean>.Create;
   FWebSocketRouteHandlers := TDictionary<string, TWebSocketMessageProc>.Create;
+  FWebSocketRouteAuth := TDictionary<string, TAuthorizationType>.Create;
+  FWebSocketRouteProtocols := TDictionary<string, TArray<string>>.Create;
+  FAllowedWebSocketOrigins := '*';
+  FAllowedWebTransportOrigins := '*';
   FWebTransportRoutes := TDictionary<string, TWebTransportRouteItem>.Create;
   FWebTransportSessionRoutes := TDictionary<TWTSessionId, string>.Create;
   FEnableCORS := True;
@@ -721,6 +751,12 @@ begin
 
   if Assigned(FWebSocketRouteHandlers) then
     FreeAndNil(FWebSocketRouteHandlers);
+
+  if Assigned(FWebSocketRouteAuth) then
+    FreeAndNil(FWebSocketRouteAuth);
+
+  if Assigned(FWebSocketRouteProtocols) then
+    FreeAndNil(FWebSocketRouteProtocols);
 
   if Assigned(FWebTransportRoutes) then
   begin
@@ -1737,6 +1773,7 @@ begin
         Logger.Info(Format('[H3] Creating HTTP/3 server with SHA-1 hash %s from store LocalMachine\%s (StoreHandle=%p)', [H3HashHex, FCertificateStore, FServerCertStore]));
         FHttp3Server := THttp3Server.Create(H3HashHex, FCertificateStore, FSubjectName, FServerCertStore);
         FHttp3Server.EnableWebTransport;
+        FHttp3Server.WebTransport.AllowedOrigins := FAllowedWebTransportOrigins;
         FHttp3Server.OnHttpRequest := HandleHttp3Request;
 
         FHttp3Server.WebTransport.OnSessionRequest := WebTransportSessionRequest;
@@ -1744,6 +1781,11 @@ begin
         FHttp3Server.WebTransport.OnSessionClosed  := WebTransportSessionClosed;
         FHttp3Server.WebTransport.OnStreamData     := WebTransportStreamData;
         FHttp3Server.WebTransport.OnDatagram       := WebTransportDatagram;
+
+        FHttp3Server.SettingMaxFieldSectionSize := FHttp3SettingMaxFieldSectionSize;
+        FHttp3Server.SettingQpackMaxTableCapacity := FHttp3SettingQpackMaxTableCapacity;
+        FHttp3Server.SettingQpackBlockedStreams := FHttp3SettingQpackBlockedStreams;
+        FHttp3Server.EnableDemoEndpoints := FHttp3EnableDemoEndpoints;
 
         FHttp3Server.Start(FHttpsPort);
         Logger.Info(Format('HTTP/3 & WebTransport (UDP) server listening on port %d', [FHttpsPort]));
@@ -2470,6 +2512,119 @@ begin
   end;
 end;
 
+function TGHttpsServerIOCP.IsWebSocketOriginAllowed(const AOrigin: string): Boolean;
+var
+  AllowedList: TArray<string>;
+  AllowedItem: string;
+  TrimmedOrigin: string;
+begin
+  Result := False;
+  TrimmedOrigin := Trim(AOrigin);
+  if TrimmedOrigin = '' then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  if (FAllowedWebSocketOrigins = '') or (FAllowedWebSocketOrigins = '*') then
+  begin
+    if (FCORSAllowedOrigins <> '*') and (FCORSAllowedOrigins <> '') then
+      Result := IsOriginAllowed(AOrigin)
+    else
+      Result := True;
+    Exit;
+  end;
+
+  AllowedList := FAllowedWebSocketOrigins.Split([',', ';']);
+  for AllowedItem in AllowedList do
+  begin
+    if SameText(Trim(AllowedItem), TrimmedOrigin) or (Trim(AllowedItem) = '*') then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function TGHttpsServerIOCP.IsWebTransportOriginAllowed(const AOrigin: string): Boolean;
+var
+  AllowedList: TArray<string>;
+  AllowedItem: string;
+  TrimmedOrigin: string;
+begin
+  Result := False;
+  TrimmedOrigin := Trim(AOrigin);
+  if TrimmedOrigin = '' then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  if (FAllowedWebTransportOrigins = '') or (FAllowedWebTransportOrigins = '*') then
+  begin
+    if (FCORSAllowedOrigins <> '*') and (FCORSAllowedOrigins <> '') then
+      Result := IsOriginAllowed(AOrigin)
+    else
+      Result := True;
+    Exit;
+  end;
+
+  AllowedList := FAllowedWebTransportOrigins.Split([',', ';']);
+  for AllowedItem in AllowedList do
+  begin
+    if SameText(Trim(AllowedItem), TrimmedOrigin) or (Trim(AllowedItem) = '*') then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function TGHttpsServerIOCP.SelectWebSocketSubProtocol(const APath, AClientProtocols: string): string;
+var
+  RouteProtocols: TArray<string>;
+  ClientProtos: TArray<string>;
+  ClientP, ServerP: string;
+begin
+  Result := '';
+  if AClientProtocols = '' then Exit;
+  ClientProtos := AClientProtocols.Split([',']);
+
+  FLock.Enter;
+  try
+    if FWebSocketRouteProtocols.TryGetValue(APath, RouteProtocols) and (Length(RouteProtocols) > 0) then
+    begin
+      for ClientP in ClientProtos do
+      begin
+        for ServerP in RouteProtocols do
+        begin
+          if SameText(Trim(ClientP), Trim(ServerP)) then
+          begin
+            Result := Trim(ClientP);
+            Exit;
+          end;
+        end;
+      end;
+    end
+    else if Length(FSupportedWebSocketProtocols) > 0 then
+    begin
+      for ClientP in ClientProtos do
+      begin
+        for ServerP in FSupportedWebSocketProtocols do
+        begin
+          if SameText(Trim(ClientP), Trim(ServerP)) then
+          begin
+            Result := Trim(ClientP);
+            Exit;
+          end;
+        end;
+      end;
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
 function TGHttpsServerIOCP.HandleCORSPreflight(Request: TRequest; Response: TResponse): Boolean;
 var
   Origin: string;
@@ -2822,12 +2977,41 @@ begin
 
     if IsWebSocketRoute then
     begin
+      var RouteAuth: TAuthorizationType := atNone;
+      FLock.Enter;
+      try
+        FWebSocketRouteAuth.TryGetValue(Request.RequestInfo.Path.ToLower, RouteAuth);
+      finally
+        FLock.Leave;
+      end;
+
       if not (SameText(Request.Headers.GetHeader('Upgrade'), 'websocket') and
               (ContainsText(Request.Headers.GetHeader('Connection'), 'Upgrade') or SameText(Request.Headers.GetHeader('Connection'), 'Upgrade'))) then
       begin
         Response.SetBadRequest('WebSocket Upgrade Header Required');
         ContinueSendingResponse(OverlappedEx);
         Exit;
+      end;
+
+      var WSVersion: string := Request.Headers.GetHeader('Sec-WebSocket-Version').Trim;
+      if WSVersion <> '13' then
+      begin
+        Response.SetStatus(400);
+        Response.AddHeader('Sec-WebSocket-Version', '13');
+        Response.SetBadRequest('Unsupported Sec-WebSocket-Version');
+        ContinueSendingResponse(OverlappedEx);
+        Exit;
+      end;
+
+      var OriginHeader: string := Request.Headers.GetHeader('Origin').Trim;
+      if OriginHeader <> '' then
+      begin
+        if not IsWebSocketOriginAllowed(OriginHeader) then
+        begin
+          Response.SetForbidden('Origin not allowed for WebSocket upgrade');
+          ContinueSendingResponse(OverlappedEx);
+          Exit;
+        end;
       end;
 
       var Key: string := Request.Headers.GetHeader('Sec-WebSocket-Key');
@@ -2839,6 +3023,41 @@ begin
         Exit;
       end;
 
+      if RouteAuth = atJWTBearer then
+      begin
+        var TokenStr: string := FJWTManager.ExtractTokenFromAuthHeader(Request.Headers.Authorization);
+        if TokenStr = '' then
+        begin
+          if not Request.RequestInfo.QueryParameters.TryGetValue('token', TokenStr) then
+            Request.RequestInfo.QueryParameters.TryGetValue('access_token', TokenStr);
+        end;
+
+        if TokenStr = '' then
+        begin
+          Response.SetUnauthorized();
+          ContinueSendingResponse(OverlappedEx);
+          Exit;
+        end;
+
+        var JWTObj: TJWTToken := nil;
+        try
+          if not FJWTManager.ValidateToken(TokenStr, JWTObj) then
+          begin
+            Response.SetUnauthorized();
+            ContinueSendingResponse(OverlappedEx);
+            Exit;
+          end;
+        finally
+          if Assigned(JWTObj) then
+            JWTObj.Free;
+        end;
+      end;
+
+      var ClientProtocols: string := Request.Headers.GetHeader('Sec-WebSocket-Protocol');
+      var SelectedProtocol: string := '';
+      if ClientProtocols <> '' then
+        SelectedProtocol := SelectWebSocketSubProtocol(Request.RequestInfo.Path.ToLower, ClientProtocols);
+
       var MergedKey: string := Key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
       var Sha1Bytes := THashSHA1.GetHashBytes(MergedKey);
       var AcceptKey := TNetEncoding.Base64.EncodeBytesToString(Sha1Bytes).Trim;
@@ -2847,6 +3066,8 @@ begin
       Response.AddHeader('Upgrade', 'websocket');
       Response.AddHeader('Connection', 'Upgrade');
       Response.AddHeader('Sec-WebSocket-Accept', AcceptKey);
+      if SelectedProtocol <> '' then
+        Response.AddHeader('Sec-WebSocket-Protocol', SelectedProtocol);
       Response.FinalizeContent;
 
       ContinueSendingResponse(OverlappedEx);
@@ -4465,8 +4686,11 @@ var
   Flags, BytesReceived: DWORD;
 begin
   var ReqPath: string := '';
+  var SessionSubProtocol: string := '';
   if Assigned(OverlappedEx^.Request) then
     ReqPath := OverlappedEx^.Request.RequestInfo.Path.ToLower;
+  if Assigned(OverlappedEx^.Response) then
+    SessionSubProtocol := OverlappedEx^.Response.Headers.Values['Sec-WebSocket-Protocol'];
 
   if Assigned(OverlappedEx^.Request) then
   begin
@@ -4481,6 +4705,7 @@ begin
 
   Session := TWebSocketSession.Create(OverlappedEx^.Socket, OverlappedEx, FOverlappedPool);
   Session.RoutePath := ReqPath;
+  Session.SubProtocol := SessionSubProtocol;
 
   WriteOverlapped := FOverlappedPool.Acquire;
   if WriteOverlapped = nil then
@@ -4807,16 +5032,38 @@ end;
 
 procedure TGHttpsServerIOCP.RegisterWebSocketRoute(const APath: string; AOnMessage: TWebSocketMessageProc);
 begin
+  RegisterWebSocketRoute(APath, AOnMessage, atNone, nil);
+end;
+
+procedure TGHttpsServerIOCP.RegisterWebSocketRoute(const APath: string; AOnMessage: TWebSocketMessageProc; AAuthType: TAuthorizationType; const ASupportedProtocols: TArray<string>);
+begin
   FLock.Enter;
   try
     var CleanPath := APath.ToLower;
     FWebSocketRoutes.AddOrSetValue(CleanPath, True);
     if Assigned(AOnMessage) then
       FWebSocketRouteHandlers.AddOrSetValue(CleanPath, AOnMessage);
-    Logger.Info(Format('Registered WebSocket route: %s (HasCustomHandler: %s)', [APath, BoolToStr(Assigned(AOnMessage), True)]));
+    FWebSocketRouteAuth.AddOrSetValue(CleanPath, AAuthType);
+    if Length(ASupportedProtocols) > 0 then
+      FWebSocketRouteProtocols.AddOrSetValue(CleanPath, ASupportedProtocols);
+    Logger.Info(Format('Registered WebSocket route: %s (HasCustomHandler: %s, AuthType: %s)', [APath, BoolToStr(Assigned(AOnMessage), True), GetEnumName(TypeInfo(TAuthorizationType), Ord(AAuthType))]));
   finally
     FLock.Leave;
   end;
+end;
+
+procedure TGHttpsServerIOCP.RevokeJWTToken(const AToken: string);
+begin
+  if Assigned(FJWTManager) then
+    FJWTManager.RevokeToken(AToken);
+end;
+
+function TGHttpsServerIOCP.IsJWTTokenRevoked(const AToken: string): Boolean;
+begin
+  if Assigned(FJWTManager) then
+    Result := FJWTManager.IsTokenRevoked(AToken)
+  else
+    Result := False;
 end;
 
 { TWebTransportRouteItem }
@@ -4883,6 +5130,8 @@ var
   PurePath: string;
 begin
   Result := False;
+  if not IsWebTransportOriginAllowed(Info.Origin) then
+    Exit;
   PurePath := LowerCase(Info.Path);
   var QMark := Pos('?', PurePath);
   if QMark > 0 then

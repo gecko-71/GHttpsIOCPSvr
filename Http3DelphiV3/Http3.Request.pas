@@ -44,11 +44,14 @@ type
     FScheme: string;
     FAuthority: string;
     FBody: TBytes;
+    FHasInvalidHeader: Boolean;
+    FHasRegularHeaderSeen: Boolean;
+    FErrorMessage: string;
   public
     constructor Create(AStream: HQUIC);
     destructor Destroy; override;
 
-    procedure AddHeader(const Name, Value: string);
+    function AddHeader(const Name, Value: string): Boolean;
     procedure AppendBody(const Data: PByte; Length: Integer);
 
     property Stream: HQUIC read FStream;
@@ -58,6 +61,8 @@ type
     property Authority: string read FAuthority;
     property Headers: TDictionary<string, string> read FHeaders;
     property Body: TBytes read FBody;
+    property HasInvalidHeader: Boolean read FHasInvalidHeader;
+    property ErrorMessage: string read FErrorMessage;
   end;
 
 implementation
@@ -76,12 +81,42 @@ begin
   inherited Destroy;
 end;
 
-procedure TQuicHttp3Request.AddHeader(const Name, Value: string);
+function TQuicHttp3Request.AddHeader(const Name, Value: string): Boolean;
 var
   LowerName: string;
 begin
+  Result := False;
+  LowerName := LowerCase(Trim(Name));
 
-  LowerName := LowerCase(Name);
+  if (LowerName = 'connection') or (LowerName = 'keep-alive') or
+     (LowerName = 'proxy-connection') or (LowerName = 'transfer-encoding') or
+     (LowerName = 'upgrade') or ((LowerName = 'te') and (LowerCase(Trim(Value)) <> 'trailers')) then
+  begin
+    FHasInvalidHeader := True;
+    FErrorMessage := 'Prohibited connection-specific header: ' + LowerName;
+    Exit(False);
+  end;
+
+  if (Length(LowerName) > 0) and (LowerName[1] = ':') then
+  begin
+    if FHasRegularHeaderSeen then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Pseudo-header appeared after regular header: ' + LowerName;
+      Exit(False);
+    end;
+    if not ((LowerName = ':method') or (LowerName = ':path') or
+            (LowerName = ':scheme') or (LowerName = ':authority') or
+            (LowerName = ':protocol') or (LowerName = ':status')) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Unknown pseudo-header: ' + LowerName;
+      Exit(False);
+    end;
+  end
+  else
+    FHasRegularHeaderSeen := True;
+
   if LowerName = ':method' then
     FMethod := Value
   else if LowerName = ':path' then
@@ -92,6 +127,7 @@ begin
     FAuthority := Value
   else
     FHeaders.AddOrSetValue(LowerName, Value);
+  Result := True;
 end;
 
 procedure TQuicHttp3Request.AppendBody(const Data: PByte; Length: Integer);
