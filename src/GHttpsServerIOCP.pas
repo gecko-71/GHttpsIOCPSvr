@@ -84,16 +84,25 @@ type
                                               const AResponse: TResponse;
                                               AServer:TGHttpsServerIOCP) ;
 
-  TWebSocketMessageProc = reference to procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const MessageText: string; Opcode: TWebSocketOpcode);
+  TWebSocketMessageProc = reference to procedure(AServer: TGHttpsServerIOCP; 
+                                             Session: TWebSocketSession; 
+											 const MessageText: string; 
+											 Opcode: TWebSocketOpcode);
+											 
   TWebSocketConnectProc = reference to procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession);
-  TWebSocketDisconnectProc = reference to procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const Reason: string);
+  TWebSocketDisconnectProc = reference to procedure(AServer: TGHttpsServerIOCP; 
+                                                    Session: TWebSocketSession; 
+													const Reason: string);
 
   THttp3Request = TQuicHttp3Request;
   THttp3Response = TQuicHttp3Response;
 
   TWebTransportSessionProc  = reference to procedure(Session: PWTSessionContext);
-  TWebTransportStreamProc   = reference to procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes);
-  TWebTransportDatagramProc = reference to procedure(Session: PWTSessionContext; const Data: TBytes);
+  TWebTransportStreamProc   = reference to procedure(Session: PWTSessionContext; 
+                                                     Stream: HQUIC; 
+													 const Data: TBytes);
+  TWebTransportDatagramProc = reference to procedure(Session: PWTSessionContext; 
+                                                     const Data: TBytes);
   TWebTransportClosedProc   = reference to procedure(SessionId: TWTSessionId);
 
   TWebTransportRouteItem = class
@@ -4774,7 +4783,8 @@ var
   SessionList: TList<TWebSocketSession>;
   WS_Session: TWebSocketSession;
 begin
-  if not Assigned(FWebSocketManager) then Exit;
+  if not Assigned(FWebSocketManager) then 
+     Exit;
   Payload := TEncoding.UTF8.GetBytes(AText);
   SessionList := FWebSocketManager.AcquireSessionList;
   try
@@ -4798,7 +4808,8 @@ var
   SessionList: TList<TWebSocketSession>;
   WS_Session: TWebSocketSession;
 begin
-  if not Assigned(FWebSocketManager) or (Length(Data) = 0) then Exit;
+  if not Assigned(FWebSocketManager) or (Length(Data) = 0) then 
+     Exit;
   SessionList := FWebSocketManager.AcquireSessionList;
   try
     for WS_Session in SessionList do
@@ -4831,9 +4842,11 @@ var
   BytesSent: DWORD;
   CurrentWriteOv: POverlappedEx;
 begin
-  if not Assigned(Session) or (Session.InCleanup <> 0) then Exit;
+  if not Assigned(Session) or (Session.InCleanup <> 0) then 
+     Exit;
   CurrentWriteOv := Session.WriteOverlapped;
-  if not Assigned(CurrentWriteOv) then Exit;
+  if not Assigned(CurrentWriteOv) then 
+     Exit;
 
   if TInterlocked.CompareExchange(Session.WritePending, 1, 0) <> 0 then
     Exit;
@@ -5151,7 +5164,8 @@ var
   Item: TWebTransportRouteItem;
   PurePath: string;
 begin
-  if Session = nil then Exit;
+  if Session = nil then 
+     Exit;
   PurePath := LowerCase(Session^.Path);
   var QMark := Pos('?', PurePath);
   if QMark > 0 then
@@ -5197,7 +5211,8 @@ var
   Item: TWebTransportRouteItem;
   PurePath: string;
 begin
-  if Session = nil then Exit;
+  if Session = nil then 
+     Exit;
   PurePath := LowerCase(Session^.Path);
   var QMark := Pos('?', PurePath);
   if QMark > 0 then
@@ -5217,7 +5232,8 @@ var
   Item: TWebTransportRouteItem;
   PurePath: string;
 begin
-  if Session = nil then Exit;
+  if Session = nil then 
+     Exit;
   PurePath := LowerCase(Session^.Path);
   var QMark := Pos('?', PurePath);
   if QMark > 0 then

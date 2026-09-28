@@ -92,6 +92,7 @@ type
     procedure Stop;
 
     procedure EnableWebTransport;
+    procedure ConfigureSettings(AMaxFieldSectionSize, AQpackMaxTableCapacity, AQpackBlockedStreams: UInt64);
     property WebTransport: TWebTransportServer read FWebTransport;
     property OnHttpRequest: THttp3HttpRequestEvent read FOnHttpRequest write FOnHttpRequest;
     property SettingMaxFieldSectionSize: UInt64 read FSettingMaxFieldSectionSize write FSettingMaxFieldSectionSize;
@@ -116,7 +117,7 @@ begin
   FSettingMaxFieldSectionSize := 32768;
   FSettingQpackMaxTableCapacity := 4096;
   FSettingQpackBlockedStreams := 100;
-  FEnableDemoEndpoints := True;
+  FEnableDemoEndpoints := False;
   FQuicServer := TQuicServer.Create(CertHashHex, CertStoreName, ServerCertStore, CertSubjectName);
   FQuicServer.AlpnProtocol := HTTP3_ALPN_H3;
   FQuicServer.OnConnectionOpened := OnConnectionOpened;
@@ -159,6 +160,13 @@ begin
 
   FQuicServer.OnDatagramReceived := OnDatagramReceived;
   //Logger.Info('[WT] WebTransport enabled.');
+end;
+
+procedure THttp3Server.ConfigureSettings(AMaxFieldSectionSize, AQpackMaxTableCapacity, AQpackBlockedStreams: UInt64);
+begin
+  FSettingMaxFieldSectionSize := AMaxFieldSectionSize;
+  FSettingQpackMaxTableCapacity := AQpackMaxTableCapacity;
+  FSettingQpackBlockedStreams := AQpackBlockedStreams;
 end;
 
 procedure THttp3Server.OnDatagramReceived(Sender: TObject; Connection: HQUIC; ConnCtx: PConnectionContext; const Buffer: PByte; BufferLength: Cardinal);
