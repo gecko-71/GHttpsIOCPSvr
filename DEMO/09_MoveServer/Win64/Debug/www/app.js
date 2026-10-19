@@ -519,14 +519,17 @@ function connectTelemetryWebSocket() {
 
         const data = JSON.parse(event.data);
 
-        if (data.type === 'role') {
+        if (data.type === 'role' || data.role === 'master' || data.uptime_sec !== undefined || data.live_position_sec !== undefined) {
           syncRole = 'slave';
           const syncRoleBadge = document.getElementById('syncRoleBadge');
-          if (syncRoleBadge) {
-            syncRoleBadge.innerText = 'SERVER MASTER';
+          if (syncRoleBadge && syncRoleBadge.innerText !== 'CLIENT (SLAVE)') {
+            syncRoleBadge.innerText = 'CLIENT (SLAVE)';
             syncRoleBadge.className = 'p-status active';
+            syncRoleBadge.title = 'Server is Master, this client is Slave';
           }
-          return;
+          if (data.type === 'role') {
+            return;
+          }
         }
 
         if (data.type === 'sync') {
@@ -667,6 +670,18 @@ async function connectTelemetryWebTransport() {
           try {
             const text = new TextDecoder().decode(value);
             const data = JSON.parse(text);
+            if (data.type === 'role' || data.role === 'master' || data.uptime_sec !== undefined || data.live_position_sec !== undefined) {
+              syncRole = 'slave';
+              const syncRoleBadge = document.getElementById('syncRoleBadge');
+              if (syncRoleBadge && syncRoleBadge.innerText !== 'CLIENT (SLAVE)') {
+                syncRoleBadge.innerText = 'CLIENT (SLAVE)';
+                syncRoleBadge.className = 'p-status active';
+                syncRoleBadge.title = 'Server is Master, this client is Slave';
+              }
+              if (data.type === 'role') {
+                continue;
+              }
+            }
             if (data.uptime_sec !== undefined || data.live_position_sec !== undefined) {
               lastServerSync = {
                 liveElapsedSec: Number(data.uptime_sec),

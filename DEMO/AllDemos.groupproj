@@ -27,6 +27,18 @@
         <Projects Include="09_MoveServer\D09_MoveServer.dproj">
             <Dependencies/>
         </Projects>
+        <Projects Include="10_mTLSAuthServerAndClient\D10_mTLSServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="10_mTLSAuthServerAndClient\D10_mTLSClient.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleServer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleClient.dproj">
+            <Dependencies/>
+        </Projects>
     </ItemGroup>
     <ProjectExtensions>
         <Borland.Personality>Default.Personality.12</Borland.Personality>
@@ -107,14 +119,50 @@
     <Target Name="D09_MoveServer:Make">
         <MSBuild Projects="09_MoveServer\D09_MoveServer.dproj" Targets="Make"/>
     </Target>
+    <Target Name="D10_mTLSServer">
+        <MSBuild Projects="10_mTLSAuthServerAndClient\D10_mTLSServer.dproj"/>
+    </Target>
+    <Target Name="D10_mTLSServer:Clean">
+        <MSBuild Projects="10_mTLSAuthServerAndClient\D10_mTLSServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D10_mTLSServer:Make">
+        <MSBuild Projects="10_mTLSAuthServerAndClient\D10_mTLSServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="D10_mTLSClient">
+        <MSBuild Projects="10_mTLSAuthServerAndClient\D10_mTLSClient.dproj"/>
+    </Target>
+    <Target Name="D10_mTLSClient:Clean">
+        <MSBuild Projects="10_mTLSAuthServerAndClient\D10_mTLSClient.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="D10_mTLSClient:Make">
+        <MSBuild Projects="10_mTLSAuthServerAndClient\D10_mTLSClient.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="mTLSAuthSimpleServer">
+        <MSBuild Projects="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleServer.dproj"/>
+    </Target>
+    <Target Name="mTLSAuthSimpleServer:Clean">
+        <MSBuild Projects="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleServer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="mTLSAuthSimpleServer:Make">
+        <MSBuild Projects="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleServer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="mTLSAuthSimpleClient">
+        <MSBuild Projects="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleClient.dproj"/>
+    </Target>
+    <Target Name="mTLSAuthSimpleClient:Clean">
+        <MSBuild Projects="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleClient.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="mTLSAuthSimpleClient:Make">
+        <MSBuild Projects="11_mTLSAuthSimpleServerAndClient\mTLSAuthSimpleClient.dproj" Targets="Make"/>
+    </Target>
     <Target Name="Build">
-        <CallTarget Targets="D01_StaticAndSpaServer;D02_JwtSecurityWafServer;D03_HighSpeedFileStreamServer;D04_WebSocketChatAndTelemetryServer;D05_Http3QuicSpeedServer;D06_TriProtocolHybridServer;D08_MorseAudioServer;D09_MoveServer"/>
+        <CallTarget Targets="D01_StaticAndSpaServer;D02_JwtSecurityWafServer;D03_HighSpeedFileStreamServer;D04_WebSocketChatAndTelemetryServer;D05_Http3QuicSpeedServer;D06_TriProtocolHybridServer;D08_MorseAudioServer;D09_MoveServer;D10_mTLSServer;D10_mTLSClient;mTLSAuthSimpleServer;mTLSAuthSimpleClient"/>
     </Target>
     <Target Name="Clean">
-        <CallTarget Targets="D01_StaticAndSpaServer:Clean;D02_JwtSecurityWafServer:Clean;D03_HighSpeedFileStreamServer:Clean;D04_WebSocketChatAndTelemetryServer:Clean;D05_Http3QuicSpeedServer:Clean;D06_TriProtocolHybridServer:Clean;D08_MorseAudioServer:Clean;D09_MoveServer:Clean"/>
+        <CallTarget Targets="D01_StaticAndSpaServer:Clean;D02_JwtSecurityWafServer:Clean;D03_HighSpeedFileStreamServer:Clean;D04_WebSocketChatAndTelemetryServer:Clean;D05_Http3QuicSpeedServer:Clean;D06_TriProtocolHybridServer:Clean;D08_MorseAudioServer:Clean;D09_MoveServer:Clean;D10_mTLSServer:Clean;D10_mTLSClient:Clean;mTLSAuthSimpleServer:Clean;mTLSAuthSimpleClient:Clean"/>
     </Target>
     <Target Name="Make">
-        <CallTarget Targets="D01_StaticAndSpaServer:Make;D02_JwtSecurityWafServer:Make;D03_HighSpeedFileStreamServer:Make;D04_WebSocketChatAndTelemetryServer:Make;D05_Http3QuicSpeedServer:Make;D06_TriProtocolHybridServer:Make;D08_MorseAudioServer:Make;D09_MoveServer:Make"/>
+        <CallTarget Targets="D01_StaticAndSpaServer:Make;D02_JwtSecurityWafServer:Make;D03_HighSpeedFileStreamServer:Make;D04_WebSocketChatAndTelemetryServer:Make;D05_Http3QuicSpeedServer:Make;D06_TriProtocolHybridServer:Make;D08_MorseAudioServer:Make;D09_MoveServer:Make;D10_mTLSServer:Make;D10_mTLSClient:Make;mTLSAuthSimpleServer:Make;mTLSAuthSimpleClient:Make"/>
     </Target>
     <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
 </Project>

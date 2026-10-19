@@ -92,12 +92,14 @@ type
     InPool: LongInt;
     ALPNProtocol: array[0..31] of AnsiChar;
     ClientIP: array[0..45] of AnsiChar;
+    ClientCertInfo: TGClientCertInfo;
   end;
 
 
 const
   SO_UPDATE_ACCEPT_CONTEXT = $700B;
   ASC_REQ_SESSION_TICKET = $00000040;
+  ASC_REQ_MUTUAL_AUTH = $00000002;
 
   WORKER_THREAD_COUNT = 48;
 
@@ -120,6 +122,10 @@ const
   SECPKG_ATTR_STREAM_SIZES = 4;
   SECPKG_ATTR_CONNECTION_INFO = 90;
   SECPKG_ATTR_APPLICATION_PROTOCOL = 35;
+  SECPKG_ATTR_REMOTE_CERT_CONTEXT = 83;
+
+  CERT_NAME_ISSUER_FLAG = $00000001;
+
   SECBUFFER_EMPTY = 0;
   SECBUFFER_DATA = 1;
   SECBUFFER_TOKEN = 2;
@@ -387,14 +393,28 @@ type
     pbData: PByte;
   end;
 
-type
+  CRYPT_ALGORITHM_IDENTIFIER = record
+    pszObjId: LPSTR;
+    Parameters: CRYPT_DATA_BLOB;
+  end;
+
+  PCERT_INFO = ^CERT_INFO;
+  CERT_INFO = record
+    dwVersion: DWORD;
+    SerialNumber: CRYPT_DATA_BLOB;
+    SignatureAlgorithm: CRYPT_ALGORITHM_IDENTIFIER;
+    Issuer: CRYPT_DATA_BLOB;
+    NotBefore: TFileTime;
+    NotAfter: TFileTime;
+  end;
+
   HCERTSTORE = Pointer;
   PCERT_CONTEXT = ^CERT_CONTEXT;
   CERT_CONTEXT = record
     dwCertEncodingType: DWORD;
     pbCertEncoded: PByte;
     cbCertEncoded: DWORD;
-    pCertInfo: Pointer;
+    pCertInfo: PCERT_INFO;
     hCertStore: HCERTSTORE;
   end;
   PCCERT_CONTEXT = PCERT_CONTEXT;
@@ -448,6 +468,9 @@ function PFXExportCertStoreEx(hStore: HCERTSTORE; pPFX: PCRYPT_DATA_BLOB;
   szPassword: LPCWSTR; pvReserved: Pointer; dwFlags: DWORD): BOOL; stdcall;
   external 'crypt32.dll';
 
+function CertVerifyTimeValidity(pTimeToVerify: Pointer; pCertInfo: PCERT_INFO): LongInt; stdcall;
+  external 'crypt32.dll';
+
 function CryptAcquireCertificatePrivateKey(pCert: PCCERT_CONTEXT; dwFlags: DWORD;
   pvReserved: Pointer; var phCryptProv: HCRYPTPROV; var pdwKeySpec: DWORD;
   var pfCallerFreeProv: BOOL): BOOL; stdcall;
@@ -457,7 +480,25 @@ function CryptReleaseContext(hProv: HCRYPTPROV; dwFlags: DWORD): BOOL; stdcall;
   external 'advapi32.dll';
 
 const
+  CERT_NAME_EMAIL_TYPE          = 1;
   CERT_NAME_SIMPLE_DISPLAY_TYPE = 4;
+  CERT_NAME_DNS_TYPE            = 6;
+  CERT_NAME_URL_TYPE            = 7;
+  CRYPT_STRING_BASE64HEADER = $00000000;
+  CERT_STORE_SIGNATURE_FLAG = $00000001;
+  CERT_STORE_TIME_FLAG      = $00000002;
+
+function CryptStringToBinary(pszString: LPCSTR; cchString: DWORD; dwFlags: DWORD;
+  pbBinary: PByte; var pcbBinary: DWORD; pdwSkip: PDWORD; pdwFlags: PDWORD): BOOL; stdcall;
+  external 'crypt32.dll' name 'CryptStringToBinaryA';
+
+function CertCreateCertificateContext(dwCertEncodingType: DWORD;
+  pbCertEncoded: PByte; cbCertEncoded: DWORD): PCCERT_CONTEXT; stdcall;
+  external 'crypt32.dll';
+
+function CertVerifySubjectCertificateContext(pSubject: PCCERT_CONTEXT;
+  pIssuer: PCCERT_CONTEXT; var pdwFlags: DWORD): BOOL; stdcall;
+  external 'crypt32.dll';
 
 function AcceptEx(sListenSocket, sAcceptSocket: TSocket; lpOutputBuffer: Pointer;
   dwReceiveDataLength, dwLocalAddressLength, dwRemoteAddressLength: DWORD;

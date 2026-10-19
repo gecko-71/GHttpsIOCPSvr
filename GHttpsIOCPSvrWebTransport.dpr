@@ -202,6 +202,42 @@ const
    DOWNLOAD_DIR = 'download';
    DOWNLAD_FILE = 'largefile_10mb.bin';
 
+function GetCmdLineOption(const SwitchName: string; out Value: string): Boolean;
+var
+  i: Integer;
+  Arg, S1, S2: string;
+begin
+  Result := False;
+  Value := '';
+  S1 := '-' + SwitchName;
+  S2 := '/' + SwitchName;
+  for i := 1 to ParamCount do
+  begin
+    Arg := ParamStr(i);
+    if SameText(Arg, S1) or SameText(Arg, S2) then
+    begin
+      if (i < ParamCount) and not StartsStr('-', ParamStr(i + 1)) and not StartsStr('/', ParamStr(i + 1)) then
+      begin
+        Value := ParamStr(i + 1);
+        Result := True;
+        Exit;
+      end;
+    end
+    else if StartsText(S1 + ':', Arg) or StartsText(S2 + ':', Arg) then
+    begin
+      Value := Copy(Arg, Length(S1) + 2, MaxInt);
+      Result := True;
+      Exit;
+    end
+    else if StartsText(S1 + '=', Arg) or StartsText(S2 + '=', Arg) then
+    begin
+      Value := Copy(Arg, Length(S1) + 2, MaxInt);
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
 begin
   SetInOutRes(0);
   if FindCmdLineSwitch('help', True) or FindCmdLineSwitch('h', True) or
@@ -279,7 +315,8 @@ begin
     end;
 
     var HttpPortStr: string;
-    if FindCmdLineSwitch('httpport', HttpPortStr, True) then
+    if GetCmdLineOption('httpport', HttpPortStr) or GetCmdLineOption('port', HttpPortStr) or
+       FindCmdLineSwitch('httpport', HttpPortStr, True) then
     begin
       var P := StrToIntDef(HttpPortStr, 0);
       if (P > 0) and (P <= 65535) then
@@ -287,7 +324,8 @@ begin
     end;
 
     var HttpsPortStr: string;
-    if FindCmdLineSwitch('httpsport', HttpsPortStr, True) then
+    if GetCmdLineOption('httpsport', HttpsPortStr) or GetCmdLineOption('tlsport', HttpsPortStr) or
+       FindCmdLineSwitch('httpsport', HttpsPortStr, True) then
     begin
       var P := StrToIntDef(HttpsPortStr, 0);
       if (P > 0) and (P <= 65535) then
@@ -295,7 +333,7 @@ begin
     end;
 
     var ModeStr: string;
-    if FindCmdLineSwitch('mode', ModeStr, True) then
+    if GetCmdLineOption('mode', ModeStr) or FindCmdLineSwitch('mode', ModeStr, True) then
     begin
       ModeStr := LowerCase(ModeStr);
       if ModeStr = 'http' then
@@ -357,6 +395,49 @@ begin
         if TimeoutVal > 0 then
           Server.IPTrackerInactiveTimeoutMs := TimeoutVal;
       end;
+      var mTLSParam: string;
+      if GetCmdLineOption('mtls', mTLSParam) or FindCmdLineSwitch('mtls', mTLSParam, True) then
+      begin
+        if SameText(mTLSParam, 'required') or SameText(mTLSParam, 'RequireAndVerifyClientCert') then
+        begin
+          Server.mTLSMode := mtlsRequired;
+          Logger.Info('mTLS mode set to: REQUIRED (RequireAndVerifyClientCert)');
+        end
+        else if SameText(mTLSParam, 'optional') or SameText(mTLSParam, 'VerifyClientCertIfGiven') then
+        begin
+          Server.mTLSMode := mtlsOptional;
+          Logger.Info('mTLS mode set to: OPTIONAL (VerifyClientCertIfGiven)');
+        end
+        else
+        begin
+          Server.mTLSMode := mtlsDisabled;
+          Logger.Info('mTLS mode set to: DISABLED (NoClientCert)');
+        end;
+      end;
+
+      var CaCertPath: string;
+      if GetCmdLineOption('cacert', CaCertPath) or GetCmdLineOption('capath', CaCertPath) or
+         FindCmdLineSwitch('cacert', CaCertPath, True) then
+      begin
+        Server.LoadCACertificate(CaCertPath);
+      end
+      else if Server.mTLSMode <> mtlsDisabled then
+      begin
+        var DefaultCa1 := TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt');
+        var DefaultCa2 := TPath.Combine(GetCurrentDir, 'test_certs\test_root_ca.crt');
+        if TFile.Exists(DefaultCa1) then
+          Server.LoadCACertificate(DefaultCa1)
+        else if TFile.Exists(DefaultCa2) then
+          Server.LoadCACertificate(DefaultCa2);
+      end;
+
+      Server.OnValidateClientCertificate :=
+        function(const CertInfo: TGClientCertInfo): Boolean
+        begin
+          Result := CertInfo.IsVerified and
+                    (not SameText(CertInfo.CommonName, 'RevokedOrNonWhitelistedClient')) and
+                    (not ContainsText(CertInfo.Subject, 'RevokedOrNonWhitelistedClient'));
+        end;
       Server.AllowedFileExtensions.Add('.txt');
       Server.AllowedFileExtensions.Add('.json');
       Server.AllowedFileExtensions.Add('.png');
@@ -833,6 +914,60 @@ begin
           AResponse.AddJSONContent('{"status":"ok","server":"GHttpsIOCPSvr","webtransport_enabled":true}');
         end);
 
+      Server.RegisterEndpointProc('/api/client-identity', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        var
+          JObj: TJSONObject;
+        begin
+          JObj := TJSONObject.Create;
+          try
+            JObj.AddPair('has_certificate', TJSONBool.Create(ARequest.ClientCertificate.HasCertificate));
+            JObj.AddPair('is_verified', TJSONBool.Create(ARequest.ClientCertificate.IsVerified));
+            JObj.AddPair('subject', ARequest.ClientCertificate.Subject);
+            JObj.AddPair('common_name', ARequest.ClientCertificate.CommonName);
+            JObj.AddPair('issuer', ARequest.ClientCertificate.Issuer);
+            JObj.AddPair('serial_number', ARequest.ClientCertificate.SerialNumber);
+            JObj.AddPair('thumbprint_sha256', ARequest.ClientCertificate.ThumbprintSHA256);
+            JObj.AddPair('san', ARequest.ClientCertificate.SAN);
+            JObj.AddPair('raw_cert_base64', ARequest.ClientCertificate.RawCertBase64);
+            var TraefikInfoStr: string := '';
+            if ARequest.ClientCertificate.HasCertificate then
+            begin
+              TraefikInfoStr := 'Subject="CN=' + ARequest.ClientCertificate.CommonName + '";Issuer="CN=' + ARequest.ClientCertificate.Issuer + '";SerialNumber="' + ARequest.ClientCertificate.SerialNumber + '"';
+              if ARequest.ClientCertificate.SAN <> '' then
+                TraefikInfoStr := TraefikInfoStr + ';SAN="' + ARequest.ClientCertificate.SAN + '"';
+            end;
+            JObj.AddPair('x_forwarded_tls_client_cert_info', TraefikInfoStr);
+            JObj.AddPair('validation_error', ARequest.ClientCertificate.ValidationError);
+            AResponse.AddJSONContent(JObj.ToString);
+          finally
+            JObj.Free;
+          end;
+        end);
+
+      Server.RegisterEndpointProc('/api/m2m/secure', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        begin
+          if (not ARequest.ClientCertificate.HasCertificate) or (not ARequest.ClientCertificate.IsVerified) then
+          begin
+            AResponse.SetForbidden('Client certificate required or untrusted');
+            Exit;
+          end;
+          AResponse.AddJSONContent('{"status":"authorized","client":"' + ARequest.ClientCertificate.CommonName + '"}');
+        end);
+
+      Server.RegisterEndpointProc('/api/public', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.AddJSONContent('{"status":"public_access_granted"}');
+        end);
+
       Server.RegisterEndpointProc('/echo', hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest;
                                    const AResponse: TResponse;
@@ -870,6 +1005,14 @@ begin
                                    AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetMethodNotAllowed('405 Method Not Allowed');
+        end);
+
+      Server.RegisterEndpointProc('/api/provoke-exception', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        begin
+          raise Exception.Create('Simulated unhandled Delphi exception for 500 test');
         end);
 
       Server.RegisterEndpointProc('/download', hmGET,

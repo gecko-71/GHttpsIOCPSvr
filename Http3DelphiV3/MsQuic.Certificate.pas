@@ -32,7 +32,7 @@ interface
 
 uses
   Winapi.Windows, System.SysUtils,
-  MsQuic.Types, MsQuic.Configuration;
+  MsQuic.Types, MsQuic.Configuration, WinApiAdditions;
 
 const
   CERT_STORE_PROV_SYSTEM        = Pointer(10);
@@ -55,22 +55,11 @@ const
   DEFAULT_QUIC_CERT_SUBJECT     = 'localhost';
 
 type
-  HCERTSTORE = Pointer;
-
-  CERT_CONTEXT = record
-    dwCertEncodingType: DWORD;
-    pbCertEncoded: PByte;
-    cbCertEncoded: DWORD;
-    pCertInfo: Pointer;
-    hCertStore: HCERTSTORE;
-  end;
-  PCCERT_CONTEXT = ^CERT_CONTEXT;
-
-  CRYPT_DATA_BLOB = record
-    cbData: DWORD;
-    pbData: PByte;
-  end;
-  PCRYPT_DATA_BLOB = ^CRYPT_DATA_BLOB;
+  HCERTSTORE = WinApiAdditions.HCERTSTORE;
+  CERT_CONTEXT = WinApiAdditions.CERT_CONTEXT;
+  PCCERT_CONTEXT = WinApiAdditions.PCCERT_CONTEXT;
+  CRYPT_DATA_BLOB = WinApiAdditions.CRYPT_DATA_BLOB;
+  PCRYPT_DATA_BLOB = WinApiAdditions.PCRYPT_DATA_BLOB;
 
   TMsQuicCertificate = class
   private
@@ -89,7 +78,9 @@ type
       const CertHashHex: string;
       const StoreName: string;
       ServerCertStore: HCERTSTORE = nil;
-      const CertSubjectName: string = ''
+      const CertSubjectName: string = '';
+      const AmTLSRequired: Boolean = False;
+      const AmTLSOptional: Boolean = False
     ): Boolean;
 
   end;
@@ -188,7 +179,9 @@ function TMsQuicCertificate.LoadServerCertificate(
   const CertHashHex: string;
   const StoreName: string;
   ServerCertStore: HCERTSTORE;
-  const CertSubjectName: string
+  const CertSubjectName: string;
+  const AmTLSRequired: Boolean;
+  const AmTLSOptional: Boolean
 ): Boolean;
 var
   hStoreToSearch, hTmpStore: HCERTSTORE;
@@ -270,9 +263,24 @@ begin
               FillChar(FCredConfig, SizeOf(FCredConfig), 0);
               FCredConfig.Type_ := QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12;
               FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
+              if AmTLSRequired or AmTLSOptional then
+                FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
               FCredConfig.Certificate := @FPkcs12;
 
               Result := AConfig.LoadCredential(@FCredConfig);
+              if (not Result) and (FCredConfig.Flags <> QUIC_CREDENTIAL_FLAG_NONE) then
+              begin
+                FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
+                Result := AConfig.LoadCredential(@FCredConfig);
+              end;
+              if (not Result) and (FCredConfig.Flags <> QUIC_CREDENTIAL_FLAG_NONE) then
+              begin
+                FillChar(FCredConfig, SizeOf(FCredConfig), 0);
+                FCredConfig.Type_ := QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12;
+                FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
+                FCredConfig.Certificate := @FPkcs12;
+                Result := AConfig.LoadCredential(@FCredConfig);
+              end;
             end;
           end;
         end;

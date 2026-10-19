@@ -59,6 +59,7 @@ type
     const AMethod, APath: string;
     const AHeaders: TArray<TPair<string, string>>;
     const ABody: TBytes;
+    const AClientCert: TGClientCertInfo;
     out AStatusCode: Integer;
     out AContentType: string;
     out AResponseBody: TBytes;
@@ -99,6 +100,7 @@ type
     property SettingQpackMaxTableCapacity: UInt64 read FSettingQpackMaxTableCapacity write FSettingQpackMaxTableCapacity;
     property SettingQpackBlockedStreams: UInt64 read FSettingQpackBlockedStreams write FSettingQpackBlockedStreams;
     property EnableDemoEndpoints: Boolean read FEnableDemoEndpoints write FEnableDemoEndpoints;
+    property QuicServer: TQuicServer read FQuicServer;
   end;
 
 implementation
@@ -679,8 +681,13 @@ begin
             end;
           else
             begin
-              CloseConnectionWithError(ConnCtx.Connection, H3_FRAME_UNEXPECTED);
-              Exit;
+              if (FrameType = HTTP3_FRAME_DATA) or (FrameType = HTTP3_FRAME_HEADERS) or
+                 (FrameType = HTTP3_FRAME_PUSH_PROMISE) or (FrameType = $02) or
+                 (FrameType = $06) or (FrameType = $08) or (FrameType = $09) then
+              begin
+                CloseConnectionWithError(ConnCtx.Connection, H3_FRAME_UNEXPECTED);
+                Exit;
+              end;
             end;
         end;
       end;
@@ -809,7 +816,7 @@ begin
                   var OutContentType: string := 'text/plain';
                   var OutBody: TBytes := nil;
                   var OutExtra: TArray<TPair<string, string>> := nil;
-                  FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, nil, OutStatus, OutContentType, OutBody, OutExtra);
+                  FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, nil, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
                   if OutStatus <> 404 then
                   begin
                     SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
@@ -896,7 +903,7 @@ begin
             var OutContentType: string := 'text/plain';
             var OutBody: TBytes := nil;
             var OutExtra: TArray<TPair<string, string>> := nil;
-            FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, StreamState.RequestBody, OutStatus, OutContentType, OutBody, OutExtra);
+            FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, StreamState.RequestBody, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
             SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
           end
           else

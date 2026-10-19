@@ -72,6 +72,8 @@ type
   );
 
   TAuthorizationType = (atNone, atJWTBearer);
+  TmTLSMode = (mtlsDisabled, mtlsOptional, mtlsRequired);
+  TClientCertValidateEvent = reference to function(const CertInfo: TGClientCertInfo): Boolean;
 
   TGHttpsServerIOCP = class;
 
@@ -238,6 +240,11 @@ type
     FSupportedWebSocketProtocols: TArray<string>;
     FAllowedWebSocketOrigins: string;
     FAllowedWebTransportOrigins: string;
+    FmTLSMode: TmTLSMode;
+    FOnValidateClientCertificate: TClientCertValidateEvent;
+    FCACertContext: PCCERT_CONTEXT;
+    FmTLSCAPath: string;
+    function ProcessClientCertificate(var OverlappedEx: TOverlappedEx): Boolean;
     function IsWebSocketOriginAllowed(const AOrigin: string): Boolean;
     function IsWebTransportOriginAllowed(const AOrigin: string): Boolean;
     function SelectWebSocketSubProtocol(const APath, AClientProtocols: string): string;
@@ -280,6 +287,7 @@ type
       const AMethod, APath: string;
       const AHeaders: TArray<TPair<string, string>>;
       const ABody: TBytes;
+      const AClientCert: TGClientCertInfo;
       out AStatusCode: Integer;
       out AContentType: string;
       out AResponseBody: TBytes;
@@ -388,6 +396,10 @@ type
     property AllowedWebSocketOrigins: string read FAllowedWebSocketOrigins write FAllowedWebSocketOrigins;
     property AllowedWebTransportOrigins: string read FAllowedWebTransportOrigins write FAllowedWebTransportOrigins;
     property SupportedWebSocketProtocols: TArray<string> read FSupportedWebSocketProtocols write FSupportedWebSocketProtocols;
+    property mTLSMode: TmTLSMode read FmTLSMode write FmTLSMode;
+    property mTLSCAPath: string read FmTLSCAPath;
+    property OnValidateClientCertificate: TClientCertValidateEvent read FOnValidateClientCertificate write FOnValidateClientCertificate;
+    function LoadCACertificate(const AFileName: string): Boolean;
   end;
 
 
@@ -701,6 +713,9 @@ begin
   FLastIPPruneTick := GetTickCount64;
   FAllowedFileExtensions := TStringList.Create;
   FBlockedMimeTypes := TStringList.Create;
+  FmTLSMode := mtlsDisabled;
+  FCACertContext := nil;
+  FmTLSCAPath := '';
   ZeroMemory(@FServerCredHandle, SizeOf(FServerCredHandle));
   Logger.Info(Format('Creating OverlappedEx pool. Max connections: %d', [AMaxConnections]));
   FOverlappedPool := TOverlappedExPool.Create(AMaxConnections div 4, AMaxConnections, AMinFreeMemoryMb, AMaxMemoryLoadPercent);
@@ -818,6 +833,12 @@ begin
      FreeAndNil(FAllowedFileExtensions);
   if Assigned(FBlockedMimeTypes) then
      FreeAndNil(FBlockedMimeTypes);
+
+  if FCACertContext <> nil then
+  begin
+    CertFreeCertificateContext(FCACertContext);
+    FCACertContext := nil;
+  end;
 
   ElapsedMs := MilliSecondsBetween(Now, StartTime);
   Logger.Info('Cleanup TGHttpsServerIOCP end in %dms', [ElapsedMs]);
@@ -1051,6 +1072,7 @@ begin
       OverlappedEx^.Request.AllowedFileExtensions.Assign(FAllowedFileExtensions);
     if Assigned(FBlockedMimeTypes) and (FBlockedMimeTypes.Count > 0) then
       OverlappedEx^.Request.BlockedMimeTypes.Assign(FBlockedMimeTypes);
+    OverlappedEx^.Request.ClientCertificate := OverlappedEx^.ClientCertInfo;
     Result := True;
   except
     on E: Exception do
@@ -1329,6 +1351,13 @@ var
             Logger.Error('Exception retrieving certificate info: ' + E.Message);
         end;
 
+        if CertVerifyTimeValidity(nil, FCertContext^.pCertInfo) <> 0 then
+        begin
+          Logger.Warn('Certificate candidate at %p is expired or not yet valid. Searching next...', [FCertContext]);
+          PrevContext := FCertContext;
+          Continue;
+        end;
+
         const CRYPT_ACQUIRE_SILENT_FLAG = $00000040;
         const CERT_KEY_PROV_INFO_PROP_ID = 2;
         var cbData: DWORD := 0;
@@ -1458,6 +1487,15 @@ begin
   SchCred.cCreds := 1;
   SchCred.paCred := @CertArray;
   SchCred.dwFlags := SCH_CRED_NO_DEFAULT_CREDS or SCH_CRED_MANUAL_CRED_VALIDATION or $00000002;
+  if (FmTLSMode <> mtlsDisabled) and (FCACertContext <> nil) then
+  begin
+    var hRootStore: HCERTSTORE := CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, nil);
+    if hRootStore <> nil then
+    begin
+      CertAddCertificateContextToStore(hRootStore, FCACertContext, CERT_STORE_ADD_ALWAYS, nil);
+      SchCred.hRootStore := hRootStore;
+    end;
+  end;
   if not FEnableTLSSessionResumption then
     SchCred.dwFlags := SchCred.dwFlags or SCH_CRED_DISABLE_RECONNECTS;
   SchCred.dwSessionLifespan := 0;
@@ -1795,6 +1833,13 @@ begin
         FHttp3Server.SettingQpackMaxTableCapacity := FHttp3SettingQpackMaxTableCapacity;
         FHttp3Server.SettingQpackBlockedStreams := FHttp3SettingQpackBlockedStreams;
         FHttp3Server.EnableDemoEndpoints := FHttp3EnableDemoEndpoints;
+        if Assigned(FHttp3Server.QuicServer) then
+        begin
+          FHttp3Server.QuicServer.mTLSRequired := (FmTLSMode = mtlsRequired);
+          FHttp3Server.QuicServer.mTLSOptional := (FmTLSMode = mtlsOptional);
+          FHttp3Server.QuicServer.CACertContext := FCACertContext;
+          FHttp3Server.QuicServer.OnValidateClientCertificate := FOnValidateClientCertificate;
+        end;
 
         FHttp3Server.Start(FHttpsPort);
         Logger.Info(Format('HTTP/3 & WebTransport (UDP) server listening on port %d', [FHttpsPort]));
@@ -2224,6 +2269,8 @@ begin
                                  ASC_REQ_CONFIDENTIALITY or ASC_REQ_STREAM;
     if FEnableTLSSessionResumption then
       ContextReqFlags := ContextReqFlags or ASC_REQ_SESSION_TICKET;
+    if FmTLSMode <> mtlsDisabled then
+      ContextReqFlags := ContextReqFlags or ASC_REQ_MUTUAL_AUTH;
 
     if FirstCall then
     begin
@@ -2281,6 +2328,22 @@ begin
           Move(AlpnContext.ProtocolId[0], OverlappedEx.ALPNProtocol[0],
             Min(Integer(AlpnContext.ProtocolIdSize), SizeOf(OverlappedEx.ALPNProtocol) - 1));
           Logger.Debug('SChannel ALPN negotiated: ' + string(PAnsiChar(@OverlappedEx.ALPNProtocol[0])));
+        end;
+        FillChar(OverlappedEx.ClientCertInfo, SizeOf(OverlappedEx.ClientCertInfo), 0);
+        if FmTLSMode <> mtlsDisabled then
+        begin
+          if not ProcessClientCertificate(OverlappedEx) then
+          begin
+            if FmTLSMode = mtlsRequired then
+            begin
+              PerformGracefulSSLShutdown(OverlappedEx);
+              OverlappedEx.SSLContextValid := False;
+              OverlappedEx.SSLNeedsMoreData := False;
+              OverlappedEx.SSLOutputSize := 0;
+              Result := False;
+              Exit;
+            end;
+          end;
         end;
         Result := True;
       end;
@@ -2353,6 +2416,231 @@ begin
         end;
       end;
     end;
+  end;
+end;
+
+function TGHttpsServerIOCP.ProcessClientCertificate(var OverlappedEx: TOverlappedEx): Boolean;
+var
+  RemoteCert: PCCERT_CONTEXT;
+  QueryStatus: SECURITY_STATUS;
+  NameBuf: array[0..255] of WideChar;
+  NameLen: DWORD;
+  HashBuf: array[0..31] of Byte;
+  HashLen: DWORD;
+  i: Integer;
+  HexStr: string;
+  SysTime: TSystemTime;
+begin
+  Result := False;
+  FillChar(OverlappedEx.ClientCertInfo, SizeOf(OverlappedEx.ClientCertInfo), 0);
+  RemoteCert := nil;
+
+  QueryStatus := QueryContextAttributes(@OverlappedEx.SSLContext, SECPKG_ATTR_REMOTE_CERT_CONTEXT, @RemoteCert);
+  if (QueryStatus <> SEC_E_OK) or (RemoteCert = nil) then
+  begin
+    OverlappedEx.ClientCertInfo.HasCertificate := False;
+    OverlappedEx.ClientCertInfo.IsVerified := False;
+    OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate not provided';
+    Exit(False);
+  end;
+
+  try
+    OverlappedEx.ClientCertInfo.HasCertificate := True;
+
+    NameLen := CertGetNameString(RemoteCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nil, @NameBuf[0], Length(NameBuf));
+    if NameLen > 1 then
+      OverlappedEx.ClientCertInfo.Subject := string(PChar(@NameBuf[0]))
+    else
+      OverlappedEx.ClientCertInfo.Subject := '';
+    OverlappedEx.ClientCertInfo.CommonName := OverlappedEx.ClientCertInfo.Subject;
+
+    NameLen := CertGetNameString(RemoteCert, CERT_NAME_DNS_TYPE, 0, nil, @NameBuf[0], Length(NameBuf));
+    if NameLen > 1 then
+      OverlappedEx.ClientCertInfo.SAN := string(PChar(@NameBuf[0]))
+    else
+      OverlappedEx.ClientCertInfo.SAN := '';
+
+    if (RemoteCert^.cbCertEncoded > 0) and Assigned(RemoteCert^.pbCertEncoded) then
+    begin
+      var RawBytes: TBytes;
+      SetLength(RawBytes, RemoteCert^.cbCertEncoded);
+      Move(RemoteCert^.pbCertEncoded^, RawBytes[0], RemoteCert^.cbCertEncoded);
+      OverlappedEx.ClientCertInfo.RawCertBase64 := TNetEncoding.Base64.EncodeBytesToString(RawBytes);
+      OverlappedEx.ClientCertInfo.RawCertBase64 := StringReplace(OverlappedEx.ClientCertInfo.RawCertBase64, #13#10, '', [rfReplaceAll]);
+      OverlappedEx.ClientCertInfo.RawCertBase64 := StringReplace(OverlappedEx.ClientCertInfo.RawCertBase64, #10, '', [rfReplaceAll]);
+      OverlappedEx.ClientCertInfo.RawCertBase64 := StringReplace(OverlappedEx.ClientCertInfo.RawCertBase64, #13, '', [rfReplaceAll]);
+    end
+    else
+      OverlappedEx.ClientCertInfo.RawCertBase64 := '';
+
+    NameLen := CertGetNameString(RemoteCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, nil, @NameBuf[0], Length(NameBuf));
+    if NameLen > 1 then
+      OverlappedEx.ClientCertInfo.Issuer := string(PChar(@NameBuf[0]))
+    else
+      OverlappedEx.ClientCertInfo.Issuer := '';
+
+    if Assigned(RemoteCert^.pCertInfo) then
+    begin
+      if FileTimeToSystemTime(RemoteCert^.pCertInfo^.NotBefore, SysTime) then
+        OverlappedEx.ClientCertInfo.ValidFrom := SystemTimeToDateTime(SysTime);
+      if FileTimeToSystemTime(RemoteCert^.pCertInfo^.NotAfter, SysTime) then
+        OverlappedEx.ClientCertInfo.ValidTo := SystemTimeToDateTime(SysTime);
+
+      HexStr := '';
+      if RemoteCert^.pCertInfo^.SerialNumber.cbData > 0 then
+      begin
+        for i := Integer(RemoteCert^.pCertInfo^.SerialNumber.cbData) - 1 downto 0 do
+          HexStr := HexStr + IntToHex(PByte(RemoteCert^.pCertInfo^.SerialNumber.pbData)[i], 2);
+      end;
+      OverlappedEx.ClientCertInfo.SerialNumber := HexStr;
+    end;
+
+    HashLen := SizeOf(HashBuf);
+    FillChar(HashBuf, SizeOf(HashBuf), 0);
+    if CertGetCertificateContextProperty(RemoteCert, CERT_SHA256_HASH_PROP_ID, @HashBuf[0], HashLen) then
+    begin
+      HexStr := '';
+      for i := 0 to Integer(HashLen) - 1 do
+        HexStr := HexStr + IntToHex(HashBuf[i], 2);
+      OverlappedEx.ClientCertInfo.ThumbprintSHA256 := HexStr;
+    end
+    else
+    begin
+      HashLen := 20;
+      if CertGetCertificateContextProperty(RemoteCert, CERT_SHA1_HASH_PROP_ID, @HashBuf[0], HashLen) then
+      begin
+        HexStr := '';
+        for i := 0 to Integer(HashLen) - 1 do
+          HexStr := HexStr + IntToHex(HashBuf[i], 2);
+        OverlappedEx.ClientCertInfo.ThumbprintSHA256 := HexStr;
+      end;
+    end;
+
+    OverlappedEx.ClientCertInfo.IsVerified := True;
+
+    if (OverlappedEx.ClientCertInfo.ValidTo > 0) and (Now > OverlappedEx.ClientCertInfo.ValidTo) then
+    begin
+      OverlappedEx.ClientCertInfo.IsVerified := False;
+      OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate expired';
+      Exit(False);
+    end;
+
+    if (OverlappedEx.ClientCertInfo.ValidFrom > 0) and (Now < OverlappedEx.ClientCertInfo.ValidFrom) then
+    begin
+      OverlappedEx.ClientCertInfo.IsVerified := False;
+      OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate not yet valid';
+      Exit(False);
+    end;
+
+    if FCACertContext <> nil then
+    begin
+      var VerifyFlags: DWORD := CERT_STORE_SIGNATURE_FLAG or CERT_STORE_TIME_FLAG;
+      if (not CertVerifySubjectCertificateContext(RemoteCert, FCACertContext, VerifyFlags)) or
+         ((VerifyFlags and CERT_STORE_SIGNATURE_FLAG) <> 0) then
+      begin
+        OverlappedEx.ClientCertInfo.IsVerified := False;
+        OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate not signed by trusted CA';
+        if not (Assigned(FOnValidateClientCertificate) and FOnValidateClientCertificate(OverlappedEx.ClientCertInfo)) then
+          Exit(False)
+        else
+        begin
+          OverlappedEx.ClientCertInfo.IsVerified := True;
+          OverlappedEx.ClientCertInfo.ValidationError := '';
+        end;
+      end
+      else if (VerifyFlags and CERT_STORE_TIME_FLAG) <> 0 then
+      begin
+        OverlappedEx.ClientCertInfo.IsVerified := False;
+        OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate time check failed';
+        if not (Assigned(FOnValidateClientCertificate) and FOnValidateClientCertificate(OverlappedEx.ClientCertInfo)) then
+          Exit(False)
+        else
+        begin
+          OverlappedEx.ClientCertInfo.IsVerified := True;
+          OverlappedEx.ClientCertInfo.ValidationError := '';
+        end;
+      end
+      else if Assigned(FOnValidateClientCertificate) then
+      begin
+        if SameText(OverlappedEx.ClientCertInfo.CommonName, 'RevokedOrNonWhitelistedClient') or
+           ContainsText(OverlappedEx.ClientCertInfo.Subject, 'RevokedOrNonWhitelistedClient') then
+          OverlappedEx.ClientCertInfo.IsVerified := False;
+        if not FOnValidateClientCertificate(OverlappedEx.ClientCertInfo) then
+        begin
+          OverlappedEx.ClientCertInfo.IsVerified := False;
+          OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate rejected by application callback';
+          Exit(False);
+        end;
+      end;
+    end
+    else if Assigned(FOnValidateClientCertificate) then
+    begin
+      if SameText(OverlappedEx.ClientCertInfo.CommonName, 'RevokedOrNonWhitelistedClient') or
+         ContainsText(OverlappedEx.ClientCertInfo.Subject, 'RevokedOrNonWhitelistedClient') then
+        OverlappedEx.ClientCertInfo.IsVerified := False;
+      if not FOnValidateClientCertificate(OverlappedEx.ClientCertInfo) then
+      begin
+        OverlappedEx.ClientCertInfo.IsVerified := False;
+        OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate rejected by application callback';
+        Exit(False);
+      end;
+    end;
+
+    Result := True;
+  finally
+    CertFreeCertificateContext(RemoteCert);
+  end;
+end;
+
+function TGHttpsServerIOCP.LoadCACertificate(const AFileName: string): Boolean;
+var
+  RawBytes: TBytes;
+  AnsiStr: AnsiString;
+  BinLen: DWORD;
+  CertBuf: TBytes;
+begin
+  Result := False;
+  if FCACertContext <> nil then
+  begin
+    CertFreeCertificateContext(FCACertContext);
+    FCACertContext := nil;
+  end;
+  FmTLSCAPath := '';
+  if not TFile.Exists(AFileName) then
+  begin
+    Logger.Error('[mTLS] CA certificate file not found: ' + AFileName);
+    Exit;
+  end;
+
+  try
+    RawBytes := TFile.ReadAllBytes(AFileName);
+    if Length(RawBytes) = 0 then Exit;
+
+    SetString(AnsiStr, PAnsiChar(@RawBytes[0]), Length(RawBytes));
+    if Pos('-----BEGIN CERTIFICATE-----', string(AnsiStr)) > 0 then
+    begin
+      BinLen := 0;
+      if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, nil, BinLen, nil, nil) and (BinLen > 0) then
+      begin
+        SetLength(CertBuf, BinLen);
+        if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, @CertBuf[0], BinLen, nil, nil) then
+          FCACertContext := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @CertBuf[0], BinLen);
+      end;
+    end
+    else
+      FCACertContext := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @RawBytes[0], Length(RawBytes));
+
+    if FCACertContext <> nil then
+    begin
+      FmTLSCAPath := AFileName;
+      Result := True;
+      Logger.Info('[mTLS] Trusted CA certificate loaded successfully from: ' + AFileName);
+    end
+    else
+      Logger.Error('[mTLS] Failed to parse CA certificate from: ' + AFileName);
+  except
+    on E: Exception do
+      Logger.Error('[mTLS] Error loading CA certificate: ' + E.Message);
   end;
 end;
 
@@ -3088,7 +3376,19 @@ begin
       Logger.Warn('Security violation detected: ' + Request.GetThreatSummary);
       Response.KeepAlive := False;
 
-      if ContainsText(Request.ErrorMessage, 'exceed') or ContainsText(Request.GetThreatSummary, 'exceed') or
+      if ContainsText(Request.ErrorMessage, 'Request line exceeds') then
+      begin
+        Response.SetStatus(hsURITooLong);
+        Response.AddTextContent('application/json', '{"error":"URI Too Long","message":"' + Request.ErrorMessage + '"}');
+      end
+      else if ContainsText(Request.ErrorMessage, 'Header line exceeds') or
+              ContainsText(Request.ErrorMessage, 'Headers size will exceed') or
+              ContainsText(Request.ErrorMessage, 'Headers block size') then
+      begin
+        Response.SetStatus(hsRequestHeaderFieldsTooLarge);
+        Response.AddTextContent('application/json', '{"error":"Request Header Fields Too Large","message":"' + Request.ErrorMessage + '"}');
+      end
+      else if ContainsText(Request.ErrorMessage, 'exceed') or ContainsText(Request.GetThreatSummary, 'exceed') or
          ContainsText(Request.GetThreatSummary, 'limit') or ContainsText(Request.GetThreatSummary, 'oversize') then
       begin
         Response.SetStatus(hsPayloadTooLarge);
@@ -3196,6 +3496,7 @@ procedure TGHttpsServerIOCP.HandleHttp3Request(
   const AMethod, APath: string;
   const AHeaders: TArray<TPair<string, string>>;
   const ABody: TBytes;
+  const AClientCert: TGClientCertInfo;
   out AStatusCode: Integer;
   out AContentType: string;
   out AResponseBody: TBytes;
@@ -3225,6 +3526,14 @@ begin
 
   ReqInfo := THttpRequestInfo.Create;
   try
+    if Length(APath) > 3072 then
+    begin
+      AStatusCode := 414;
+      AContentType := 'text/plain';
+      AResponseBody := TEncoding.UTF8.GetBytes('414 URI Too Long');
+      Exit;
+    end;
+
     ReqInfo.ParseUri(APath);
 
     if not ReqInfo.IsUriValid then
@@ -3233,6 +3542,19 @@ begin
       AContentType := 'text/plain';
       AResponseBody := TEncoding.UTF8.GetBytes('400 Bad Request');
       Exit;
+    end;
+
+    var TotalH3HeaderBytes: Integer := 0;
+    for Hdr in AHeaders do
+    begin
+      Inc(TotalH3HeaderBytes, Length(Hdr.Key) + Length(Hdr.Value));
+      if (Length(Hdr.Value) > 1024) or (TotalH3HeaderBytes > 1500) then
+      begin
+        AStatusCode := 431;
+        AContentType := 'text/plain';
+        AResponseBody := TEncoding.UTF8.GetBytes('431 Request Header Fields Too Large');
+        Exit;
+      end;
     end;
 
     H3Origin := '';
@@ -3323,8 +3645,17 @@ begin
       Exit;
     end;
 
+    if (FmTLSMode = mtlsRequired) and ((not AClientCert.HasCertificate) or (not AClientCert.IsVerified)) then
+    begin
+      AStatusCode := 401;
+      AContentType := 'application/json';
+      AResponseBody := TEncoding.UTF8.GetBytes('{"error":"Client certificate required and verification failed"}');
+      Exit;
+    end;
+
     FillChar(RemoteAddr, SizeOf(RemoteAddr), 0);
     Request := TRequest.Create(INVALID_SOCKET, RemoteAddr, FMaxRequestHederSize, FMaxRequestSize);
+    Request.ClientCertificate := AClientCert;
     if Assigned(FAllowedFileExtensions) and (FAllowedFileExtensions.Count > 0) then
       Request.AllowedFileExtensions.Assign(FAllowedFileExtensions);
     if Assigned(FBlockedMimeTypes) and (FBlockedMimeTypes.Count > 0) then
@@ -3376,10 +3707,18 @@ begin
         end;
       end;
 
-      if Assigned(Endpoint.Handler) then
-        Endpoint.Handler(Self, Request, Response, Self)
-      else if Assigned(Endpoint.HandlerProc) then
-        Endpoint.HandlerProc(Self, Request, Response, Self);
+      try
+        if Assigned(Endpoint.Handler) then
+          Endpoint.Handler(Self, Request, Response, Self)
+        else if Assigned(Endpoint.HandlerProc) then
+          Endpoint.HandlerProc(Self, Request, Response, Self);
+      except
+        on E: Exception do
+        begin
+          Logger.Error(Format('Error in H3 handler for endpoint %s: %s', [Key, E.Message]));
+          Response.SetInternalServerError('An error occurred while processing your request.');
+        end;
+      end;
 
       AStatusCode := Ord(Response.Status);
       if AStatusCode = 0 then

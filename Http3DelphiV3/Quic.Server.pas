@@ -29,6 +29,7 @@ unit Quic.Server;
 {$ENDIF}
 {$ALIGN 8}
 {$MINENUMSIZE 4}
+{$POINTERMATH ON}
 
 interface
 
@@ -37,9 +38,11 @@ uses
   System.Classes,
   System.SyncObjs,
   System.Generics.Collections,
+  System.NetEncoding,
   Winapi.Winsock2,
   Winapi.Windows,
   Winapi.PsAPI,
+  GRequest,
   MsQuic.Types,
   MsQuic.ApiTable,
   MsQuic.Loader,
@@ -48,7 +51,8 @@ uses
   MsQuic.Certificate,
   MsQuic.Listener,
   MsQuic.Errors,
-  Quick.Logger;
+  Quick.Logger,
+  WinApiAdditions;
 
 const
   QUIC_SEND_FLAG_NONE                = $0000;
@@ -74,6 +78,7 @@ type
     AppContext: Pointer;
     NegotiatedAlpn: AnsiString;
     ConnId: Int64;
+    ClientCertInfo: TGClientCertInfo;
   end;
 
   TQuicConnectionEvent = procedure(Sender: TObject; Connection: HQUIC; ConnCtx: PConnectionContext; const NegotiatedAlpn: AnsiString) of object;
@@ -109,6 +114,10 @@ type
     FAllConnsClosed:            TEvent;
     FShuttingDown:              Integer;
     FGracefulShutdownTimeoutMs: Integer;
+    FmTLSRequired:              Boolean;
+    FmTLSOptional:              Boolean;
+    FCACertContext:             WinApiAdditions.PCCERT_CONTEXT;
+    FOnValidateClientCertificate: TClientCertValidateEvent;
     procedure OnNewConnection(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO);
   public
     FSendCtxAllocated: Integer;
@@ -141,6 +150,10 @@ type
     property Registration: TMsQuicRegistration read FRegistration;
     property Configuration: TMsQuicConfiguration read FConfiguration;
     property Listener: TMsQuicListener read FListener;
+    property mTLSRequired: Boolean read FmTLSRequired write FmTLSRequired;
+    property mTLSOptional: Boolean read FmTLSOptional write FmTLSOptional;
+    property CACertContext: WinApiAdditions.PCCERT_CONTEXT read FCACertContext write FCACertContext;
+    property OnValidateClientCertificate: TClientCertValidateEvent read FOnValidateClientCertificate write FOnValidateClientCertificate;
   end;
 
 implementation
@@ -190,6 +203,7 @@ begin
   ConnCtx.Connection := Connection;
   ConnCtx.AppContext := nil;
   ConnCtx.ConnId := TInterlocked.Increment(FConnSeqId);
+  FillChar(ConnCtx.ClientCertInfo, SizeOf(ConnCtx.ClientCertInfo), 0);
   if (Info <> nil) and (Info.NegotiatedAlpnLength > 0) and
              (Info.NegotiatedAlpn <> nil) then
     SetString(ConnCtx.NegotiatedAlpn, PAnsiChar(Info.NegotiatedAlpn), Info.NegotiatedAlpnLength)
@@ -214,6 +228,16 @@ var
   Server: TQuicServer;
   RemainingCount: Integer;
   SendCtx: PQuicSendContext;
+  RemoteCert: WinApiAdditions.PCCERT_CONTEXT;
+  NameBuf: array[0..255] of WideChar;
+  NameLen: DWORD;
+  HashBuf: array[0..31] of Byte;
+  HashLen: DWORD;
+  i: Integer;
+  HexStr: string;
+  SysTime: TSystemTime;
+  RawBytes: TBytes;
+  VerifyFlags: DWORD;
 begin
   Result := 0;
   try
@@ -229,6 +253,146 @@ begin
         begin
           if Assigned(Server.FOnConnectionOpened) then
             Server.FOnConnectionOpened(Server, Connection, ConnCtx, ConnCtx.NegotiatedAlpn);
+        end;
+
+      QUIC_CONNECTION_EVENT_PEER_CERTIFICATE_RECEIVED:
+        begin
+          if (Event.PeerCertificate <> nil) and
+             (PQUIC_BUFFER(Event.PeerCertificate)^.Buffer <> nil) and
+             (PQUIC_BUFFER(Event.PeerCertificate)^.Length > 0) then
+          begin
+            RemoteCert := WinApiAdditions.CertCreateCertificateContext(
+              X509_ASN_ENCODING or PKCS_7_ASN_ENCODING,
+              PQUIC_BUFFER(Event.PeerCertificate)^.Buffer,
+              PQUIC_BUFFER(Event.PeerCertificate)^.Length
+            );
+            if RemoteCert <> nil then
+            try
+              ConnCtx.ClientCertInfo.HasCertificate := True;
+
+              NameLen := WinApiAdditions.CertGetNameString(RemoteCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nil, @NameBuf[0], Length(NameBuf));
+              if NameLen > 1 then
+                ConnCtx.ClientCertInfo.Subject := string(PChar(@NameBuf[0]))
+              else
+                ConnCtx.ClientCertInfo.Subject := '';
+              ConnCtx.ClientCertInfo.CommonName := ConnCtx.ClientCertInfo.Subject;
+
+              NameLen := WinApiAdditions.CertGetNameString(RemoteCert, CERT_NAME_DNS_TYPE, 0, nil, @NameBuf[0], Length(NameBuf));
+              if NameLen > 1 then
+                ConnCtx.ClientCertInfo.SAN := string(PChar(@NameBuf[0]))
+              else
+                ConnCtx.ClientCertInfo.SAN := '';
+
+              if (RemoteCert^.cbCertEncoded > 0) and Assigned(RemoteCert^.pbCertEncoded) then
+              begin
+                SetLength(RawBytes, RemoteCert^.cbCertEncoded);
+                Move(RemoteCert^.pbCertEncoded^, RawBytes[0], RemoteCert^.cbCertEncoded);
+                ConnCtx.ClientCertInfo.RawCertBase64 := TNetEncoding.Base64.EncodeBytesToString(RawBytes);
+                ConnCtx.ClientCertInfo.RawCertBase64 := StringReplace(ConnCtx.ClientCertInfo.RawCertBase64, #13#10, '', [rfReplaceAll]);
+                ConnCtx.ClientCertInfo.RawCertBase64 := StringReplace(ConnCtx.ClientCertInfo.RawCertBase64, #10, '', [rfReplaceAll]);
+                ConnCtx.ClientCertInfo.RawCertBase64 := StringReplace(ConnCtx.ClientCertInfo.RawCertBase64, #13, '', [rfReplaceAll]);
+              end
+              else
+                ConnCtx.ClientCertInfo.RawCertBase64 := '';
+
+              NameLen := WinApiAdditions.CertGetNameString(RemoteCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, nil, @NameBuf[0], Length(NameBuf));
+              if NameLen > 1 then
+                ConnCtx.ClientCertInfo.Issuer := string(PChar(@NameBuf[0]))
+              else
+                ConnCtx.ClientCertInfo.Issuer := '';
+
+              if Assigned(RemoteCert^.pCertInfo) then
+              begin
+                if FileTimeToSystemTime(RemoteCert^.pCertInfo^.NotBefore, SysTime) then
+                  ConnCtx.ClientCertInfo.ValidFrom := SystemTimeToDateTime(SysTime);
+                if FileTimeToSystemTime(RemoteCert^.pCertInfo^.NotAfter, SysTime) then
+                  ConnCtx.ClientCertInfo.ValidTo := SystemTimeToDateTime(SysTime);
+
+                HexStr := '';
+                if RemoteCert^.pCertInfo^.SerialNumber.cbData > 0 then
+                begin
+                  for i := Integer(RemoteCert^.pCertInfo^.SerialNumber.cbData) - 1 downto 0 do
+                    HexStr := HexStr + IntToHex(PByte(RemoteCert^.pCertInfo^.SerialNumber.pbData)[i], 2);
+                end;
+                ConnCtx.ClientCertInfo.SerialNumber := HexStr;
+              end;
+
+              HashLen := SizeOf(HashBuf);
+              FillChar(HashBuf, SizeOf(HashBuf), 0);
+              if WinApiAdditions.CertGetCertificateContextProperty(RemoteCert, CERT_SHA256_HASH_PROP_ID, @HashBuf[0], HashLen) then
+              begin
+                HexStr := '';
+                for i := 0 to Integer(HashLen) - 1 do
+                  HexStr := HexStr + IntToHex(HashBuf[i], 2);
+                ConnCtx.ClientCertInfo.ThumbprintSHA256 := HexStr;
+              end
+              else
+              begin
+                HashLen := 20;
+                if WinApiAdditions.CertGetCertificateContextProperty(RemoteCert, CERT_SHA1_HASH_PROP_ID, @HashBuf[0], HashLen) then
+                begin
+                  HexStr := '';
+                  for i := 0 to Integer(HashLen) - 1 do
+                    HexStr := HexStr + IntToHex(HashBuf[i], 2);
+                  ConnCtx.ClientCertInfo.ThumbprintSHA256 := HexStr;
+                end;
+              end;
+
+              ConnCtx.ClientCertInfo.IsVerified := (Event.DeferredStatus = 0);
+              if not ConnCtx.ClientCertInfo.IsVerified then
+                ConnCtx.ClientCertInfo.ValidationError := Format('TLS validation failed with status 0x%x', [Event.DeferredStatus]);
+
+              if (ConnCtx.ClientCertInfo.ValidTo > 0) and (Now > ConnCtx.ClientCertInfo.ValidTo) then
+              begin
+                ConnCtx.ClientCertInfo.IsVerified := False;
+                ConnCtx.ClientCertInfo.ValidationError := 'Client certificate expired';
+              end;
+
+              if (ConnCtx.ClientCertInfo.ValidFrom > 0) and (Now < ConnCtx.ClientCertInfo.ValidFrom) then
+              begin
+                ConnCtx.ClientCertInfo.IsVerified := False;
+                ConnCtx.ClientCertInfo.ValidationError := 'Client certificate not yet valid';
+              end;
+
+              var CaSigned: Boolean := False;
+              if (Server <> nil) and (Server.FCACertContext <> nil) then
+              begin
+                VerifyFlags := CERT_STORE_SIGNATURE_FLAG or CERT_STORE_TIME_FLAG;
+                if WinApiAdditions.CertVerifySubjectCertificateContext(RemoteCert, Server.FCACertContext, VerifyFlags) and
+                   ((VerifyFlags and (CERT_STORE_SIGNATURE_FLAG or CERT_STORE_TIME_FLAG)) = 0) then
+                  CaSigned := True;
+              end;
+
+              if (Server <> nil) and Assigned(Server.FOnValidateClientCertificate) then
+              begin
+                ConnCtx.ClientCertInfo.IsVerified := CaSigned and
+                  (not SameText(ConnCtx.ClientCertInfo.CommonName, 'RevokedOrNonWhitelistedClient'));
+                if not Server.FOnValidateClientCertificate(ConnCtx.ClientCertInfo) then
+                begin
+                  ConnCtx.ClientCertInfo.IsVerified := False;
+                  ConnCtx.ClientCertInfo.ValidationError := 'Client certificate rejected by application callback';
+                end
+                else
+                begin
+                  ConnCtx.ClientCertInfo.IsVerified := True;
+                  ConnCtx.ClientCertInfo.ValidationError := '';
+                end;
+              end
+              else if (Server <> nil) and (Server.FCACertContext <> nil) and (not CaSigned) then
+              begin
+                ConnCtx.ClientCertInfo.IsVerified := False;
+                ConnCtx.ClientCertInfo.ValidationError := 'Client certificate not signed by trusted CA';
+              end;
+
+              if (Server <> nil) and Server.mTLSRequired and (not ConnCtx.ClientCertInfo.IsVerified) then
+              begin
+                Result := $80090325;
+                Exit;
+              end;
+            finally
+              WinApiAdditions.CertFreeCertificateContext(RemoteCert);
+            end;
+          end;
         end;
 
       QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
@@ -414,7 +578,7 @@ begin
   FConfiguration := TMsQuicConfiguration.Create(FMsQuic.Api, FRegistration, FAlpnProtocol, @Settings);
   Logger.Info('MsQuic configuration opened with SendBufferingEnabled=0 (msh3 pattern). Handle: %p', [FConfiguration.Handle]);
   FCertificate := TMsQuicCertificate.Create;
-  if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName) then
+  if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName, FmTLSRequired, FmTLSOptional) then
   begin
     Logger.Error('Error loading certificate from store or binding it to configuration.');
     raise EMsQuicError.Create('Fatal: Failed to load TLS certificate or bind it to configuration. Server cannot start.', $80004005);
@@ -440,7 +604,7 @@ begin
   if (FConfiguration <> nil) and (FCertificate <> nil) then
   begin
     Logger.Info('[Hot-Reload] Loading new certificate with hash: %s', [FCertHashHex]);
-    if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName) then
+    if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName, FmTLSRequired, FmTLSOptional) then
     begin
       Logger.Error('[Hot-Reload] Fatal: Failed to dynamically load new certificate!');
       raise EMsQuicError.Create('Failed to hot-reload TLS certificate.', $80004005);

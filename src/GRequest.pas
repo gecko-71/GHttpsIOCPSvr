@@ -33,6 +33,23 @@ uses
   System.NetEncoding, GRequestBody, System.Generics.Defaults, System.ZLib;
 
 type
+  TGClientCertInfo = record
+    HasCertificate: Boolean;
+    IsVerified: Boolean;
+    Subject: string;
+    CommonName: string;
+    Issuer: string;
+    SerialNumber: string;
+    ThumbprintSHA256: string;
+    ValidFrom: TDateTime;
+    ValidTo: TDateTime;
+    ValidationError: string;
+    SAN: string;
+    RawCertBase64: string;
+  end;
+
+  TClientCertValidateEvent = reference to function(const CertInfo: TGClientCertInfo): Boolean;
+
   TCaseInsensitiveStringComparer = class(TInterfacedObject, IEqualityComparer<string>)
   public
     function Equals(const Left, Right: string): Boolean;
@@ -265,6 +282,7 @@ type
     FSecurityViolationDetected: Boolean;
     FAllowedFileExtensions: TStringList;
     FBlockedMimeTypes: TStringList;
+    FClientCertInfo: TGClientCertInfo;
     procedure ConfigureBodyParserSecurity;
     function GetHeadersSize: Integer;
     function StartsWithHTTPMethod(const Data: string): Boolean;
@@ -357,6 +375,7 @@ type
     property BlockedMimeTypes: TStringList read FBlockedMimeTypes;
     property RawBuffer: TBytes read FRawBuffer;
     property RawBufferSize: Integer read FRawBufferSize write  FRawBufferSize;
+    property ClientCertificate: TGClientCertInfo read FClientCertInfo write FClientCertInfo;
     function IsComplete: Boolean;
     function IsHeadersComplete: Boolean;
     function IsBodyComplete: Boolean;
@@ -926,20 +945,6 @@ begin
   end;
 
   LowerValue := LowerCase(Value);
-
-  for I := 1 to Length(LowerValue) do
-  begin
-    if LowerValue[I] = #9 then
-    begin
-      if (I > 1) and (I < Length(LowerValue)) and
-         CharInSet(LowerValue[I - 1], ['a'..'z', '0'..'9', '_', '<', '/', '$', '.']) and
-         CharInSet(LowerValue[I + 1], ['a'..'z', '0'..'9', '_', '>', '/', ':', '=']) then
-      begin
-        Result := True;
-        Exit;
-      end;
-    end;
-  end;
 
   NoWsValue := '';
   for I := 1 to Length(LowerValue) do
@@ -2658,6 +2663,7 @@ procedure TRequest.Clear;
 begin
   try
     ClearBuffers;
+    FillChar(FClientCertInfo, SizeOf(FClientCertInfo), 0);
     if Assigned(FHeaders) then
        FHeaders.Clear;
     if Assigned(FRequestInfo) then

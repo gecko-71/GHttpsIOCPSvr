@@ -22,8 +22,18 @@ It serves as a high-performance foundation for REST APIs, real-time WebSocket co
     *   Full HTTP/1.1 Keep-Alive pipelining with zero-allocation buffer reuse.
     *   Configurable idle-timeout sweeper in a dedicated monitor thread.
 *   **Enterprise Security & Web Application Firewall (WAF):**
-    *   Built-in **JWT (JSON Web Token)** Manager with HMAC-SHA256 verification for Bearer-token protected routes (`atJWTBearer`).
-    *   Zero-day request sanitization: Protection against path traversal (`..`), HTTP Request Smuggling, header injection, and malformed chunk framing.
+    *   **Mutual TLS (mTLS) & Zero-Trust Client Authentication:**
+        *   Full two-way cryptographic verification across both HTTPS (TCP / SChannel) and HTTP/3 (QUIC / MsQuic).
+        *   Flexible enforcement policies: Required client certificate, optional client certificate, and disabled.
+        *   Deep X.509 v3 client identity extraction: Common Name (CN), Subject, Issuer, Serial Number, validity dates, SHA-256 thumbprint, and Subject Alternative Names (SAN).
+        *   Reverse-proxy identity propagation compatible with standard conventions (`X-Forwarded-Tls-Client-Cert-Info`).
+        *   **RFC Standards Compliance:**
+            *   **RFC 8446:** TLS 1.3 Mutual Authentication (§4.3.2 CertificateRequest, §4.4.2 Certificate, §4.4.3 CertificateVerify).
+            *   **RFC 5246:** TLS 1.2 Client Certificate mutual exchange and validation (§7.4.4, §7.4.6).
+            *   **RFC 9001:** QUIC TLS encapsulation and client authentication (§4.4 Client Authentication).
+            *   **RFC 5280:** X.509 v3 certificate structure, Subject Alternative Names (SAN), and Client Authentication EKU (OID 1.3.6.1.5.5.7.3.2).
+    *   Built-in **JWT (JSON Web Token)** Manager with HMAC-SHA256 verification for Bearer-token protected routes.
+    *   Zero-day request sanitization: Protection against path traversal, HTTP Request Smuggling, header injection, and malformed chunk framing.
 *   **Advanced Content & Streaming:**
     *   High-speed file streaming via IOCP chunking (`otWriteChunk`) for multi-gigabyte downloads.
     *   Asynchronous multipart form data uploads (`multipart/form-data`) with disk streaming.
@@ -125,10 +135,17 @@ To generate the standard RSA certificate:
 # Run PowerShell as Administrator
 .\gen_quic_cert.ps1
 ```
+*(For GMcpSvr MCP server instance, use `.\gen_quic_cert_mcp.ps1`).*
 
 *   **Certificate Storage & Key Security:**
     *   **Certificate Store:** The certificate is installed into the dedicated Windows machine store: `Cert:\LocalMachine\GHttpsIOCPSvr`.
     *   **Private Key Permissions (CNG):** Both scripts configure Access Control Lists (ACLs) on the CNG private key file in `%ProgramData%\Microsoft\Crypto\Keys\` granting Read access to service accounts and the `Users` group (SID `S-1-1-0`).
+
+#### Option C: Mutual TLS (mTLS) Test Certificates
+To generate test CA, server, and client certificates for mTLS verification in `test_certs\`:
+```powershell
+.\gen_mtls_test_certs.ps1
+```
 
 #### Remove / Clean Certificates:
 To remove all generated test certificates from Windows Certificate Stores:

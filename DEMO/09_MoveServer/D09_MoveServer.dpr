@@ -659,6 +659,7 @@ begin
 
     Result := Format(
       '{"status":"broadcasting",' +
+      '"role":"master",' +
       '"uptime_sec":%.1f,' +
       '"current_seq":%d,' +
       '"segment_index":%d,' +
@@ -984,6 +985,8 @@ begin
         begin
           if Assigned(GLiveEngine) and Assigned(Session) then
           begin
+            Session.SendText('{"type":"role","server_role":"master","client_role":"slave"}');
+            AServer.TriggerWebSocketWrite(Session);
             Session.SendText(GLiveEngine.GetStatusJSON(AServer.GetWebSocketActiveCount, GetWTActiveCount));
             AServer.TriggerWebSocketWrite(Session);
           end;
