@@ -73,7 +73,6 @@ type
 
   TAuthorizationType = (atNone, atJWTBearer);
   TmTLSMode = (mtlsDisabled, mtlsOptional, mtlsRequired);
-  TClientCertValidateEvent = reference to function(const CertInfo: TGClientCertInfo): Boolean;
 
   TGHttpsServerIOCP = class;
 
