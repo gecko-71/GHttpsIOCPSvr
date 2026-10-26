@@ -35,7 +35,7 @@ uses
   MsQuic.Types, MsQuic.ApiTable, MsQuic.Errors, MsQuic.Registration, MsQuic.Configuration;
 
 type
-  TQuicNewConnectionEvent = procedure(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO) of object;
+  TQuicNewConnectionEvent = procedure(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO; var AcceptConnection: Boolean) of object;
 
   TMsQuicListener = class
   private
@@ -97,7 +97,7 @@ var
   Status: QUIC_STATUS;
   LocalAddr: TSOCKADDR_INET;
 begin
-  if (FApi = nil) or (FHandle = nil) then 
+  if (FApi = nil) or (FHandle = nil) then
      Exit;
 
   if AlpnProtocol = '' then
@@ -119,16 +119,17 @@ end;
 procedure TMsQuicListener.Stop;
 begin
   if (FApi <> nil) and (FHandle <> nil) then
-     FApi.ListenerStop(FHandle);  
+     FApi.ListenerStop(FHandle);
 end;
 
 class function TMsQuicListener.ListenerCallback(Listener: HQUIC; Context: Pointer; Event: PQUIC_LISTENER_EVENT): QUIC_STATUS; cdecl;
 var
   SelfObj: TMsQuicListener;
+  AcceptConn: Boolean;
 begin
   Result := 0;
   SelfObj := TMsQuicListener(Context);
-  if SelfObj = nil then 
+  if SelfObj = nil then
      Exit;
 
   case Event.Type_ of
@@ -136,8 +137,11 @@ begin
       begin
         if Assigned(SelfObj.FOnNewConnection) then
         begin
+          AcceptConn := True;
           try
-            SelfObj.FOnNewConnection(SelfObj, Event.Connection, Event.Info);
+            SelfObj.FOnNewConnection(SelfObj, Event.Connection, Event.Info, AcceptConn);
+            if not AcceptConn then
+              Result := $800704C9;
           except
             on E: Exception do
             begin

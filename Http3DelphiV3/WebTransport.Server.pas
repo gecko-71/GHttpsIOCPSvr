@@ -100,6 +100,7 @@ uses
 
 const
   QUIC_SEND_FLAG_NONE = 0;
+  WT_BUFFERED_STREAM_REJECTED = $3994BD84;
 
 function TWebTransportServer.IsOriginAllowed(const AOrigin: string): Boolean;
 var
@@ -108,12 +109,12 @@ var
   TrimmedOrigin: string;
 begin
   Result := False;
-  TrimmedOrigin := Trim(AOrigin);
-  if TrimmedOrigin = '' then
-    Exit(True);
-
   if (FAllowedOrigins = '*') or (FAllowedOrigins = '') then
     Exit(True);
+
+  TrimmedOrigin := Trim(AOrigin);
+  if TrimmedOrigin = '' then
+    Exit(False);
 
   AllowedList := FAllowedOrigins.Split([',', ';']);
   for AllowedItem in AllowedList do
@@ -238,17 +239,20 @@ var
   SessCtx: TWTSessionContext;
   ProtoVal: string;
   OriginVal: string;
+  Pair: TPair<HQUIC, TWTSessionContext>;
+  ConnSessionCount: Integer;
+  LimitExceeded: Boolean;
 begin
   Result := False;
 
   if Api <> nil then
     FApi := Api;
 
-  if not SameText(Request.Method, 'CONNECT') then 
+  if not SameText(Request.Method, 'CONNECT') then
      Exit;
-  if not Request.TryGetHeader(':protocol', ProtoVal) or 
-          not SameText(ProtoVal, WT_PROTOCOL_HEADER_VALUE) then 
-	 Exit;
+  if not Request.TryGetHeader(':protocol', ProtoVal) or
+          not SameText(ProtoVal, WT_PROTOCOL_HEADER_VALUE) then
+     Exit;
 
   OriginVal := '';
   Request.TryGetHeader('origin', OriginVal);
@@ -256,6 +260,30 @@ begin
   if not IsOriginAllowed(OriginVal) then
   begin
     Logger.Warn('[WebTransport] Session request rejected: disallowed origin "%s"', [OriginVal]);
+    Send403(Api, ConnCtx, StreamState.Stream);
+    Exit;
+  end;
+
+  LimitExceeded := False;
+  FLock.Enter;
+  try
+    if FSessions.Count >= 1024 then
+      LimitExceeded := True
+    else
+    begin
+      ConnSessionCount := 0;
+      for Pair in FSessions do
+        if Pair.Value.Connection = ConnCtx.Connection then
+          Inc(ConnSessionCount);
+      if ConnSessionCount >= 16 then
+        LimitExceeded := True;
+    end;
+  finally
+    FLock.Leave;
+  end;
+
+  if LimitExceeded then
+  begin
     Send403(Api, ConnCtx, StreamState.Stream);
     Exit;
   end;
@@ -311,21 +339,15 @@ begin
 
   WTSendConnect200(Api, ConnCtx, StreamState.Stream, SessionId, FSendDraft02Header);
   if Assigned(FOnSessionReady) then
-  begin
-    FLock.Enter;
-    try
-      if FSessions.TryGetValue(StreamState.Stream, SessCtx) then
-        FOnSessionReady(Self, @SessCtx);
-    finally
-      FLock.Leave;
-    end;
-  end;
+    FOnSessionReady(Self, @SessCtx);
   Result := True;
 end;
 
 procedure TWebTransportServer.HandleStreamClosed(ConnectStreamOrDataStream: HQUIC);
 var
   IsConnectStream: Boolean;
+  ParentConnectStream: HQUIC;
+  SessCtx: TWTSessionContext;
 begin
   if ConnectStreamOrDataStream = nil then Exit;
   IsConnectStream := False;
@@ -333,7 +355,18 @@ begin
   try
     IsConnectStream := FSessions.ContainsKey(ConnectStreamOrDataStream);
     if not IsConnectStream then
-      FStreamToSession.Remove(ConnectStreamOrDataStream);
+    begin
+      if FStreamToSession.TryGetValue(ConnectStreamOrDataStream, ParentConnectStream) then
+      begin
+        FStreamToSession.Remove(ConnectStreamOrDataStream);
+        if FSessions.TryGetValue(ParentConnectStream, SessCtx) then
+        begin
+          if SessCtx.StreamCount > 0 then
+            Dec(SessCtx.StreamCount);
+          FSessions.AddOrSetValue(ParentConnectStream, SessCtx);
+        end;
+      end;
+    end;
   finally
     FLock.Leave;
   end;
@@ -408,6 +441,8 @@ begin
 end;
 
 function TWebTransportServer.HandleStreamData(Connection: HQUIC; Stream: HQUIC; const Data: TBytes): Boolean;
+const
+  QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
 var
   SessCtx: TWTSessionContext;
   ConnectStream: HQUIC;
@@ -418,14 +453,26 @@ var
   PayloadData: TBytes;
   TargetConnectStream: HQUIC;
   Found: Boolean;
+  RejectStream: Boolean;
+  RejectErrorCode: UInt64;
   Pair: TPair<HQUIC, TWTSessionContext>;
 begin
   Result := False;
-  if Length(Data) = 0 then 
+  if Length(Data) = 0 then
      Exit;
+
+  if Length(Data) > 10 * 1024 * 1024 then
+  begin
+    if (FApi <> nil) and (Stream <> nil) then
+      FApi.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_EXCESSIVE_LOAD);
+    Result := True;
+    Exit;
+  end;
 
   TargetConnectStream := nil;
   PayloadOffset := 0;
+  RejectStream := False;
+  RejectErrorCode := WT_BUFFERED_STREAM_REJECTED;
 
   FLock.Enter;
   try
@@ -452,7 +499,6 @@ begin
               if (Pair.Value.StreamId = SessionId) or (Pair.Value.SessionId = SessionId) then
               begin
                 TargetConnectStream := Pair.Key;
-                FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
                 PayloadOffset := DecodeOffset;
                 Found := True;
                 Break;
@@ -467,7 +513,6 @@ begin
                    ((Pair.Value.StreamId = SessionId) or (Pair.Value.SessionId = SessionId)) then
                 begin
                   TargetConnectStream := Pair.Key;
-                  FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
                   PayloadOffset := DecodeOffset;
                   Found := True;
                   Break;
@@ -475,23 +520,51 @@ begin
               end;
             end;
 
-            if not Found then 
+            if not Found then
             begin
               Logger.Warn('[WebTransport] Stream rejected: session %d not found on connection', [SessionId]);
-              Exit;
+              RejectStream := True;
+              RejectErrorCode := WT_BUFFERED_STREAM_REJECTED;
+            end
+            else if FSessions.TryGetValue(TargetConnectStream, SessCtx) then
+            begin
+              if SessCtx.StreamCount >= 256 then
+              begin
+                RejectStream := True;
+                RejectErrorCode := WT_BUFFERED_STREAM_REJECTED;
+                TargetConnectStream := nil;
+              end
+              else
+              begin
+                Inc(SessCtx.StreamCount);
+                FSessions.AddOrSetValue(TargetConnectStream, SessCtx);
+                FStreamToSession.AddOrSetValue(Stream, TargetConnectStream);
+              end;
             end;
           end;
         end;
       end;
     end;
 
-    if TargetConnectStream = nil then 
-	   Exit;
-    if not FSessions.TryGetValue(TargetConnectStream, SessCtx) then 
-	   Exit;
+    if (not RejectStream) and (TargetConnectStream <> nil) then
+    begin
+      if not FSessions.TryGetValue(TargetConnectStream, SessCtx) then
+        TargetConnectStream := nil;
+    end;
   finally
     FLock.Leave;
   end;
+
+  if RejectStream then
+  begin
+    if (FApi <> nil) and (Stream <> nil) then
+      FApi.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, RejectErrorCode);
+    Result := True;
+    Exit;
+  end;
+
+  if TargetConnectStream = nil then
+     Exit;
 
   if PayloadOffset > 0 then
   begin
@@ -530,7 +603,7 @@ var
   TargetSessionId: TWTSessionId;
   Payload: TBytes;
 begin
-  if (Length(Data) = 0) or (not Assigned(FOnDatagram)) then Exit;
+  if (Length(Data) = 0) or (Length(Data) > 65536) or (not Assigned(FOnDatagram)) then Exit;
 
   DecodeOffset := 0;
   if not TQuicVarInt.Decode(Data, DecodeOffset, QuarterStreamId) then
@@ -592,7 +665,7 @@ var
   HdrBytes: TBytes;
   Status: QUIC_STATUS;
 begin
-  if (Api = nil) or (ConnectStream = nil) or (ConnCtx = nil) then 
+  if (Api = nil) or (ConnectStream = nil) or (ConnCtx = nil) then
      Exit;
 
   SetLength(HdrBytes, 6);

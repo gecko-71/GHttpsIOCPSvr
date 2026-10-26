@@ -75,6 +75,7 @@ type
     FSettingMaxFieldSectionSize: UInt64;
     FSettingQpackMaxTableCapacity: UInt64;
     FSettingQpackBlockedStreams: UInt64;
+    FMaxRequestBodySize: Int64;
     FEnableDemoEndpoints: Boolean;
     procedure CloseConnectionWithError(Conn: HQUIC; ErrorCode: UInt64);
     procedure ConfigureQpack(ConnCtx: PConnectionContext; H3State: THttp3ConnectionState);
@@ -99,9 +100,13 @@ type
     property SettingMaxFieldSectionSize: UInt64 read FSettingMaxFieldSectionSize write FSettingMaxFieldSectionSize;
     property SettingQpackMaxTableCapacity: UInt64 read FSettingQpackMaxTableCapacity write FSettingQpackMaxTableCapacity;
     property SettingQpackBlockedStreams: UInt64 read FSettingQpackBlockedStreams write FSettingQpackBlockedStreams;
+    property MaxRequestBodySize: Int64 read FMaxRequestBodySize write FMaxRequestBodySize;
     property EnableDemoEndpoints: Boolean read FEnableDemoEndpoints write FEnableDemoEndpoints;
     property QuicServer: TQuicServer read FQuicServer;
   end;
+
+threadvar
+  CurrentHttp3RemoteIP: string;
 
 implementation
 
@@ -119,6 +124,7 @@ begin
   FSettingMaxFieldSectionSize := 32768;
   FSettingQpackMaxTableCapacity := 4096;
   FSettingQpackBlockedStreams := 100;
+  FMaxRequestBodySize := 10 * 1024 * 1024;
   FEnableDemoEndpoints := False;
   FQuicServer := TQuicServer.Create(CertHashHex, CertStoreName, ServerCertStore, CertSubjectName);
   FQuicServer.AlpnProtocol := HTTP3_ALPN_H3;
@@ -161,7 +167,6 @@ begin
     FWebTransport.Api := FQuicServer.MsQuic.Api;
 
   FQuicServer.OnDatagramReceived := OnDatagramReceived;
-  //Logger.Info('[WT] WebTransport enabled.');
 end;
 
 procedure THttp3Server.ConfigureSettings(AMaxFieldSectionSize, AQpackMaxTableCapacity, AQpackBlockedStreams: UInt64);
@@ -327,8 +332,11 @@ procedure THttp3Server.OnConnectionOpened(Sender: TObject; Connection: HQUIC; Co
 var
   H3State: THttp3ConnectionState;
 begin
-  if (NegotiatedAlpn <> HTTP3_ALPN_H3) and (NegotiatedAlpn <> '') then
+  if (NegotiatedAlpn <> HTTP3_ALPN_H3) and (NegotiatedAlpn <> AnsiString(FQuicServer.AlpnProtocol)) and (NegotiatedAlpn <> '') then
      Exit;
+
+  if Assigned(FWebTransport) and (FQuicServer <> nil) and (FQuicServer.MsQuic <> nil) then
+    FWebTransport.Api := FQuicServer.MsQuic.Api;
 
   H3State := THttp3ConnectionState.Create(FQuicServer.MsQuic.Api, Connection);
   ConnCtx.AppContext := H3State;
@@ -427,9 +435,7 @@ var
   StreamIdSize: UInt32;
   HdrPairs: TArray<TPair<RawByteString, RawByteString>>;
   HdrIdx: Integer;
-  ReqPath, ReqMethod, SizeStr, RespJson, ValStr: string;
-  DownloadSize, SizePos, AmpPos: Integer;
-  FilePayload: TBytes;
+  ReqPath, ReqMethod, ValStr: string;
   ExtraHdrs: TArray<TPair<string, string>>;
   ReqData: THttp3RequestData;
 begin
@@ -456,6 +462,11 @@ begin
       if DataLength > 0 then
       begin
         OldLen := Length(TempBuf);
+        if Int64(OldLen) + Int64(DataLength) > FMaxRequestBodySize + 65536 then
+        begin
+          CloseConnectionWithError(ConnCtx.Connection, H3_EXCESSIVE_LOAD);
+          Exit;
+        end;
         SetLength(TempBuf, OldLen + DataLength);
         DataLength := OldLen;
         for I := 0 to Integer(BufferCount) - 1 do
@@ -469,16 +480,21 @@ begin
       end;
     end;
 
-    if Assigned(FWebTransport) and FWebTransport.HandleStreamData(ConnCtx.Connection, Stream, TempBuf) then
+    if Assigned(FWebTransport) then
     begin
-      H3State.Lock.Enter;
-      try
-        if H3State.Streams.TryGetValue(Stream, StreamState) then
-          StreamState.Buffer := nil;
-      finally
-        H3State.Lock.Leave;
+      if (FWebTransport.Api = nil) and (FQuicServer <> nil) and (FQuicServer.MsQuic <> nil) then
+        FWebTransport.Api := FQuicServer.MsQuic.Api;
+      if FWebTransport.HandleStreamData(ConnCtx.Connection, Stream, TempBuf) then
+      begin
+        H3State.Lock.Enter;
+        try
+          if H3State.Streams.TryGetValue(Stream, StreamState) then
+            StreamState.Buffer := nil;
+        finally
+          H3State.Lock.Leave;
+        end;
+        Exit;
       end;
-      Exit;
     end;
 
     Offset := 0;
@@ -576,7 +592,12 @@ begin
           Offset := OldLen;
           Break;
         end;
-        if (FrameLength > High(Integer)) or (Int64(Offset) + Int64(FrameLength) > Length(TempBuf)) then
+        if FrameLength > 65536 then
+        begin
+          CloseConnectionWithError(ConnCtx.Connection, H3_EXCESSIVE_LOAD);
+          Exit;
+        end;
+        if Int64(Offset) + Int64(FrameLength) > Length(TempBuf) then
         begin
           Offset := OldLen;
           Break;
@@ -707,7 +728,17 @@ begin
           Offset := OldLen;
           Break;
         end;
-        if (FrameLength > High(Integer)) or (Int64(Offset) + Int64(FrameLength) > Length(TempBuf)) then
+        if (FrameType = HTTP3_FRAME_HEADERS) and (FrameLength > FSettingMaxFieldSectionSize) then
+        begin
+          CloseConnectionWithError(ConnCtx.Connection, H3_EXCESSIVE_LOAD);
+          Exit;
+        end;
+        if (FrameLength > UInt64(FMaxRequestBodySize)) or (FrameLength > High(Integer)) then
+        begin
+          CloseConnectionWithError(ConnCtx.Connection, H3_EXCESSIVE_LOAD);
+          Exit;
+        end;
+        if Int64(Offset) + Int64(FrameLength) > Length(TempBuf) then
         begin
           Offset := OldLen;
           Break;
@@ -787,6 +818,13 @@ begin
 
               if (ReqMethod = 'CONNECT') then
               begin
+                if (FQuicServer <> nil) and FQuicServer.mTLSRequired and
+                   ((not ConnCtx.ClientCertInfo.HasCertificate) or (not ConnCtx.ClientCertInfo.IsVerified)) then
+                begin
+                  SendResponse(H3State, StreamState, ConnCtx, 403, 'text/plain', TEncoding.UTF8.GetBytes('403 Forbidden - mTLS Client Certificate Required'));
+                  Exit;
+                end;
+
                 if Assigned(FWebTransport) and StreamState.Request.HasHeader(':protocol') then
                 begin
                   H3State.Lock.Enter;
@@ -802,7 +840,7 @@ begin
                 end
                 else
                 begin
-                  SendResponse(H3State, StreamState, ConnCtx, 400, 'text/plain', TEncoding.UTF8.GetBytes('400 Bad Request - Missing :protocol header'));
+                  SendResponse(H3State, StreamState, ConnCtx, 400, 'text/plain', TEncoding.UTF8.GetBytes('Bad Request'));
                   Exit;
                 end;
               end;
@@ -816,6 +854,7 @@ begin
                   var OutContentType: string := 'text/plain';
                   var OutBody: TBytes := nil;
                   var OutExtra: TArray<TPair<string, string>> := nil;
+                  CurrentHttp3RemoteIP := ConnCtx.RemoteIP;
                   FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, nil, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
                   if OutStatus <> 404 then
                   begin
@@ -876,7 +915,7 @@ begin
 
                 if not AppHandled then
                 begin
-                  if (ReqMethod = 'GET') and (ReqPath = '/') then
+                  if (ReqMethod = 'GET') and (ReqPath = '/') and FEnableDemoEndpoints then
                     SendHelloWorldResponse(H3State, StreamState, ConnCtx)
                   else
                     SendResponse(H3State, StreamState, ConnCtx, 404, 'text/plain', TEncoding.UTF8.GetBytes('404 Not Found'));
@@ -886,7 +925,15 @@ begin
           HTTP3_FRAME_DATA:
             begin
               if Length(Payload) > 0 then
+              begin
+                if Int64(Length(StreamState.RequestBody)) + Int64(Length(Payload)) > FMaxRequestBodySize then
+                begin
+                  const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
+                  FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_EXCESSIVE_LOAD);
+                  Exit;
+                end;
                 StreamState.AppendRequestBody(Payload);
+              end;
             end;
         end;
       end;
@@ -903,6 +950,7 @@ begin
             var OutContentType: string := 'text/plain';
             var OutBody: TBytes := nil;
             var OutExtra: TArray<TPair<string, string>> := nil;
+            CurrentHttp3RemoteIP := ConnCtx.RemoteIP;
             FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, StreamState.RequestBody, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
             SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
           end
@@ -981,9 +1029,6 @@ begin
         H3State.QpackEncoder.EncodeHeader('content-type', UTF8Encode(ContentType), EncInst, HdrBytes);
         Block := Block + HdrBytes;
       end;
-
-      H3State.QpackEncoder.EncodeHeader('server', 'Http3DelphiV3', EncInst, HdrBytes);
-      Block := Block + HdrBytes;
 
       H3State.QpackEncoder.EncodeHeader('alt-svc', 'h3=":8443"; ma=86400', EncInst, HdrBytes);
       Block := Block + HdrBytes;
@@ -1119,6 +1164,8 @@ end;
 procedure THttp3Server.Start(Port: Word);
 begin
   FQuicServer.Start(Port);
+  if Assigned(FWebTransport) and (FQuicServer.MsQuic <> nil) then
+    FWebTransport.Api := FQuicServer.MsQuic.Api;
   Logger.Info('[HTTP/3] Server is listening for HTTP/3 connections on port %d', [Port]);
 end;
 

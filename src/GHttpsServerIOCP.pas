@@ -155,6 +155,8 @@ type
     ActiveConnections: Integer;
     RequestCount: Integer;
     WindowStartTick: UInt64;
+    FailureCount: Integer;
+    BlockedUntilTick: UInt64;
     constructor Create;
   end;
 
@@ -243,6 +245,9 @@ type
     FOnValidateClientCertificate: TClientCertValidateEvent;
     FCACertContext: PCCERT_CONTEXT;
     FmTLSCAPath: string;
+    FQuicRequiredServerName: string;
+    FQuicForceStatelessRetry: Boolean;
+    FQuicAlpnProtocol: string;
     function ProcessClientCertificate(var OverlappedEx: TOverlappedEx): Boolean;
     function IsWebSocketOriginAllowed(const AOrigin: string): Boolean;
     function IsWebTransportOriginAllowed(const AOrigin: string): Boolean;
@@ -263,7 +268,7 @@ type
     function InitializeSSLCredentials: Boolean;
     function CreateWorkerThreads: Boolean;
     procedure CleanupWinsock;
-    procedure ListCertificatesInStore(const StoreName: string);
+    //procedure ListCertificatesInStore(const StoreName: string);
     procedure AcceptConnection2(Socket: TSocket);
     procedure HandleHttpsHandshake(ClientSocket: TSocket; const AClientIP: string = '');
     procedure HandleHttpPlainConnection(ClientSocket: TSocket; const AClientIP: string = '');
@@ -300,6 +305,9 @@ type
     procedure WebTransportSessionClosed(Sender: TObject; SessionId: TWTSessionId);
     procedure WebTransportStreamData(Sender: TObject; Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes);
     procedure WebTransportDatagram(Sender: TObject; Session: PWTSessionContext; const Data: TBytes);
+    function HandleQuicBeforeAcceptConnection(Sender: TObject; const ARemoteIP: string): Boolean;
+    procedure HandleQuicAfterCloseConnection(Sender: TObject; const ARemoteIP: string);
+    procedure HandleQuicHandshakeFailed(Sender: TObject; const ARemoteIP: string);
   public
     procedure TriggerWebSocketWrite(Session: TWebSocketSession);
     procedure CleanupWebSocketSession(Session: TWebSocketSession; const Reason: string);
@@ -366,6 +374,9 @@ type
     property Http3SettingQpackMaxTableCapacity: UInt64 read FHttp3SettingQpackMaxTableCapacity write FHttp3SettingQpackMaxTableCapacity;
     property Http3SettingQpackBlockedStreams: UInt64 read FHttp3SettingQpackBlockedStreams write FHttp3SettingQpackBlockedStreams;
     property Http3EnableDemoEndpoints: Boolean read FHttp3EnableDemoEndpoints write FHttp3EnableDemoEndpoints;
+    property QuicRequiredServerName: string read FQuicRequiredServerName write FQuicRequiredServerName;
+    property QuicForceStatelessRetry: Boolean read FQuicForceStatelessRetry write FQuicForceStatelessRetry;
+    property QuicAlpnProtocol: string read FQuicAlpnProtocol write FQuicAlpnProtocol;
     property WebSocketManager: TWebSocketManager read FWebSocketManager;
     property ActiveConnections: Int64 read FActiveConnections;
     property EnableKeepAlive: Boolean read FEnableKeepAlive write FEnableKeepAlive;
@@ -605,6 +616,8 @@ begin
   ActiveConnections := 0;
   RequestCount := 0;
   WindowStartTick := GetTickCount64;
+  FailureCount := 0;
+  BlockedUntilTick := 0;
 end;
 
 
@@ -682,6 +695,9 @@ begin
   FHttp3SettingQpackMaxTableCapacity := 4096;
   FHttp3SettingQpackBlockedStreams := 100;
   FHttp3EnableDemoEndpoints := False;
+  FQuicRequiredServerName := '';
+  FQuicForceStatelessRetry := True;
+  FQuicAlpnProtocol := '';
   FEnableKeepAlive := AEnableKeepAlive;
   FKeepAliveTimeoutMs := 5000;
   FMaxKeepAliveRequests := 1000;
@@ -1398,7 +1414,8 @@ var
         end;
       until False;
     finally
-
+      if (not Result) and (StoreHandle <> nil) then
+        CertCloseStore(StoreHandle, 0);
     end;
   end;
 
@@ -1541,7 +1558,7 @@ begin
   Move(ProtoName[1], FAlpnData[11], ProtoLen);
 end;
 
-procedure TGHttpsServerIOCP.ListCertificatesInStore(const StoreName: string);
+{procedure TGHttpsServerIOCP.ListCertificatesInStore(const StoreName: string);
 var
   CertStore: HCERTSTORE;
   CertContext: PCCERT_CONTEXT;
@@ -1612,7 +1629,7 @@ begin
   end;
 
   Logger.Info('================================================');
-end;
+end;}
 
 function TGHttpsServerIOCP.CreateWorkerThreads: Boolean;
 var
@@ -1832,12 +1849,23 @@ begin
         FHttp3Server.SettingQpackMaxTableCapacity := FHttp3SettingQpackMaxTableCapacity;
         FHttp3Server.SettingQpackBlockedStreams := FHttp3SettingQpackBlockedStreams;
         FHttp3Server.EnableDemoEndpoints := FHttp3EnableDemoEndpoints;
+        FHttp3Server.MaxRequestBodySize := UInt64(FMaxRequestSize);
         if Assigned(FHttp3Server.QuicServer) then
         begin
+          FHttp3Server.QuicServer.ForceStatelessRetry := FQuicForceStatelessRetry;
+          FHttp3Server.QuicServer.RequiredServerName := FQuicRequiredServerName;
+          if FQuicAlpnProtocol <> '' then
+          begin
+
+            FHttp3Server.QuicServer.AlpnProtocol := AnsiString(FQuicAlpnProtocol);
+          end;
           FHttp3Server.QuicServer.mTLSRequired := (FmTLSMode = mtlsRequired);
           FHttp3Server.QuicServer.mTLSOptional := (FmTLSMode = mtlsOptional);
           FHttp3Server.QuicServer.CACertContext := FCACertContext;
           FHttp3Server.QuicServer.OnValidateClientCertificate := FOnValidateClientCertificate;
+          FHttp3Server.QuicServer.OnBeforeAcceptConnection := HandleQuicBeforeAcceptConnection;
+          FHttp3Server.QuicServer.OnAfterCloseConnection := HandleQuicAfterCloseConnection;
+          FHttp3Server.QuicServer.OnHandshakeFailed := HandleQuicHandshakeFailed;
         end;
 
         FHttp3Server.Start(FHttpsPort);
@@ -3523,6 +3551,22 @@ begin
   SetLength(AResponseBody, 0);
   SetLength(AExtraHeaders, 0);
 
+  if FRejectNewConnections = 1 then
+  begin
+    AStatusCode := 503;
+    AResponseBody := TEncoding.UTF8.GetBytes('503 Service Unavailable');
+    Exit;
+  end;
+
+  if (CurrentHttp3RemoteIP <> '') and (not CheckIPRateLimit(CurrentHttp3RemoteIP)) then
+  begin
+    AStatusCode := 429;
+    SetLength(AExtraHeaders, 1);
+    AExtraHeaders[0] := TPair<string, string>.Create('retry-after', '1');
+    AResponseBody := TEncoding.UTF8.GetBytes('429 Too Many Requests');
+    Exit;
+  end;
+
   ReqInfo := THttpRequestInfo.Create;
   try
     if Length(APath) > 3072 then
@@ -3767,17 +3811,18 @@ var
   CompletionKey: ULONG_PTR;
   OverlappedEx: POverlappedEx;
   Status: DWORD;
-  PlainData: string;
-  EncryptedData, PlainBytes: TBytes;
+  //PlainData: string;
+  //EncryptedData,
+  //PlainBytes: TBytes;
   DecryptSuccess: Boolean;
   HandshakeComplete: Boolean;
   WSABuf: TWSABUF;
   Flags, BytesReceived: DWORD;
   GracefulShutdown: Boolean;
   ConsecutiveErrors: Integer;
-  MemStatus: TMemoryStatusEx;
-  FreeMemMb: Int64;
-  RejectReason: string;
+  //MemStatus: TMemoryStatusEx;
+  //FreeMemMb: Int64;
+  //RejectReason: string;
 begin
   Result := 0;
   Server := TGHttpsServerIOCP(Parameter);
@@ -5583,6 +5628,68 @@ begin
       Item.OnDatagram(Session, Data);
   finally
     FLock.Leave;
+  end;
+end;
+
+function TGHttpsServerIOCP.HandleQuicBeforeAcceptConnection(Sender: TObject; const ARemoteIP: string): Boolean;
+var
+  Info: TIPClientInfo;
+  NowTick: UInt64;
+begin
+  Result := False;
+  if (not FRunning) or (FRejectNewConnections = 1) or (FActiveConnections >= FMaxConnections) then
+    Exit;
+  if ARemoteIP <> '' then
+  begin
+    NowTick := GetTickCount64;
+    FIPTrackerLock.Enter;
+    try
+      if FIPTracker.TryGetValue(ARemoteIP, Info) then
+      begin
+        if (Info.BlockedUntilTick > 0) and (NowTick < Info.BlockedUntilTick) then
+          Exit;
+      end;
+    finally
+      FIPTrackerLock.Leave;
+    end;
+  end;
+  if not TrackIPConnect(ARemoteIP) then
+    Exit;
+  TInterlocked.Increment(FRequestsPerSecondCounter);
+  InterlockedIncrement64(FActiveConnections);
+  Result := True;
+end;
+
+procedure TGHttpsServerIOCP.HandleQuicAfterCloseConnection(Sender: TObject; const ARemoteIP: string);
+begin
+  InterlockedDecrement64(FActiveConnections);
+  if ARemoteIP <> '' then
+    TrackIPDisconnect(ARemoteIP);
+end;
+
+procedure TGHttpsServerIOCP.HandleQuicHandshakeFailed(Sender: TObject; const ARemoteIP: string);
+var
+  Info: TIPClientInfo;
+  NowTick: UInt64;
+  ShiftVal: Integer;
+begin
+  if ARemoteIP = '' then
+    Exit;
+  NowTick := GetTickCount64;
+  FIPTrackerLock.Enter;
+  try
+    if not FIPTracker.TryGetValue(ARemoteIP, Info) then
+    begin
+      Info := TIPClientInfo.Create;
+      FIPTracker.Add(ARemoteIP, Info);
+    end;
+    Inc(Info.FailureCount);
+    ShiftVal := Info.FailureCount;
+    if ShiftVal > 6 then
+      ShiftVal := 6;
+    Info.BlockedUntilTick := NowTick + UInt64(1000 shl ShiftVal);
+  finally
+    FIPTrackerLock.Leave;
   end;
 end;
 

@@ -25,6 +25,7 @@
 program GHttpsIOCPSvrWebTransport;
 
 {$APPTYPE CONSOLE}
+{$SETPEOPTFLAGS $0160}
 
 {$R *.res}
 
@@ -413,6 +414,26 @@ begin
           Server.mTLSMode := mtlsDisabled;
           Logger.Info('mTLS mode set to: DISABLED (NoClientCert)');
         end;
+      end;
+
+      var SniParam: string;
+      if GetCmdLineOption('sni', SniParam) or FindCmdLineSwitch('sni', SniParam, True) then
+      begin
+        Server.QuicRequiredServerName := SniParam;
+        Logger.Info('QUIC required SNI set to: ' + SniParam);
+      end;
+
+      var AlpnParam: string;
+      if GetCmdLineOption('alpn', AlpnParam) or FindCmdLineSwitch('alpn', AlpnParam, True) then
+      begin
+        Server.QuicAlpnProtocol := AlpnParam;
+        Logger.Info('QUIC ALPN set to: ' + AlpnParam);
+      end;
+
+      var RetryParam: string;
+      if GetCmdLineOption('retry', RetryParam) or FindCmdLineSwitch('retry', RetryParam, True) then
+      begin
+        Server.QuicForceStatelessRetry := (RetryParam <> '0') and (not SameText(RetryParam, 'false'));
       end;
 
       var CaCertPath: string;

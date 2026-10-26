@@ -176,6 +176,14 @@ var
   LowerName: string;
 begin
   Result := False;
+  if (Length(AName) > 256) or (Length(AValue) > 4096) or (Length(AName) + Length(AValue) > 8192) then
+  begin
+    FHasInvalidHeader := True;
+    FErrorMessage := 'Single header size limit exceeded';
+    FErrorCode := H3_EXCESSIVE_LOAD;
+    Exit(False);
+  end;
+
   LowerName := LowerCase(Trim(AName));
 
   if (LowerName = 'connection') or (LowerName = 'keep-alive') or
@@ -349,11 +357,23 @@ begin
 end;
 
 procedure THttp3ConnectionState.ApplyPeerSettings;
+var
+  ClampedCapacity, ClampedBlocked: Cardinal;
 begin
   FLock.Enter;
   try
+    if FPeerQpackMaxTableCapacity > 16384 then
+      ClampedCapacity := 16384
+    else
+      ClampedCapacity := Cardinal(FPeerQpackMaxTableCapacity);
+
+    if FPeerQpackBlockedStreams > 100 then
+      ClampedBlocked := 100
+    else
+      ClampedBlocked := Cardinal(FPeerQpackBlockedStreams);
+
     FQpackEncoder.Free;
-    FQpackEncoder := TQpackEncoder.Create(Cardinal(FPeerQpackMaxTableCapacity), Cardinal(FPeerQpackBlockedStreams));
+    FQpackEncoder := TQpackEncoder.Create(ClampedCapacity, ClampedBlocked);
   finally
     FLock.Leave;
   end;

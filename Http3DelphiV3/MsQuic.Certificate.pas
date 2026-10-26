@@ -161,6 +161,8 @@ procedure TMsQuicCertificate.Clear;
 begin
   if FPfxBlob <> nil then
   begin
+    if FPfxBlobSize > 0 then
+      FillChar(FPfxBlob^, FPfxBlobSize, 0);
     FreeMem(FPfxBlob);
     FPfxBlob := nil;
     FPfxBlobSize := 0;
@@ -264,22 +266,32 @@ begin
               FCredConfig.Type_ := QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12;
               FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
               if AmTLSRequired or AmTLSOptional then
-                FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
+                FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
               FCredConfig.Certificate := @FPkcs12;
 
               Result := AConfig.LoadCredential(@FCredConfig);
               if (not Result) and (FCredConfig.Flags <> QUIC_CREDENTIAL_FLAG_NONE) then
               begin
-                FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
+                FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
                 Result := AConfig.LoadCredential(@FCredConfig);
               end;
-              if (not Result) and (FCredConfig.Flags <> QUIC_CREDENTIAL_FLAG_NONE) then
+              if (not Result) and (not AmTLSRequired) and AmTLSOptional then
               begin
                 FillChar(FCredConfig, SizeOf(FCredConfig), 0);
                 FCredConfig.Type_ := QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12;
                 FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
                 FCredConfig.Certificate := @FPkcs12;
                 Result := AConfig.LoadCredential(@FCredConfig);
+              end;
+
+              if (FPfxBlob <> nil) and (FPfxBlobSize > 0) then
+              begin
+                FillChar(FPfxBlob^, FPfxBlobSize, 0);
+                FreeMem(FPfxBlob);
+                FPfxBlob := nil;
+                FPfxBlobSize := 0;
+                FPkcs12.Asn1Blob := nil;
+                FPkcs12.Asn1BlobLength := 0;
               end;
             end;
           end;

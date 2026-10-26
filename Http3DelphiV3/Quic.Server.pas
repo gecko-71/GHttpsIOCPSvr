@@ -78,9 +78,14 @@ type
     AppContext: Pointer;
     NegotiatedAlpn: AnsiString;
     ConnId: Int64;
+    RemoteIP: string;
+    HandshakeCompleted: Boolean;
     ClientCertInfo: TGClientCertInfo;
   end;
 
+  TQuicBeforeAcceptConnectionEvent = function(Sender: TObject; const RemoteIP: string): Boolean of object;
+  TQuicAfterCloseConnectionEvent = procedure(Sender: TObject; const RemoteIP: string) of object;
+  TQuicHandshakeFailedEvent = procedure(Sender: TObject; const RemoteIP: string) of object;
   TQuicConnectionEvent = procedure(Sender: TObject; Connection: HQUIC; ConnCtx: PConnectionContext; const NegotiatedAlpn: AnsiString) of object;
   TQuicConnectionClosedEvent = procedure(Sender: TObject; Connection: HQUIC; ConnCtx: PConnectionContext) of object;
   TQuicStreamStartedEvent = procedure(Sender: TObject; Stream: HQUIC; Connection: HQUIC; ConnCtx: PConnectionContext; StreamFlags: UInt32) of object;
@@ -91,6 +96,20 @@ type
   TQuicServer = class
   private
     FAlpnProtocol: AnsiString;
+    FRequiredServerName: string;
+    FForceStatelessRetry: Boolean;
+    FHandshakesInFlight: Integer;
+    FMaxHandshakesInFlight: Integer;
+    FRejectedConnCount: Integer;
+    FFailedHandshakeCount: Integer;
+    FHandshakeIdleTimeoutMs: UInt64;
+    FIdleTimeoutMs: UInt64;
+    FPeerBidiStreamCount: Word;
+    FPeerUnidiStreamCount: Word;
+    FConnFlowControlWindow: Cardinal;
+    FOnBeforeAcceptConnection: TQuicBeforeAcceptConnectionEvent;
+    FOnAfterCloseConnection: TQuicAfterCloseConnectionEvent;
+    FOnHandshakeFailed: TQuicHandshakeFailedEvent;
     FOnConnectionOpened: TQuicConnectionEvent;
     FOnConnectionClosed: TQuicConnectionClosedEvent;
     FOnPeerStreamStarted: TQuicStreamStartedEvent;
@@ -118,7 +137,8 @@ type
     FmTLSOptional:              Boolean;
     FCACertContext:             WinApiAdditions.PCCERT_CONTEXT;
     FOnValidateClientCertificate: TClientCertValidateEvent;
-    procedure OnNewConnection(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO);
+    class function ExtractRemoteIP(const Info: PQUIC_NEW_CONNECTION_INFO): string; static;
+    procedure OnNewConnection(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO; var AcceptConnection: Boolean);
   public
     FSendCtxAllocated: Integer;
     FSendCtxFreed:     Integer;
@@ -140,6 +160,20 @@ type
     property GracefulShutdownTimeoutMs:  Integer read FGracefulShutdownTimeoutMs
                                                   write FGracefulShutdownTimeoutMs;
     property AlpnProtocol: AnsiString read FAlpnProtocol write FAlpnProtocol;
+    property RequiredServerName: string read FRequiredServerName write FRequiredServerName;
+    property ForceStatelessRetry: Boolean read FForceStatelessRetry write FForceStatelessRetry;
+    property HandshakesInFlight: Integer read FHandshakesInFlight;
+    property MaxHandshakesInFlight: Integer read FMaxHandshakesInFlight write FMaxHandshakesInFlight;
+    property RejectedConnectionCount: Integer read FRejectedConnCount;
+    property FailedHandshakeCount: Integer read FFailedHandshakeCount;
+    property HandshakeIdleTimeoutMs: UInt64 read FHandshakeIdleTimeoutMs write FHandshakeIdleTimeoutMs;
+    property IdleTimeoutMs: UInt64 read FIdleTimeoutMs write FIdleTimeoutMs;
+    property PeerBidiStreamCount: Word read FPeerBidiStreamCount write FPeerBidiStreamCount;
+    property PeerUnidiStreamCount: Word read FPeerUnidiStreamCount write FPeerUnidiStreamCount;
+    property ConnFlowControlWindow: Cardinal read FConnFlowControlWindow write FConnFlowControlWindow;
+    property OnBeforeAcceptConnection: TQuicBeforeAcceptConnectionEvent read FOnBeforeAcceptConnection write FOnBeforeAcceptConnection;
+    property OnAfterCloseConnection: TQuicAfterCloseConnectionEvent read FOnAfterCloseConnection write FOnAfterCloseConnection;
+    property OnHandshakeFailed: TQuicHandshakeFailedEvent read FOnHandshakeFailed write FOnHandshakeFailed;
     property OnConnectionOpened: TQuicConnectionEvent read FOnConnectionOpened write FOnConnectionOpened;
     property OnConnectionClosed: TQuicConnectionClosedEvent read FOnConnectionClosed write FOnConnectionClosed;
     property OnPeerStreamStarted: TQuicStreamStartedEvent read FOnPeerStreamStarted write FOnPeerStreamStarted;
@@ -158,6 +192,39 @@ type
 
 implementation
 
+class function TQuicServer.ExtractRemoteIP(const Info: PQUIC_NEW_CONNECTION_INFO): string;
+var
+  B0, B1, B2, B3: Byte;
+  W: array[0..7] of Word;
+  K: Integer;
+begin
+  Result := '127.0.0.1';
+  if (Info = nil) or (Info.RemoteAddress = nil) then
+    Exit;
+  if Info.RemoteAddress.si_family = AF_INET then
+  begin
+    B0 := Byte(Info.RemoteAddress.Ipv4.sin_addr.S_un_b.s_b1);
+    B1 := Byte(Info.RemoteAddress.Ipv4.sin_addr.S_un_b.s_b2);
+    B2 := Byte(Info.RemoteAddress.Ipv4.sin_addr.S_un_b.s_b3);
+    B3 := Byte(Info.RemoteAddress.Ipv4.sin_addr.S_un_b.s_b4);
+    Result := Format('%d.%d.%d.%d', [B0, B1, B2, B3]);
+  end
+  else if Info.RemoteAddress.si_family = AF_INET6 then
+  begin
+    for K := 0 to 7 do
+      W[K] := ntohs(Info.RemoteAddress.Ipv6.sin6_addr.Word[K]);
+    if (W[0] = 0) and (W[1] = 0) and (W[2] = 0) and (W[3] = 0) and (W[4] = 0) and (W[5] = $FFFF) then
+      Result := Format('%d.%d.%d.%d', [Info.RemoteAddress.Ipv6.sin6_addr.Byte[12],
+                                       Info.RemoteAddress.Ipv6.sin6_addr.Byte[13],
+                                       Info.RemoteAddress.Ipv6.sin6_addr.Byte[14],
+                                       Info.RemoteAddress.Ipv6.sin6_addr.Byte[15]])
+    else if (W[0] = 0) and (W[1] = 0) and (W[2] = 0) and (W[3] = 0) and (W[4] = 0) and (W[5] = 0) and (W[6] = 0) and (W[7] = 1) then
+      Result := '127.0.0.1'
+    else
+      Result := LowerCase(Format('%x:%x:%x:%x::/64', [W[0], W[1], W[2], W[3]]));
+  end;
+end;
+
 constructor TQuicServer.Create(const CertHashHex: string; const CertStoreName: string; ServerCertStore: HCERTSTORE; const CertSubjectName: string);
 var
   MemCounters: TProcessMemoryCounters;
@@ -174,6 +241,17 @@ begin
   FActiveConnCount           := 0;
   FShuttingDown              := 0;
   FGracefulShutdownTimeoutMs := 2000;
+  FForceStatelessRetry       := True;
+  FHandshakesInFlight        := 0;
+  FMaxHandshakesInFlight     := 64;
+  FRejectedConnCount         := 0;
+  FFailedHandshakeCount      := 0;
+  FHandshakeIdleTimeoutMs    := 10000;
+  FIdleTimeoutMs             := 30000;
+  FPeerBidiStreamCount       := 1000;
+  FPeerUnidiStreamCount      := 1000;
+  FConnFlowControlWindow     := 128 * 1024 * 1024;
+  FRequiredServerName        := '';
   FActiveConnections         := TList<Pointer>.Create;
   FConnectionsLock           := TCriticalSection.Create;
   FAllConnsClosed            := TEvent.Create(nil, True, True, '');
@@ -194,15 +272,60 @@ begin
   inherited Destroy;
 end;
 
-procedure TQuicServer.OnNewConnection(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO);
+procedure TQuicServer.OnNewConnection(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO; var AcceptConnection: Boolean);
 var
   ConnCtx: PConnectionContext;
+  RemoteIP: string;
 begin
+  AcceptConnection := True;
+  if TInterlocked.CompareExchange(FShuttingDown, 0, 0) = 1 then
+  begin
+    TInterlocked.Increment(FRejectedConnCount);
+    AcceptConnection := False;
+    Exit;
+  end;
+
+  if (FRequiredServerName <> '') and ((Info = nil) or (Info.ServerNameLength = 0) or (Info.ServerName = nil) or (not SameText(string(PAnsiChar(Info.ServerName)), FRequiredServerName))) then
+  begin
+    TInterlocked.Increment(FRejectedConnCount);
+    AcceptConnection := False;
+    Exit;
+  end;
+
+  if TInterlocked.CompareExchange(FActiveConnCount, 0, 0) >= 4096 then
+  begin
+    TInterlocked.Increment(FRejectedConnCount);
+    AcceptConnection := False;
+    Exit;
+  end;
+
+  if TInterlocked.Increment(FHandshakesInFlight) > FMaxHandshakesInFlight then
+  begin
+    TInterlocked.Decrement(FHandshakesInFlight);
+    TInterlocked.Increment(FRejectedConnCount);
+    AcceptConnection := False;
+    Exit;
+  end;
+
+  RemoteIP := ExtractRemoteIP(Info);
+  if Assigned(FOnBeforeAcceptConnection) then
+  begin
+    if not FOnBeforeAcceptConnection(Self, RemoteIP) then
+    begin
+      TInterlocked.Decrement(FHandshakesInFlight);
+      TInterlocked.Increment(FRejectedConnCount);
+      AcceptConnection := False;
+      Exit;
+    end;
+  end;
+
   New(ConnCtx);
   ConnCtx.Server := Self;
   ConnCtx.Connection := Connection;
   ConnCtx.AppContext := nil;
   ConnCtx.ConnId := TInterlocked.Increment(FConnSeqId);
+  ConnCtx.RemoteIP := RemoteIP;
+  ConnCtx.HandshakeCompleted := False;
   FillChar(ConnCtx.ClientCertInfo, SizeOf(ConnCtx.ClientCertInfo), 0);
   if (Info <> nil) and (Info.NegotiatedAlpnLength > 0) and
              (Info.NegotiatedAlpn <> nil) then
@@ -251,6 +374,19 @@ begin
     case Event.Type_ of
       QUIC_CONNECTION_EVENT_CONNECTED:
         begin
+          if not ConnCtx.HandshakeCompleted then
+          begin
+            ConnCtx.HandshakeCompleted := True;
+            TInterlocked.Decrement(Server.FHandshakesInFlight);
+          end;
+
+          if Server.mTLSRequired and ((not ConnCtx.ClientCertInfo.HasCertificate) or (not ConnCtx.ClientCertInfo.IsVerified)) then
+          begin
+            if (Server.FMsQuic <> nil) and (Server.FMsQuic.Api <> nil) then
+              Server.FMsQuic.Api.ConnectionShutdown(Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, $0100);
+            Result := $80090325;
+            Exit;
+          end;
           if Assigned(Server.FOnConnectionOpened) then
             Server.FOnConnectionOpened(Server, Connection, ConnCtx, ConnCtx.NegotiatedAlpn);
         end;
@@ -386,19 +522,67 @@ begin
 
               if (Server <> nil) and Server.mTLSRequired and (not ConnCtx.ClientCertInfo.IsVerified) then
               begin
+                if Assigned(Server.FOnHandshakeFailed) then
+                  Server.FOnHandshakeFailed(Server, ConnCtx.RemoteIP);
                 Result := $80090325;
                 Exit;
               end;
             finally
               WinApiAdditions.CertFreeCertificateContext(RemoteCert);
+            end
+            else if (Server <> nil) and Server.mTLSRequired then
+            begin
+              ConnCtx.ClientCertInfo.HasCertificate := False;
+              ConnCtx.ClientCertInfo.IsVerified := False;
+              ConnCtx.ClientCertInfo.ValidationError := 'Invalid client certificate context';
+              if Assigned(Server.FOnHandshakeFailed) then
+                Server.FOnHandshakeFailed(Server, ConnCtx.RemoteIP);
+              Result := $80090325;
+              Exit;
             end;
+          end
+          else
+          begin
+            ConnCtx.ClientCertInfo.HasCertificate := False;
+            ConnCtx.ClientCertInfo.IsVerified := False;
+            ConnCtx.ClientCertInfo.ValidationError := 'Client certificate required';
+            if (Server <> nil) and Server.mTLSRequired then
+            begin
+              if Assigned(Server.FOnHandshakeFailed) then
+                Server.FOnHandshakeFailed(Server, ConnCtx.RemoteIP);
+              Result := $80090325;
+              Exit;
+            end;
+          end;
+        end;
+
+      QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+        begin
+          if not ConnCtx.HandshakeCompleted then
+          begin
+            ConnCtx.HandshakeCompleted := True;
+            TInterlocked.Decrement(Server.FHandshakesInFlight);
+            TInterlocked.Increment(Server.FFailedHandshakeCount);
+            if Assigned(Server.FOnHandshakeFailed) then
+              Server.FOnHandshakeFailed(Server, ConnCtx.RemoteIP);
           end;
         end;
 
       QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
         begin
+          if not ConnCtx.HandshakeCompleted then
+          begin
+            ConnCtx.HandshakeCompleted := True;
+            TInterlocked.Decrement(Server.FHandshakesInFlight);
+            TInterlocked.Increment(Server.FFailedHandshakeCount);
+            if Assigned(Server.FOnHandshakeFailed) then
+              Server.FOnHandshakeFailed(Server, ConnCtx.RemoteIP);
+          end;
+
           if Assigned(Server.FOnConnectionClosed) then
              Server.FOnConnectionClosed(Server, Connection, ConnCtx);
+          if Assigned(Server.FOnAfterCloseConnection) then
+             Server.FOnAfterCloseConnection(Server, ConnCtx.RemoteIP);
 
           Server.FMsQuic.Api.ConnectionClose(Connection);
           Dispose(ConnCtx);
@@ -456,7 +640,6 @@ begin
   except
     on E: Exception do
     begin
-
       Result := $80004005;
     end;
   end;
@@ -470,12 +653,12 @@ var
 begin
   Result := 0;
   try
-    if Context = nil then 
-	   Exit;
+    if Context = nil then
+       Exit;
     ConnCtx := PConnectionContext(Context);
     Server := ConnCtx.Server;
-    if Server = nil then 
-	   Exit;
+    if Server = nil then
+       Exit;
 
     case Event.Type_ of
       QUIC_STREAM_EVENT_RECEIVE:
@@ -555,6 +738,12 @@ begin
   FMsQuic := TMsQuicLibrary.Create('msquic.dll');
   FMsQuic.Start;
 
+  if FForceStatelessRetry and (FMsQuic.Api <> nil) then
+  begin
+    var RetryPercent: UInt16 := 0;
+    FMsQuic.Api.SetParam(nil, $01000000, SizeOf(RetryPercent), @RetryPercent);
+  end;
+
   FRegistration := TMsQuicRegistration.Create(FMsQuic.Api, 'GHttpsIOCPSvr', QUIC_EXECUTION_PROFILE_LOW_LATENCY);
 
   FillChar(Settings, SizeOf(Settings), 0);
@@ -568,12 +757,12 @@ begin
     (UInt64(1) shl 24) or
     (UInt64(1) shl 27);
 
-  Settings.HandshakeIdleTimeoutMs  := 10000; 
-  Settings.IdleTimeoutMs           := 30000; 
+  Settings.HandshakeIdleTimeoutMs  := FHandshakeIdleTimeoutMs;
+  Settings.IdleTimeoutMs           := FIdleTimeoutMs;
   Settings.StreamRecvWindowDefault := 16 * 1024 * 1024;
-  Settings.ConnFlowControlWindow   := 128 * 1024 * 1024;
-  Settings.PeerBidiStreamCount     := 1000;
-  Settings.PeerUnidiStreamCount    := 1000;
+  Settings.ConnFlowControlWindow   := FConnFlowControlWindow;
+  Settings.PeerBidiStreamCount     := FPeerBidiStreamCount;
+  Settings.PeerUnidiStreamCount    := FPeerUnidiStreamCount;
   Settings.Flags8                  := (0 shl 0) or (1 shl 3);
   FConfiguration := TMsQuicConfiguration.Create(FMsQuic.Api, FRegistration, FAlpnProtocol, @Settings);
   Logger.Info('MsQuic configuration opened with SendBufferingEnabled=0 (msh3 pattern). Handle: %p', [FConfiguration.Handle]);
