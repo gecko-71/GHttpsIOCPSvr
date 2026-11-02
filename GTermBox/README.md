@@ -65,20 +65,16 @@ Follow the W3C certificate generation guide in [GHttpsIOCPSvr Certificate Manage
 ### 2. Build the Project
 Open and compile `GTermBoxServer.dproj` (or `GTermBoxServer.dpr`) and `ManageUsers.dproj` (or `ManageUsers.dpr`) in RAD Studio / Delphi for **Win64 Debug** or **Win64 Release**. Both projects are bundled together in `GTermBoxtGroup.groupproj`.
 
-### 3. Provision the Environment (`Build-Environment.ps1`)
-Run `Build-Environment.ps1` from the project directory (`GTermBox\` where `GTermBoxServer.dproj` resides) or the build directory (`Win64\Debug\`) to configure the working directory, copy required assets and libraries, provision mTLS keys/certs, and prepare user sandboxes:
+### 3. Provision the Environment (`Install-GTermBox.ps1`)
+Run `Install-GTermBox.ps1` from an elevated PowerShell window (Run as Administrator) to perform full automated setup, W3C WebTransport certificate generation, firewall rule configuration, and an automated self-test:
 ```powershell
-# From the project directory (alongside .dproj files):
-.\Build-Environment.ps1
+# Standard installation (auto-detects local network IP):
+.\Install-GTermBox.ps1
 
-# Or from the binary build directory:
-.\Win64\Debug\Build-Environment.ps1
+# Or bind to a specific network adapter and port:
+.\Install-GTermBox.ps1 -BindIp 198.51.100.11 -Port 8443
 ```
-*   Automatically discovers `ManageUsers.exe`, copies required web assets (`web/`) and core DLLs (`msquic.dll`, `ls-qpack.dll`).
-*   Prompts interactively for paths to optional applications (`Python`, `Far Manager`, `Edit`) while suggesting detected system tools as hints.
-*   Allows skipping any optional application by entering `skip` or `none` (leaving a minimal, pure PowerShell environment).
-*   Enables registering custom user-specified applications on demand.
-*   Initializes default accounts (`admin` and `usr1` with password `1234`), applies Windows AppContainer ACLs (`*S-1-15-2-1`), and validates complete environment readiness.
+Once installed, start the server using `.\Start-GTermBox.cmd` (or `.\Start-GTermBoxServer.bat`).
 
 ### 4. Launch the Server
 Run `Win64\Debug\GTermBoxServer.exe`.
@@ -461,7 +457,7 @@ Defines user identities, authentication hashes, and granular security overrides:
 #### Parameter Reference (`users.json`):
 *   **`username`** *(string)*: Unique login identifier.
 *   **`role`** *(string)*: Primary RBAC role (`"admin"` or `"user"`). Embedded as a claim into JWT tokens. Multiple administrator accounts can share `"role": "admin"`.
-*   **`clientCertificate`** *(string, optional)*: Associated client certificate filename (e.g. `"admin.crt"`, `"usr1.crt"`) or SHA-256 thumbprint for seamless Zero-Trust mTLS authentication. Bound automatically by `Build-Environment.ps1` or manually via `ManageUsers.exe bind-cert`.
+*   **`clientCertificate`** *(string, optional)*: Associated client certificate filename (e.g. `"admin.crt"`, `"usr1.crt"`) or SHA-256 thumbprint for seamless Zero-Trust mTLS authentication. Bound automatically by `Install-GTermBox.ps1` or manually via `ManageUsers.exe bind-cert`.
 *   **`salt`** *(string)*: Cryptographic per-user salt in the format `salt_<username>_<random_hex>` generated with OS-level high-entropy randomness (`TGUID.NewGuid` in Delphi). Prevents rainbow table attacks and guarantees distinct hashes across users with identical passwords.
 *   **`passwordHash`** *(string)*: 64-character lowercase hex digest of `SHA-256(salt + ":" + password)`. Computed natively by Delphi (`THashSHA2.GetHashString`).
 *   **`sandbox`** *(string)*: Dedicated directory relative to server root assigned as process `Cwd` and granted exclusive read/write DACL permissions for the user's AppContainer profile.
@@ -553,53 +549,79 @@ For automated deployments, DevOps, and scripting, `ManageUsers.exe` supports ful
 
 ### 5. Companion Automation Scripts Suite
 
-To make routine deployment and administration effortless, GTermBox provides a complete suite of six companion PowerShell automation scripts and CMD wrappers located in `GTermBox\` (alongside `.dproj` files) and deployed directly into `Win64\Debug\` alongside `GTermBoxServer.exe`:
+To make routine deployment and administration effortless, GTermBox provides a complete suite of nine companion PowerShell automation scripts and CMD wrappers located in `GTermBox\` (alongside `.dproj` files) and deployed directly alongside `GTermBoxServer.exe`:
 
 | Script (.ps1) | CMD Wrapper (.cmd) | Scope / Primary Responsibility |
 | :--- | :--- | :--- |
-| `Build-Environment.ps1` | — | Complete environment provisioner, assets, certs, sandboxes & ACLs |
+| `Install-GTermBox.ps1` | `Start-GTermBox.cmd` | Complete 9-step automated installer, self-test & deployment from clean directory |
+| `Add-FarAndEdit.ps1` | — | Automated downloader and provisioner for Far Manager and Microsoft Edit |
 | `Add-App.ps1` | — | Interactive & CLI registration of console applications in `apps.json` |
 | `Add-User.ps1` | — | Provisioning users, password salts/hashes, sandbox tree & mTLS cert binding |
 | `Bind-ClientCertificate.ps1` | `Bind-ClientCertificate.cmd` | Binds client certificates (`.crt`/`.cer`) to existing users in `users.json` |
 | `Install-ClientCertificate.ps1` | `Install-ClientCertificate.cmd` | Installs client PFX identity certificate into Windows Personal Store (`CurrentUser\My`) |
 | `Install-ServerCertificate.ps1` | `Install-ServerCertificate.cmd` | Installs `localhost.cer` into Windows Root Store (`CurrentUser\Root`) for WebTransport |
+| `gen_w3c_wt_cert.ps1` | — | Generates W3C-compliant ECDSA P-256 TLS certificate with 14-day validity and CNG ACLs |
+| `remove_certs.ps1` | — | Cleanly purges development certificates from Windows certificate stores |
 
 *   **Automatic Discovery:** The scripts automatically detect whether they are running from the server directory (`Win64\Debug\`), the workspace root, or the project folder (`GTermBox\`), targeting the correct `ManageUsers.exe`, `users.json`, `apps.json`, and certificate folders.
 *   **Dual Mode:** All scripts can be executed interactively (guided wizard with prompts and hints) or fully automated via command-line switches and parameters.
 
 ---
 
-#### 1. `Build-Environment.ps1` — Complete Environment Provisioner
+#### 1. `Install-GTermBox.ps1` — Complete 9-Step Automated Production Installer
 
-Builds and prepares the entire runtime directory structure required for `GTermBoxServer.exe` without hardcoded developer paths:
+Deploys, configures, and verifies GTermBox from scratch in any clean target directory containing only binaries and helper scripts:
 
-*   **Capabilities & Workflow:**
-    *   **Core Assets & Binaries:** Copies web client assets (`web/index.html`, `web/lib/`) and transport DLLs (`msquic.dll`, `ls-qpack.dll`) to the target server directory.
-    *   **Automated mTLS Key & Certificate Provisioning:** Automatically provisions RSA private keys, X.509 public certificates (`.crt`), and password-protected PKCS#12 bundles (`.pfx`) for default users (`admin`, `usr1`, `usr2`, `usr3`) into `trusted_clients\` (public whitelist) and `client_keys\` (private bundles).
-    *   **mTLS User Binding:** Executes `ManageUsers.exe bind-cert <username> <cert.crt>` to establish zero-trust client certificate mapping in `users.json`.
-    *   **Helper Script Deployment:** Copies `Install-ClientCertificate.ps1` / `.cmd` and `Install-ServerCertificate.ps1` / `.cmd` into both the server root and `client_keys\`.
-    *   **Interactive Guided Discovery:** Detects installed system tools (`python.exe`, `Far.exe`, `edit.exe` / `micro.exe`) and presents them as convenient defaults/hints in interactive prompts.
-    *   **Selective Application Deployment:** Allows users to specify custom binary locations or explicitly skip any optional application by entering `skip` or `none` (or using `-SkipPython`, `-SkipFar`, `-SkipEdit`).
-    *   **Custom Application Registration:** Enables adding and configuring custom user-specified applications during setup.
-    *   **Baseline Configuration:** Calls `ManageUsers.exe init-env` to establish minimal configuration and directories, then synchronizes active application lists into `users.json` for default users (`admin` and `usr1` with password `1234`).
-    *   **Windows Security DACLs:** Applies Windows AppContainer SID permissions (`icacls *S-1-15-2-1`) across sandboxes, web assets, and active tool folders.
-    *   **Readiness Checklist:** Verifies all components and displays a color-coded status checklist before server startup.
+*   **Capabilities & 9-Step Workflow:**
+    *   **[1/9] Prerequisites & Certificate Store Cleanup:** Verifies Administrator elevation and PowerShell 5.1/7+. Cleans outdated project certificates from `LocalMachine` and `CurrentUser` stores. Automatically detects the active IPv4 network route or binds to a specified IP (`-BindIp`).
+    *   **[2/9] Dependencies & Web Assets:** Verifies helper scripts and native libraries (`msquic.dll`, `ls-qpack.dll`). Automatically locates and copies web client files (`web/index.html`, `web/lib/`) and `PyTui\`.
+    *   **[3/9] Directory Initialization:** Calls `ManageUsers.exe init-env` to establish directory scaffolding (`Log/`, `trusted_clients/`, `client_keys/`, sandboxes).
+    *   **[4/9] Application Whitelist:** Configures the `powershell` profile for standard users, and registers `pytui` ("Python TUI") and `python` ("Python Console") with administrative role restrictions (`--roles=admin`).
+    *   **[5/9] User Accounts:** Configures default accounts `admin` (role: admin, password: `1234`) and `usr1` (role: user, password: `1234`).
+    *   **[6/9] W3C WebTransport Certificate:** Generates a compliant ECDSA P-256 certificate (validity <= 14 days, SHA-256) in `LocalMachine\GHttpsIOCPSvr`, grants read ACLs to the machine CNG private key (`S-1-1-0`), exports `localhost.cer`, and displays SHA-256 fingerprints.
+    *   **[7/9] mTLS Client Certificates:** Generates client identity certificates and keys (`admin.pfx`, `usr1.pfx`), exports public certificates to `trusted_clients/`, installs into `CurrentUser\My`, and binds them in `users.json`.
+    *   **[8/9] Security ACLs, Firewall & Start Scripts:** Grants Windows AppContainer SID permissions (`*S-1-15-2-1:(OI)(CI)F`), configures Windows Firewall rules for TCP and UDP port 8443, creates `Start-GTermBox.cmd`, and writes `install_info.json`.
+    *   **[9/9] Automated End-to-End Self-Test:** Launches a background test instance of `GTermBoxServer.exe`, tests HTTPS GET `/`, verifies REST API `/api/login` authentication for `admin` and `usr1`, verifies JWT tokens, tests app enumeration `/api/apps`, verifies rejection of invalid credentials, and safely stops the test process.
 
 *   **Usage Examples:**
     ```powershell
-    # Interactive wizard setup (prompts for paths with hints):
-    .\Build-Environment.ps1
+    # Standard installation (auto-detects local network IP):
+    .\Install-GTermBox.ps1
 
-    # Unattended setup skipping all optional tools (pure minimal PowerShell environment):
-    .\Build-Environment.ps1 -SkipPython -SkipFar -SkipEdit
+    # Explicit network adapter bind and port:
+    .\Install-GTermBox.ps1 -BindIp 198.51.100.11 -Port 8443
 
-    # Unattended setup pointing to custom tool installations:
-    .\Build-Environment.ps1 -PythonPath "C:\Tools\Python312\python.exe" -FarPath "C:\Tools\Far\Far.exe" -EditPath "C:\Tools\Edit\edit.exe"
+    # Custom default password and skip firewall configuration:
+    .\Install-GTermBox.ps1 -Password "MySecurePass123!" -SkipFirewall
     ```
 
 ---
 
-#### 2. `Add-App.ps1` — Application Setup Helper
+#### 2. `Add-FarAndEdit.ps1` — Automated Downloader & Provisioner for Far Manager & Edit
+
+Automates the retrieval, extraction, sandboxing, and registration of **Far Manager** and **Microsoft Edit** (`edit.exe`) purely from the official GitHub Internet releases without copying from any local machine directories:
+
+*   **Capabilities & Workflow:**
+    *   **Internet-Only Installation:** Never scans or copies files from outside directories. If Internet access is unavailable, it gracefully skips installation and warns the operator without failing.
+    *   **Automated GitHub Releases Download:** Downloads the latest official 64-bit releases from GitHub:
+        *   `FarGroup/FarManager`: Downloads the `.7z` package and extracts it using Windows built-in `tar.exe`.
+        *   `microsoft/edit`: Downloads the `edit-*-x86_64-windows.zip` package and extracts `edit.exe`.
+    *   **AppContainer Permissions:** Grants Windows AppContainer read/execute permissions (`*S-1-15-2-1:(OI)(CI)RX`) across `Far\` and `Edit\` directories for installed applications.
+    *   **Application Registration:** Registers `far` (160x38, sandbox: `standard`) and `edit` (120x40, sandbox: `standard`) in `apps.json` via `ManageUsers.exe add-app`.
+    *   **User Grants Synchronization:** Automatically updates `users.json`, granting `far` and `edit` to standard users (`usr1`) so they appear immediately in the browser interface.
+
+*   **Usage Examples:**
+    ```powershell
+    # Standard installation (downloads from official GitHub releases if not present):
+    .\Add-FarAndEdit.ps1
+
+    # Force fresh re-download from GitHub releases:
+    .\Add-FarAndEdit.ps1 -ForceDownload
+    ```
+
+---
+
+#### 3. `Add-App.ps1` — Application Setup Helper
 
 Registers new applications in `apps.json` with comprehensive security and permissions handling.
 
@@ -629,7 +651,7 @@ Registers new applications in `apps.json` with comprehensive security and permis
 
 ---
 
-#### 3. `Add-User.ps1` — User Provisioning & Sandbox Scaffolding
+#### 4. `Add-User.ps1` — User Provisioning & Sandbox Scaffolding
 
 Creates user accounts in `users.json`, computes cryptographic salts and SHA-256 hashes via `ManageUsers.exe`, and physically provisions their complete sandbox filesystem layout on disk.
 
@@ -639,21 +661,7 @@ Creates user accounts in `users.json`, computes cryptographic salts and SHA-256 
     *   **Preset Switches:**
         *   `-Admin`: Creates an administrator account with wildcard application access (`apps: ["*"]`), full disk access, Job-Only shell permission, and network access enabled.
         *   `-Restricted`: Creates a secure, locked-down user account with standard AppContainer isolation, offline network restriction, and strict directory confinement.
-    *   **Sandbox Directory Scaffolding:** Automatically creates the user's isolated directory tree on disk:
-        ```text
-        sandbox_<username>\
-        ├── AppData\
-        │   ├── Local\
-        │   └── Roaming\
-        ├── Documents\
-        │   ├── PowerShell\
-        │   └── WindowsPowerShell\
-        │       └── Microsoft.PowerShell_profile.ps1   # Maps user to home:\ and enforces sandbox tmp
-        ├── tmp\
-        ├── profile\
-        │   └── local\                                 # Dedicated isolated storage for Far Manager
-        └── apps\                                      # User-specific application payloads & shims
-        ```
+    *   **Sandbox Directory Scaffolding:** Automatically creates the user's isolated directory tree on disk (`AppData`, `Documents`, `tmp`, `profile/local`, `apps`).
     *   **AppContainer Permissions:** Grants full AppContainer access (`icacls *S-1-15-2-1:(OI)(CI)F`) to the user's sandbox directory.
 
 *   **Interactive Wizard:**
@@ -676,14 +684,14 @@ Creates user accounts in `users.json`, computes cryptographic salts and SHA-256 
 
 ---
 
-#### 4. `Bind-ClientCertificate.ps1` / `Bind-ClientCertificate.cmd` — Client Certificate Binding Helper
+#### 5. `Bind-ClientCertificate.ps1` / `Bind-ClientCertificate.cmd` — Client Certificate Binding Helper
 
 Binds a client certificate (`.crt` / `.cer`) to an existing user account in `users.json`:
 
 *   **Capabilities & Workflow:**
-    *   **Automated Whitelist Ingestion:** Checks if the certificate file is already in `trusted_clients\`. If located elsewhere (e.g. current directory or absolute path), it automatically copies it into `trusted_clients\` on the server.
+    *   **Automated Whitelist Ingestion:** Checks if the certificate file is already in `trusted_clients\`. If located elsewhere, it automatically copies it into `trusted_clients\` on the server.
     *   **Zero-Trust Identity Mapping:** Invokes `ManageUsers.exe bind-cert` to update `users.json`, preserving all existing user settings, passwords, and sandbox files intact.
-    *   **Interactive or Scripted:** Can be run interactively (prompts with user list and hints) or unattended via CLI parameters.
+    *   **Interactive or Scripted:** Can be run interactively or unattended via CLI parameters.
 *   **Usage Examples:**
     ```powershell
     # Interactive wizard (shows registered users and prompts for details):
@@ -698,7 +706,7 @@ Binds a client certificate (`.crt` / `.cer`) to an existing user account in `use
 
 ---
 
-#### 5. `Install-ClientCertificate.ps1` / `Install-ClientCertificate.cmd` — Client Certificate Installer
+#### 6. `Install-ClientCertificate.ps1` / `Install-ClientCertificate.cmd` — Client Certificate Installer
 
 Provides one-step installation of client identity certificates (`.pfx`) into the Windows CurrentUser Personal certificate store (`Cert:\CurrentUser\My`):
 
@@ -719,7 +727,7 @@ Provides one-step installation of client identity certificates (`.pfx`) into the
 
 ---
 
-#### 6. `Install-ServerCertificate.ps1` / `Install-ServerCertificate.cmd` — WebTransport Server Trust Installer
+#### 7. `Install-ServerCertificate.ps1` / `Install-ServerCertificate.cmd` — WebTransport Server Trust Installer
 
 Imports the server certificate (`localhost.cer`) into the Windows CurrentUser Trusted Root Certification Authorities store (`Cert:\CurrentUser\Root`):
 
@@ -730,6 +738,46 @@ Imports the server certificate (`localhost.cer`) into the Windows CurrentUser Tr
     .\Install-ServerCertificate.cmd
     ```
     *When prompted by Windows Security Warning ("Do you want to install this certificate?"), click **Yes**.*
+
+---
+
+#### 8. `gen_w3c_wt_cert.ps1` — W3C WebTransport TLS Certificate Generator
+
+Generates a dedicated TLS certificate strictly adhering to the W3C WebTransport specification for browser connectivity with `serverCertificateHashes`:
+
+*   **Capabilities & Compliance:**
+    *   **Key Algorithm & Hash:** Uses `ECDSA_nistP256` (secp256r1) and `SHA256` (RSA certificates are strictly rejected by Chromium for WebTransport certificate hashing).
+    *   **14-Day Validity Window:** Enforces `NotAfter - NotBefore <= 14 days` (`AddDays(-1)` to `AddDays(13)`).
+    *   **Multi-Interface SAN:** Detects all active local IPv4 addresses and loopback (`127.0.0.1`, `localhost`), registering them into Subject Alternative Names.
+    *   **CNG Private Key Permissions:** Automatically grants Read permissions on the machine private key in `ProgramData\Microsoft\Crypto\Keys` to `Everyone` (`S-1-1-0`), allowing the server to access credentials under standard process tokens.
+*   **Usage Examples:**
+    ```powershell
+    # Generate certificate with all detected local network interfaces:
+    .\gen_w3c_wt_cert.ps1
+
+    # Generate certificate bound to a specific IP address:
+    .\gen_w3c_wt_cert.ps1 -ServerIp 198.51.100.11
+    ```
+
+---
+
+#### 9. `remove_certs.ps1` — Certificate Store Cleanup Utility
+
+Safely purges GTermBox and GHttpsIOCPSvr development certificates from the system:
+
+*   **Capabilities & Safety Guards:**
+    *   Scans both `LocalMachine` and `CurrentUser` stores (`GHttpsIOCPSvr`, `My`, `Root`, `CA`, `TrustedPeople`).
+    *   Matches certificates generated by GTermBox and demo scripts (`localhost`, `admin`, `usr*`, `mallory`, `GHttpsIOCP-DemoRootCA`, IP patterns).
+    *   **System Safe Guard:** Explicitly preserves system and IDE development certificates (such as `IIS Express Development Certificate` and `ASP.NET Core HTTPS development certificate`).
+    *   Deletes orphaned CNG and CAPI private keys from disk.
+*   **Usage Examples:**
+    ```powershell
+    # Remove all development certificates:
+    .\remove_certs.ps1
+
+    # Keep trusted root certificates intact:
+    .\remove_certs.ps1 -SkipUserRoot
+    ```
 
 ---
 

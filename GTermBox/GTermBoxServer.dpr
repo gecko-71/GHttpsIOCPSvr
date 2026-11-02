@@ -1,4 +1,4 @@
-program GTermBoxServer;
+﻿program GTermBoxServer;
 
 {$APPTYPE CONSOLE}
 
@@ -122,6 +122,7 @@ var
   InputRec: TInputRecord;
   NumRead: DWORD;
   GServerRunning: Boolean = True;
+  GServerCertIsTrusted: Boolean = False;
 
 function ConsoleCtrlHandler(dwCtrlType: DWORD): BOOL; stdcall;
 begin
@@ -804,20 +805,118 @@ begin
   inherited Destroy;
 end;
 
-function CheckServerCertificateValidity(const AStoreName, ASubjectName: string; out AErrorDetail: string): Boolean;
+type
+  PCRYPT_BIT_BLOB = ^CRYPT_BIT_BLOB;
+  CRYPT_BIT_BLOB = record
+    cbData: DWORD;
+    pbData: PByte;
+    cUnusedBits: DWORD;
+  end;
+
+  PCERT_PUBLIC_KEY_INFO = ^CERT_PUBLIC_KEY_INFO;
+  CERT_PUBLIC_KEY_INFO = record
+    Algorithm: CRYPT_ALGORITHM_IDENTIFIER;
+    PublicKey: CRYPT_BIT_BLOB;
+  end;
+
+  PFullCertInfo = ^TFullCertInfo;
+  TFullCertInfo = record
+    dwVersion: DWORD;
+    SerialNumber: CRYPT_DATA_BLOB;
+    SignatureAlgorithm: CRYPT_ALGORITHM_IDENTIFIER;
+    Issuer: CRYPT_DATA_BLOB;
+    NotBefore: TFileTime;
+    NotAfter: TFileTime;
+    Subject: CRYPT_DATA_BLOB;
+    SubjectPublicKeyInfo: CERT_PUBLIC_KEY_INFO;
+    IssuerUniqueId: CRYPT_BIT_BLOB;
+    SubjectUniqueId: CRYPT_BIT_BLOB;
+    cExtension: DWORD;
+    rgExtension: Pointer;
+  end;
+
+  TCertTrustStatus = record
+    dwErrorStatus: DWORD;
+    dwInfoStatus: DWORD;
+  end;
+
+  PCertChainContext = ^TCertChainContext;
+  TCertChainContext = record
+    cbSize: DWORD;
+    TrustStatus: TCertTrustStatus;
+    cChain: DWORD;
+    rgpChain: Pointer;
+  end;
+
+  TCertChainPara = record
+    cbSize: DWORD;
+    RequestedUsage: record
+      dwType: DWORD;
+      Usage: record
+        cUsageIdentifier: DWORD;
+        rgpszUsageIdentifier: Pointer;
+      end;
+    end;
+  end;
+
+function CertGetPublicKeyLength(dwCertEncodingType: DWORD; pPublicKey: Pointer): DWORD; stdcall; external 'crypt32.dll';
+
+function CertGetCertificateChain(
+  hChainEngine: Pointer;
+  pCertContext: PCCERT_CONTEXT;
+  pTime: Pointer;
+  hAdditionalStore: HCERTSTORE;
+  pChainPara: Pointer;
+  dwFlags: DWORD;
+  pvReserved: Pointer;
+  var ppChainContext: PCertChainContext
+): BOOL; stdcall; external 'crypt32.dll';
+
+procedure CertFreeCertificateChain(
+  pChainContext: PCertChainContext
+); stdcall; external 'crypt32.dll';
+
+const
+  szOID_ECC_PUBLICKEY   = '1.2.840.10045.2.1';
+  szOID_RSA_RSA         = '1.2.840.113549.1.1.1';
+  szOID_ECDSA_SHA256    = '1.2.840.10045.4.3.2';
+  szOID_RSA_SHA256RSA   = '1.2.840.113549.1.1.11';
+  CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG = $00010000;
+  CRYPT_ACQUIRE_SILENT_FLAG          = $00000040;
+  CERT_NCRYPT_KEY_SPEC               = $FFFFFFFF;
+
+function CheckServerCertificateValidity(const AStoreName, ASubjectName: string; out AErrorDetail: string; out AIsTrusted: Boolean): Boolean;
 var
   StoreHandle: HCERTSTORE;
   CertCtx, PrevCtx: PCCERT_CONTEXT;
-  SysTime: TSystemTime;
+  SysTime, STBefore, STAfter: TSystemTime;
   LocalFT: TFileTime;
+  DTBefore, DTAfter: TDateTime;
+  DiffDays: Double;
   ExpiryStr, ValidFromStr: string;
   TimeValidity: LongInt;
   FoundCandidate: Boolean;
   AnyValid: Boolean;
   Stores: array[0..1] of DWORD;
   StoreIdx: Integer;
+  ChainPara: TCertChainPara;
+  ChainCtx: PCertChainContext;
+  CandidateIsTrusted: Boolean;
+  FullInfo: PFullCertInfo;
+  KeyOid: string;
+  KeyBits: DWORD;
+  SigOid: string;
+  CryptProv: ULONG_PTR;
+  KeySpec: DWORD;
+  MustFree: BOOL;
+  HasKey: Boolean;
+  KeyErr: DWORD;
+  NCryptLib: HMODULE;
+  NCryptFreeObj: function(hObject: ULONG_PTR): LongInt; stdcall;
+  AlgDesc: string;
 begin
   AErrorDetail := '';
+  AIsTrusted := False;
   FoundCandidate := False;
   AnyValid := False;
 
@@ -868,22 +967,130 @@ begin
             [SysTime.wYear, SysTime.wMonth, SysTime.wDay, SysTime.wHour, SysTime.wMinute, SysTime.wSecond]);
         end;
 
-        if TimeValidity = 0 then
-        begin
-          AnyValid := True;
-          CertFreeCertificateContext(CertCtx);
-          Break;
-        end
-        else if TimeValidity > 0 then
+        if TimeValidity > 0 then
         begin
           AErrorDetail := Format('TLS certificate in store "%s" (Subject: "%s") is EXPIRED! Expiration date: %s. The server cannot start with an expired certificate. Run .\gen_w3c_wt_cert.ps1 as Administrator to generate a fresh 14-day certificate.', [AStoreName, ASubjectName, ExpiryStr]);
-        end
-        else
+          PrevCtx := CertCtx;
+          Continue;
+        end;
+        if TimeValidity < 0 then
         begin
           AErrorDetail := Format('TLS certificate in store "%s" (Subject: "%s") is NOT YET VALID (valid from: %s).', [AStoreName, ASubjectName, ValidFromStr]);
+          PrevCtx := CertCtx;
+          Continue;
         end;
 
-        PrevCtx := CertCtx;
+        CandidateIsTrusted := False;
+        FillChar(ChainPara, SizeOf(ChainPara), 0);
+        ChainPara.cbSize := SizeOf(ChainPara);
+        ChainCtx := nil;
+        if CertGetCertificateChain(nil, CertCtx, nil, nil, @ChainPara, 0, nil, ChainCtx) then
+        try
+          CandidateIsTrusted := (ChainCtx <> nil) and (ChainCtx^.TrustStatus.dwErrorStatus = 0);
+        finally
+          if ChainCtx <> nil then
+            CertFreeCertificateChain(ChainCtx);
+        end;
+
+        DiffDays := 0;
+        if FileTimeToSystemTime(CertCtx^.pCertInfo^.NotBefore, STBefore) and
+           FileTimeToSystemTime(CertCtx^.pCertInfo^.NotAfter, STAfter) then
+        begin
+          DTBefore := SystemTimeToDateTime(STBefore);
+          DTAfter := SystemTimeToDateTime(STAfter);
+          DiffDays := DTAfter - DTBefore;
+        end;
+
+        if (not CandidateIsTrusted) and (DiffDays > 14.05) then
+        begin
+          AErrorDetail := Format('TLS certificate in store "%s" (Subject: "%s") validity duration is %.1f days, which exceeds the 14-day W3C WebTransport limit (NotAfter - NotBefore <= 14 days). Untrusted self-signed certificates must be 14 days or less. Run .\gen_w3c_wt_cert.ps1 as Administrator to generate a compliant certificate.', [AStoreName, ASubjectName, DiffDays]);
+          PrevCtx := CertCtx;
+          Continue;
+        end;
+
+        FullInfo := PFullCertInfo(CertCtx^.pCertInfo);
+        KeyOid := '';
+        KeyBits := 0;
+        if FullInfo <> nil then
+        begin
+          if FullInfo^.SubjectPublicKeyInfo.Algorithm.pszObjId <> nil then
+            KeyOid := string(AnsiString(FullInfo^.SubjectPublicKeyInfo.Algorithm.pszObjId));
+          KeyBits := CertGetPublicKeyLength(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @(FullInfo^.SubjectPublicKeyInfo));
+        end;
+
+        if not CandidateIsTrusted then
+        begin
+          if (KeyOid <> szOID_ECC_PUBLICKEY) or (KeyBits <> 256) then
+          begin
+            if KeyOid = szOID_RSA_RSA then
+              AlgDesc := 'RSA'
+            else
+              AlgDesc := KeyOid;
+            AErrorDetail := Format('TLS certificate in store "%s" (Subject: "%s") key algorithm is %s (%d bits). W3C WebTransport strictly requires ECDSA P-256 (secp256r1 / 256 bits). Chromium rejects WebTransport connections with RSA certificates. Run .\gen_w3c_wt_cert.ps1 as Administrator to generate a compliant certificate.', [AStoreName, ASubjectName, AlgDesc, KeyBits]);
+            PrevCtx := CertCtx;
+            Continue;
+          end;
+        end;
+
+        SigOid := '';
+        if CertCtx^.pCertInfo^.SignatureAlgorithm.pszObjId <> nil then
+          SigOid := string(AnsiString(CertCtx^.pCertInfo^.SignatureAlgorithm.pszObjId));
+
+        if (SigOid <> szOID_ECDSA_SHA256) and (SigOid <> szOID_RSA_SHA256RSA) then
+        begin
+          AErrorDetail := Format('TLS certificate in store "%s" (Subject: "%s") signature algorithm is "%s". SHA-256 hash algorithm is required for WebTransport. Run .\gen_w3c_wt_cert.ps1 as Administrator.', [AStoreName, ASubjectName, SigOid]);
+          PrevCtx := CertCtx;
+          Continue;
+        end;
+
+        CryptProv := 0;
+        KeySpec := 0;
+        MustFree := False;
+        HasKey := False;
+        KeyErr := 0;
+
+        if CryptAcquireCertificatePrivateKey(
+             CertCtx,
+             CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG or CRYPT_ACQUIRE_SILENT_FLAG,
+             nil,
+             CryptProv,
+             KeySpec,
+             MustFree
+           ) then
+        begin
+          HasKey := True;
+          if MustFree then
+          begin
+            if KeySpec = CERT_NCRYPT_KEY_SPEC then
+            begin
+              NCryptLib := LoadLibrary('ncrypt.dll');
+              if NCryptLib <> 0 then
+              begin
+                @NCryptFreeObj := GetProcAddress(NCryptLib, 'NCryptFreeObject');
+                if Assigned(NCryptFreeObj) then
+                  NCryptFreeObj(CryptProv);
+                FreeLibrary(NCryptLib);
+              end;
+            end
+            else
+              CryptReleaseContext(CryptProv, 0);
+          end;
+        end
+        else
+          KeyErr := GetLastError;
+
+        if not HasKey then
+        begin
+          AErrorDetail := Format('Server process cannot access CNG private key for certificate in store "%s" (Win32 Error: 0x%x). The process lacks read permissions to the key file in ProgramData\Microsoft\Crypto\Keys. Run .\gen_w3c_wt_cert.ps1 as Administrator to grant permissions (Everyone / S-1-1-0).', [AStoreName, KeyErr]);
+          PrevCtx := CertCtx;
+          Continue;
+        end;
+
+        AnyValid := True;
+        AIsTrusted := CandidateIsTrusted;
+        AErrorDetail := '';
+        CertFreeCertificateContext(CertCtx);
+        Break;
       until False;
     finally
       CertCloseStore(StoreHandle, 0);
@@ -1148,9 +1355,10 @@ begin
     end;
 
     var CertCheckErr: string;
-    if not CheckServerCertificateValidity(CertStoreName, SubjectNameParam, CertCheckErr) then
+    var IsCertTrusted: Boolean := False;
+    if not CheckServerCertificateValidity(CertStoreName, SubjectNameParam, CertCheckErr, IsCertTrusted) then
     begin
-      if (SubjectNameParam <> 'localhost') and CheckServerCertificateValidity(CertStoreName, 'localhost', CertCheckErr) then
+      if (SubjectNameParam <> 'localhost') and CheckServerCertificateValidity(CertStoreName, 'localhost', CertCheckErr, IsCertTrusted) then
       begin
         SubjectNameParam := 'localhost';
       end
@@ -1168,6 +1376,11 @@ begin
         ExitCode := 1; Exit;
       end;
     end;
+    GServerCertIsTrusted := IsCertTrusted;
+    if GServerCertIsTrusted then
+      Logger.Info('[Cert] Server certificate is TRUSTED by Windows Root CA (14-day limit waived)')
+    else
+      Logger.Info('[Cert] Server certificate is self-signed W3C compliant (ECDSA P-256, <=14 days, CNG permissions verified)');
 
     if GSecretPathPrefix = '' then
       GSecretPathPrefix := Trim(GetEnvironmentVariable('GTERM_SECRET_PATH'));
@@ -1364,6 +1577,7 @@ begin
           JsonRes := TJSONObject.Create;
           try
             JsonRes.AddPair('algorithm', 'sha-256');
+            JsonRes.AddPair('is_trusted', TJSONBool.Create(GServerCertIsTrusted));
             JsonArr := TJSONArray.Create;
             for I := 0 to High(HashBytes) do
               JsonArr.Add(HashBytes[I]);
@@ -4499,10 +4713,22 @@ begin
         ExitCode := 1; Exit;
       end;
 
+      var DisplayHost: string := GBindAddress;
+      if DisplayHost = '' then
+        DisplayHost := GHttpsBindAddress;
+      if (DisplayHost = '') or (DisplayHost = '0.0.0.0') then
+        DisplayHost := GetPrimaryIPv4Address;
+      if DisplayHost = '' then
+        DisplayHost := 'localhost';
+
       Logger.Info('================================================================');
-      Logger.Info(Format('  Server listening on HTTPS:        https://%s:%d', [SubjectNameParam, HttpsPortParam]));
-      Logger.Info(Format('  Server listening on WebTransport: https://%s:%d/wt/terminal', [SubjectNameParam, HttpsPortParam]));
-      Logger.Info(Format('  Server listening on WebTransport Files: https://%s:%d/wt/files', [SubjectNameParam, HttpsPortParam]));
+      Logger.Info(Format('  Server listening on HTTPS:        https://%s:%d', [DisplayHost, HttpsPortParam]));
+      Logger.Info(Format('  Server listening on WebTransport: https://%s:%d/wt/terminal', [DisplayHost, HttpsPortParam]));
+      Logger.Info(Format('  Server listening on WebTransport Files: https://%s:%d/wt/files', [DisplayHost, HttpsPortParam]));
+      if GServerCertIsTrusted then
+        Logger.Info('  TLS Trust Mode:                   TRUSTED (System Root CA - Web PKI)')
+      else
+        Logger.Info('  TLS Trust Mode:                   Self-Signed W3C WebTransport (serverCertificateHashes)');
       case GmTLSMode of
         mtlsRequired: Logger.Info('  mTLS Client Authentication:       REQUIRED (Strict Mutual TLS)');
         mtlsOptional: Logger.Info('  mTLS Client Authentication:       OPTIONAL (Verify Client Cert If Given)');
