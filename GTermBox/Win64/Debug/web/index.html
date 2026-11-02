@@ -825,7 +825,7 @@
 
       <span>GTermBox</span>
 
-      <span class="badge" id="transport-badge">Connecting</span>
+      <span class="badge" id="transport-badge">Disconnected</span>
 
     </div>
 
@@ -1149,7 +1149,7 @@
 
             const data = await res.json();
 
-            if (data && data.hash && Array.isArray(data.hash) && data.hash.length === 32) {
+            if (data && data.hash && Array.isArray(data.hash) && data.hash.length === 32 && !data.is_trusted) {
 
               wtOptions = {
 
@@ -1262,7 +1262,7 @@
 
 
 
-        this.updateBadge('WebTransport', '#10b981');
+        this.updateBadge('Connected', '#10b981');
 
         try {
 
@@ -1380,7 +1380,7 @@
 
               if (str.includes('"type":"app_error"')) {
 
-                this.updateBadge('App Unavailable', '#f59e0b');
+                this.updateBadge('Disconnected', '#ef4444');
 
                 continue;
 
@@ -1488,11 +1488,11 @@
       let badgeColor = '#64748b';
       let statusDesc = 'Session disconnected or process exited.';
       if (category === 'app_unavailable') {
-        badgeText = 'App Unavailable';
-        badgeColor = '#f59e0b';
+        badgeText = 'Disconnected';
+        badgeColor = '#ef4444';
         statusDesc = 'Application executable not found or process exited.';
       } else if (category === 'transport_failed') {
-        badgeText = 'Connection Failed';
+        badgeText = 'Disconnected';
         badgeColor = '#ef4444';
         statusDesc = 'WebTransport connection failed (TLS certificate untrusted, expired, or server unreachable).';
       }
@@ -2350,8 +2350,8 @@ class TabManager {
             }
             const badge = document.getElementById('transport-badge');
             if (badge) {
-              badge.textContent = 'Sandbox Files';
-              badge.style.background = '#0284c7';
+              badge.textContent = 'Connected';
+              badge.style.background = '#10b981';
             }
           } else {
             try {
@@ -2368,7 +2368,7 @@ class TabManager {
                 badge.textContent = 'Disconnected';
                 badge.style.background = '#64748b';
               } else if (t.instance && t.instance.transportMode === 'webtransport') {
-                badge.textContent = 'WebTransport';
+                badge.textContent = 'Connected';
                 badge.style.background = '#10b981';
               }
             }
