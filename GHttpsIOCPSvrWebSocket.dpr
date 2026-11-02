@@ -33,7 +33,9 @@ uses
   Quick.Logger,
   Quick.Logger.Provider.Files,
   Quick.Logger.Provider.Console,
+  Winapi.Windows,
   System.SysUtils,
+  System.Generics.Collections,
   System.Classes,
   System.NetEncoding,
   System.StrUtils,
@@ -121,6 +123,54 @@ begin
   end;
 end;
 
+function ExtractCertSha256FromFile(const AFilePath: string): string;
+var
+  RawBytes, CertBuf: TBytes;
+  AnsiStr: AnsiString;
+  BinLen, HashLen: DWORD;
+  CertCtx: PCCERT_CONTEXT;
+  HashBuf: array[0..31] of Byte;
+  HexStr: string;
+  I: Integer;
+begin
+  Result := '';
+  if not TFile.Exists(AFilePath) then Exit;
+  RawBytes := TFile.ReadAllBytes(AFilePath);
+  if Length(RawBytes) = 0 then Exit;
+
+  SetString(AnsiStr, PAnsiChar(@RawBytes[0]), Length(RawBytes));
+  if Pos('-----BEGIN CERTIFICATE-----', string(AnsiStr)) > 0 then
+  begin
+    BinLen := 0;
+    if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, nil, BinLen, nil, nil) and (BinLen > 0) then
+    begin
+      SetLength(CertBuf, BinLen);
+      if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, @CertBuf[0], BinLen, nil, nil) then
+        CertCtx := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @CertBuf[0], BinLen)
+      else
+        CertCtx := nil;
+    end
+    else
+      CertCtx := nil;
+  end
+  else
+    CertCtx := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @RawBytes[0], Length(RawBytes));
+
+  if CertCtx <> nil then
+  try
+    HashLen := SizeOf(HashBuf);
+    if CertGetCertificateContextProperty(CertCtx, CERT_SHA256_HASH_PROP_ID, @HashBuf[0], HashLen) then
+    begin
+      HexStr := '';
+      for I := 0 to Integer(HashLen) - 1 do
+        HexStr := HexStr + IntToHex(HashBuf[I], 2);
+      Result := HexStr;
+    end;
+  finally
+    CertFreeCertificateContext(CertCtx);
+  end;
+end;
+
 procedure PrintUsage;
 begin
   Writeln('================================================================');
@@ -134,11 +184,15 @@ begin
   Writeln('                                 https: HTTPS (TLS 1.3/1.2) + wss:// + HTTP/3 only');
   Writeln('  -httpport:<port>              Port for plaintext HTTP (default: 8080)');
   Writeln('  -httpsport:<port>             Port for encrypted HTTPS TLS (default: 8443)');
+  Writeln('  -bind:<ip>                    Bind ALL listeners (HTTP, HTTPS, WebSocket, HTTP/3, WebTransport) to one IPv4 address (default: all)');
+  Writeln('  -httpbind:<ip>                Bind plain HTTP + ws:// listener only to the given IPv4 address');
+  Writeln('  -httpsbind:<ip>               Bind HTTPS + wss:// listener only to the given IPv4 address');
+  Writeln('  -http3bind:<ip>               Bind HTTP/3 + WebTransport (UDP/QUIC) listener only to the given IPv4 address');
   Writeln('  -redirect                     Automatically redirect plain HTTP to HTTPS (301)');
   Writeln('  -keepalive / -nokeepalive     Enable or disable persistent Keep-Alive connections');
   Writeln('  -nolog                        Disable all logging (maximum performance)');
   Writeln('  -certstore:<name>             Windows Certificate Store name (default: GHttpsIOCPSvr)');
-  Writeln('  -subject:<name>               TLS Certificate Subject name (default: localhost)');
+  Writeln('  -subject:<name>               TLS Certificate Subject name (default: ' + GetPrimaryIPv4Address + ')');
   Writeln('  -help / -h / -?               Display this help message');
   Writeln('----------------------------------------------------------------');
   Writeln('SERVER CONTROL:');
@@ -189,7 +243,7 @@ begin
     end;
 
     var CertStoreName: string := 'GHttpsIOCPSvr';
-    var SubjectNameParam: string := 'localhost';
+    var SubjectNameParam: string := GetPrimaryIPv4Address;
     Logger.Info('====================================');
     Logger.Info('Starting server...');
 
@@ -205,6 +259,15 @@ begin
     var HttpsPortParam: Word := 8443;
     var HttpPortParam: Word := 8080;
     var HttpActionParam: THttpActionOnDualMode := haServeNormally;
+    var BindParam: string := '';
+    var HttpBindParam: string := '';
+    var HttpsBindParam: string := '';
+    var Http3BindParam: string := '';
+    var mTLSModeParam: TmTLSMode := mtlsDisabled;
+    var CaCertParam: string := '';
+    var TrustedClientsDirParam: string := '';
+    var PinnedThumbprintParam: string := '';
+    var GWSWhitelistedClients: TDictionary<string, string> := TDictionary<string, string>.Create;
 
     var ParamIdx: Integer;
     for ParamIdx := 1 to ParamCount do
@@ -271,9 +334,105 @@ begin
         begin
           if Length(Val) > 0 then SubjectNameParam := Val;
         end
+        else if SameText(Key, 'bind') or SameText(Key, 'bind-address') then
+        begin
+          BindParam := Val;
+        end
+        else if SameText(Key, 'httpbind') or SameText(Key, 'http-bind') then
+        begin
+          HttpBindParam := Val;
+        end
+        else if SameText(Key, 'httpsbind') or SameText(Key, 'https-bind') then
+        begin
+          HttpsBindParam := Val;
+        end
+        else if SameText(Key, 'http3bind') or SameText(Key, 'http3-bind') then
+        begin
+          Http3BindParam := Val;
+        end
         else if SameText(Key, 'redirect') or SameText(Key, 'redirect-to-https') then
         begin
           HttpActionParam := haRedirectToHttps;
+        end
+        else if SameText(Key, 'mtls') then
+        begin
+          if SameText(Val, 'required') or SameText(Val, 'requireandverifyclientcert') or (Val = '1') or SameText(Val, 'true') then
+            mTLSModeParam := mtlsRequired
+          else if SameText(Val, 'optional') or SameText(Val, 'verifyclientcertifgiven') then
+            mTLSModeParam := mtlsOptional
+          else
+            mTLSModeParam := mtlsDisabled;
+        end
+        else if SameText(Key, 'cacert') or SameText(Key, 'ca-cert') or SameText(Key, 'capath') then
+        begin
+          if Length(Val) > 0 then CaCertParam := Val;
+        end
+        else if SameText(Key, 'trusted-clients') or SameText(Key, 'trusted-dir') then
+        begin
+          if Length(Val) > 0 then TrustedClientsDirParam := Val;
+        end
+        else if SameText(Key, 'pinned') or SameText(Key, 'pinned-cert') then
+        begin
+          if Length(Val) > 0 then PinnedThumbprintParam := UpperCase(Val);
+        end;
+      end;
+    end;
+
+    if TrustedClientsDirParam = '' then
+    begin
+      var DirCand1 := ExtractFilePath(ParamStr(0)) + 'trusted_clients';
+      var DirCand2 := TPath.Combine(GetCurrentDir, 'trusted_clients');
+      if TDirectory.Exists(DirCand1) then
+        TrustedClientsDirParam := DirCand1
+      else if TDirectory.Exists(DirCand2) then
+        TrustedClientsDirParam := DirCand2;
+    end;
+
+    if (TrustedClientsDirParam <> '') and TDirectory.Exists(TrustedClientsDirParam) then
+    begin
+      var Files: TArray<string> := TDirectory.GetFiles(TrustedClientsDirParam, '*.*');
+      for var F in Files do
+      begin
+        var Ext := LowerCase(ExtractFileExt(F));
+        if (Ext = '.crt') or (Ext = '.cer') or (Ext = '.pem') then
+        begin
+          var Thumb := ExtractCertSha256FromFile(F);
+          if Thumb <> '' then
+          begin
+            var Ident := ChangeFileExt(ExtractFileName(F), '');
+            GWSWhitelistedClients.AddOrSetValue(Thumb, Ident);
+            Logger.Info(Format('[mTLS] Whitelisted client cert: %s (User: %s, SHA-256: %s)',
+              [ExtractFileName(F), Ident, Thumb]));
+          end;
+        end
+        else if Ext = '.sha256' then
+        begin
+          var Thumb := UpperCase(Trim(TFile.ReadAllText(F)));
+          if Thumb <> '' then
+          begin
+            var Ident := ChangeFileExt(ExtractFileName(F), '');
+            GWSWhitelistedClients.AddOrSetValue(Thumb, Ident);
+            Logger.Info(Format('[mTLS] Whitelisted client sha256: %s (User: %s, SHA-256: %s)',
+              [ExtractFileName(F), Ident, Thumb]));
+          end;
+        end;
+      end;
+    end;
+
+    if (mTLSModeParam <> mtlsDisabled) and (CaCertParam = '') then
+    begin
+      var CaCandidates: TArray<string> := [
+        TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt'),
+        TPath.Combine(GetCurrentDir, 'test_certs\test_root_ca.crt'),
+        TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs\test_root_ca.crt'),
+        TPath.Combine(ExtractFilePath(ParamStr(0)), 'test_certs\test_root_ca.crt')
+      ];
+      for var Cand in CaCandidates do
+      begin
+        if TFile.Exists(Cand) then
+        begin
+          CaCertParam := Cand;
+          Break;
         end;
       end;
     end;
@@ -302,6 +461,7 @@ begin
     Logger.Info('  -mode:http|dual|https  -httpport:<port>  -httpsport:<port>');
     Logger.Info('  -redirect              -keepalive|-nokeepalive  -nolog');
     Logger.Info('  -certstore:<name>      -subject:<name>          -help');
+    Logger.Info('  -bind:<ip>  -httpbind:<ip>  -httpsbind:<ip>  -http3bind:<ip>');
     Logger.Info('================================================================');
     Logger.Info('Starting server...');
 
@@ -325,6 +485,66 @@ begin
       Server.SetSSLShutdownOptions(True, 200);
       Server.EnableKeepAlive := KeepAliveParam;
       Server.EnableHttp3 := True;
+      Server.BindAddress := BindParam;
+      Server.HttpBindAddress := HttpBindParam;
+      Server.HttpsBindAddress := HttpsBindParam;
+      Server.Http3BindAddress := Http3BindParam;
+      if (BindParam <> '') or (HttpBindParam <> '') or (HttpsBindParam <> '') or (Http3BindParam <> '') then
+        Logger.Info(Format('Bind addresses: all="%s" http="%s" https="%s" http3="%s"',
+          [BindParam, HttpBindParam, HttpsBindParam, Http3BindParam]));
+      Server.mTLSMode := mTLSModeParam;
+      if CaCertParam <> '' then
+      begin
+        if not Server.LoadCACertificate(CaCertParam) then
+          Logger.Warn('[mTLS] Failed to load CA certificate from: ' + CaCertParam);
+      end;
+
+      Server.OnValidateClientCertificate :=
+        function(const CertInfo: TGClientCertInfo): Boolean
+        begin
+          if SameText(CertInfo.CommonName, 'RevokedOrNonWhitelistedClient') or
+             (Pos('RevokedOrNonWhitelistedClient', CertInfo.Subject) > 0) then
+          begin
+            Logger.Warn('[mTLS] Rejected revoked client: ' + CertInfo.Subject);
+            Exit(False);
+          end;
+
+          if Assigned(GWSWhitelistedClients) and (GWSWhitelistedClients.Count > 0) then
+          begin
+            if GWSWhitelistedClients.ContainsKey(CertInfo.ThumbprintSHA256) then
+            begin
+              Logger.Info(Format('[mTLS] Client %s authorized via OUT-OF-BAND WHITELIST (%s)',
+                [CertInfo.CommonName, GWSWhitelistedClients[CertInfo.ThumbprintSHA256]]));
+              Exit(True);
+            end
+            else
+            begin
+              Logger.Warn(Format('[mTLS] Rejected client %s: not in out-of-band whitelist', [CertInfo.CommonName]));
+              Exit(False);
+            end;
+          end;
+
+          if (PinnedThumbprintParam <> '') and SameText(CertInfo.ThumbprintSHA256, PinnedThumbprintParam) then
+          begin
+            Logger.Info(Format('[mTLS] Client %s authorized via PINNED THUMBPRINT', [CertInfo.CommonName]));
+            Exit(True);
+          end;
+
+          if (PinnedThumbprintParam <> '') and not SameText(CertInfo.ThumbprintSHA256, PinnedThumbprintParam) then
+          begin
+            Logger.Warn(Format('[mTLS] Pinned thumbprint mismatch for %s: got %s, expected %s',
+              [CertInfo.CommonName, CertInfo.ThumbprintSHA256, PinnedThumbprintParam]));
+            Exit(False);
+          end;
+
+          if CertInfo.ValidationError <> '' then
+          begin
+            Logger.Warn(Format('[mTLS] Rejected invalid client cert %s: %s', [CertInfo.CommonName, CertInfo.ValidationError]));
+            Exit(False);
+          end;
+
+          Result := True;
+        end;
 
       Server.RegisterWebSocketRoute('/chat',
         procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const MessageText: string; Opcode: TWebSocketOpcode)
@@ -341,11 +561,30 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           StatusJson: TJSONObject;
+          ModeStr: string;
         begin
+          case AServer.mTLSMode of
+            mtlsRequired: ModeStr := 'required';
+            mtlsOptional: ModeStr := 'optional';
+          else
+            ModeStr := 'disabled';
+          end;
+
           StatusJson := TJSONObject.Create;
           try
             StatusJson.AddPair('status', 'ok');
             StatusJson.AddPair('server', 'GHttpsIOCPSvr');
+            StatusJson.AddPair('mtls_mode', ModeStr);
+            StatusJson.AddPair('has_client_cert', TJSONBool.Create(ARequest.ClientCertificate.HasCertificate));
+            StatusJson.AddPair('verified', TJSONBool.Create(ARequest.ClientCertificate.IsVerified));
+            StatusJson.AddPair('common_name', ARequest.ClientCertificate.CommonName);
+            StatusJson.AddPair('thumbprint_sha256', ARequest.ClientCertificate.ThumbprintSHA256);
+            var WUser: string := '';
+            if Assigned(GWSWhitelistedClients) and GWSWhitelistedClients.TryGetValue(ARequest.ClientCertificate.ThumbprintSHA256, WUser) then
+              StatusJson.AddPair('whitelisted_user', WUser)
+            else
+              StatusJson.AddPair('whitelisted_user', '');
+            StatusJson.AddPair('whitelist_count', TJSONNumber.Create(GWSWhitelistedClients.Count));
             AResponse.AddJSONContent(StatusJson.ToJSON);
           finally
             StatusJson.Free;
@@ -685,14 +924,14 @@ begin
       Logger.Info('================================================================');
       if HttpsPortParam > 0 then
       begin
-        Logger.Info(Format('  [HTTPS TLS]   https://localhost:%d/status', [HttpsPortParam]));
-        Logger.Info(Format('  [WebSocket]   wss://localhost:%d/chat', [HttpsPortParam]));
+        Logger.Info(Format('  [HTTPS TLS]   https://%s:%d/status', [SubjectNameParam, HttpsPortParam]));
+        Logger.Info(Format('  [WebSocket]   wss://%s:%d/chat', [SubjectNameParam, HttpsPortParam]));
         Logger.Info(Format('  [HTTP/3 QUIC] UDP Port %d (Alt-Svc h3 enabled)', [HttpsPortParam]));
       end;
       if HttpPortParam > 0 then
       begin
-        Logger.Info(Format('  [HTTP Plain]  http://localhost:%d/status', [HttpPortParam]));
-        Logger.Info(Format('  [WebSocket]   ws://localhost:%d/chat', [HttpPortParam]));
+        Logger.Info(Format('  [HTTP Plain]  http://%s:%d/status', [SubjectNameParam, HttpPortParam]));
+        Logger.Info(Format('  [WebSocket]   ws://%s:%d/chat', [SubjectNameParam, HttpPortParam]));
       end;
       Logger.Info('----------------------------------------------------------------');
       Logger.Info('  CONTROL: Press [ENTER] in console window to gracefully stop the server.');
@@ -706,6 +945,8 @@ begin
       Server.Stop;
     finally
       Server.Free;
+      if Assigned(GWSWhitelistedClients) then
+        FreeAndNil(GWSWhitelistedClients);
     end;
     Logger.Info('Program completed');
   except

@@ -182,12 +182,16 @@ begin
   Writeln('                                 https: HTTPS (TLS 1.3/1.2) + wss:// + HTTP/3 + WebTransport');
   Writeln('  -httpport:<port>              Port for plaintext HTTP (default: 8080)');
   Writeln('  -httpsport:<port>             Port for encrypted HTTPS / QUIC (default: 8443)');
+  Writeln('  -bind:<ip>                    Bind ALL listeners (HTTP, HTTPS, WebSocket, HTTP/3, WebTransport) to one IPv4 address (default: all)');
+  Writeln('  -httpbind:<ip>                Bind plain HTTP + ws:// listener only to the given IPv4 address');
+  Writeln('  -httpsbind:<ip>               Bind HTTPS + wss:// listener only to the given IPv4 address');
+  Writeln('  -http3bind:<ip>               Bind HTTP/3 + WebTransport (UDP/QUIC) listener only to the given IPv4 address');
   Writeln('  -redirect                     Automatically redirect plain HTTP to HTTPS (301)');
   Writeln('  -keepalive / -nokeepalive     Enable or disable persistent Keep-Alive connections');
   Writeln('  -nolog                        Disable all logging (maximum performance)');
   Writeln('  -daemon                       Run as continuous background daemon without console input');
   Writeln('  -certstore:<name>             Windows Certificate Store name (default: GHttpsIOCPSvr)');
-  Writeln('  -subject:<name>               TLS Certificate Subject name (default: localhost)');
+  Writeln('  -subject:<name>               TLS Certificate Subject name (default: ' + GetPrimaryIPv4Address + ')');
   Writeln('  -help / -h / -?               Display this help message');
   Writeln('----------------------------------------------------------------');
   Writeln('WEBTRANSPORT ENDPOINTS:');
@@ -279,7 +283,7 @@ begin
     end;
 
     var CertStoreName: string := 'GHttpsIOCPSvr';
-    var SubjectNameParam: string := 'localhost';
+    var SubjectNameParam: string := GetPrimaryIPv4Address;
     var CustomCertStore: string;
     if FindCmdLineSwitch('certstore', CustomCertStore, True) and (CustomCertStore <> '') then
     begin
@@ -388,6 +392,17 @@ begin
       Server.SetSSLShutdownOptions(True, 200);
       Server.EnableKeepAlive := KeepAliveParam;
       Server.EnableHttp3 := True;
+      var BindParam, HttpBindParam, HttpsBindParam, Http3BindParam: string;
+      if GetCmdLineOption('bind', BindParam) then
+        Server.BindAddress := BindParam;
+      if GetCmdLineOption('httpbind', HttpBindParam) then
+        Server.HttpBindAddress := HttpBindParam;
+      if GetCmdLineOption('httpsbind', HttpsBindParam) then
+        Server.HttpsBindAddress := HttpsBindParam;
+      if GetCmdLineOption('http3bind', Http3BindParam) then
+        Server.Http3BindAddress := Http3BindParam;
+      Logger.Info(Format('Bind addresses: all="%s" http="%s" https="%s" http3="%s"',
+        [BindParam, HttpBindParam, HttpsBindParam, Http3BindParam]));
 
       var IpTimeoutStr: string;
       if FindCmdLineSwitch('iptimeout', IpTimeoutStr, True) then
@@ -432,16 +447,13 @@ begin
 
       var RetryParam: string;
       if GetCmdLineOption('retry', RetryParam) or FindCmdLineSwitch('retry', RetryParam, True) then
-      begin
         Server.QuicForceStatelessRetry := (RetryParam <> '0') and (not SameText(RetryParam, 'false'));
-      end;
 
       var CaCertPath: string;
-      if GetCmdLineOption('cacert', CaCertPath) or GetCmdLineOption('capath', CaCertPath) or
+      if GetCmdLineOption('cacert', CaCertPath) or
+         GetCmdLineOption('capath', CaCertPath) or
          FindCmdLineSwitch('cacert', CaCertPath, True) then
-      begin
-        Server.LoadCACertificate(CaCertPath);
-      end
+              Server.LoadCACertificate(CaCertPath)
       else if Server.mTLSMode <> mtlsDisabled then
       begin
         var DefaultCa1 := TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt');
@@ -466,8 +478,23 @@ begin
       Server.BlockedMimeTypes.Add('application/x-msdownload');
       Server.BlockedMimeTypes.Add('application/x-sh');
       Server.BlockedMimeTypes.Add('application/x-bat');
-      Server.AllowedWebSocketOrigins := 'http://localhost:8080,https://localhost:8443,http://127.0.0.1:8080,https://127.0.0.1:8443,https://trusted-app.local';
-      Server.AllowedWebTransportOrigins := 'http://localhost:8080,https://localhost:8443,http://127.0.0.1:8080,https://127.0.0.1:8443,https://trusted-app.local';
+      var WsOriginsParam: string;
+      if not (GetCmdLineOption('ws-origins', WsOriginsParam) or FindCmdLineSwitch('ws-origins', WsOriginsParam, True) or
+              GetCmdLineOption('allowed-origins', WsOriginsParam) or FindCmdLineSwitch('allowed-origins', WsOriginsParam, True)) then
+        WsOriginsParam := GetEnvironmentVariable('ALLOWED_ORIGINS');
+      if WsOriginsParam <> '' then
+        Server.AllowedWebSocketOrigins := WsOriginsParam
+      else
+        Server.AllowedWebSocketOrigins := 'https://trusted-app.local';
+
+      var WtOriginsParam: string;
+      if not (GetCmdLineOption('wt-origins', WtOriginsParam) or FindCmdLineSwitch('wt-origins', WtOriginsParam, True) or
+              GetCmdLineOption('allowed-origins', WtOriginsParam) or FindCmdLineSwitch('allowed-origins', WtOriginsParam, True)) then
+        WtOriginsParam := GetEnvironmentVariable('ALLOWED_ORIGINS');
+      if WtOriginsParam <> '' then
+        Server.AllowedWebTransportOrigins := WtOriginsParam
+      else
+        Server.AllowedWebTransportOrigins := 'https://trusted-app.local';
       Server.RegisterWebTransportRoute(
         '/webtransport',
         nil,
@@ -500,7 +527,7 @@ begin
         procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const MessageText: string; Opcode: TWebSocketOpcode)
         begin
           if Opcode = wsOpText then
-            Session.SendText(MessageText);
+             Session.SendText(MessageText);
           AServer.TriggerWebSocketWrite(Session);
         end,
         atNone,
@@ -544,6 +571,27 @@ begin
       );
 
       Server.RegisterEndpointProc('/status', hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest;
+                                   const AResponse: TResponse;
+                                   AServer: TGHttpsServerIOCP)
+        var
+          Json: TJSONObject;
+        begin
+          Json := TJSONObject.Create;
+          try
+            Json.AddPair('status', 'ok');
+            Json.AddPair('time', FormatDateTime('yyyy-mm-dd hh:nn:ss', Now));
+            Json.AddPair('server', 'GHttpsIOCPSvrWebTransport');
+            Json.AddPair('webtransport_enabled', TJSONBool.Create(True));
+            Json.AddPair('keepalive', TJSONBool.Create(AServer.EnableKeepAlive));
+            AResponse.AddJSONContent(Json.ToJSON);
+          finally
+            Json.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc('/api/status', hmGET,
         procedure(Sender: TObject; const ARequest: TRequest;
                                    const AResponse: TResponse;
                                    AServer: TGHttpsServerIOCP)
@@ -1107,16 +1155,16 @@ begin
       Logger.Info('================================================================');
       if HttpsPortParam > 0 then
       begin
-        Logger.Info(Format('  [HTTPS TLS]    https://localhost:%d/status', [HttpsPortParam]));
-        Logger.Info(Format('  [WebSocket]    wss://localhost:%d/chat', [HttpsPortParam]));
+        Logger.Info(Format('  [HTTPS TLS]    https://%s:%d/status', [SubjectNameParam, HttpsPortParam]));
+        Logger.Info(Format('  [WebSocket]    wss://%s:%d/chat', [SubjectNameParam, HttpsPortParam]));
         Logger.Info(Format('  [HTTP/3 QUIC]  UDP Port %d (Alt-Svc h3 enabled)', [HttpsPortParam]));
-        Logger.Info(Format('  [WebTransport] https://localhost:%d/webtransport', [HttpsPortParam]));
-        Logger.Info(Format('  [WebTransport] https://localhost:%d/wt', [HttpsPortParam]));
+        Logger.Info(Format('  [WebTransport] https://%s:%d/webtransport', [SubjectNameParam, HttpsPortParam]));
+        Logger.Info(Format('  [WebTransport] https://%s:%d/wt', [SubjectNameParam, HttpsPortParam]));
       end;
       if HttpPortParam > 0 then
       begin
-        Logger.Info(Format('  [HTTP Plain]   http://localhost:%d/status', [HttpPortParam]));
-        Logger.Info(Format('  [WebSocket]    ws://localhost:%d/chat', [HttpPortParam]));
+        Logger.Info(Format('  [HTTP Plain]   http://%s:%d/status', [SubjectNameParam, HttpPortParam]));
+        Logger.Info(Format('  [WebSocket]    ws://%s:%d/chat', [SubjectNameParam, HttpPortParam]));
       end;
       Logger.Info('----------------------------------------------------------------');
       Logger.Info('  CONTROL: Press [ENTER] in console window to gracefully stop the server.');

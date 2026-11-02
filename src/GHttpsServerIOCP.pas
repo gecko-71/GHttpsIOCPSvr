@@ -171,6 +171,10 @@ type
     FPort: Word;
     FHttpsPort: Word;
     FHttpPort: Word;
+    FBindAddress: string;
+    FHttpBindAddress: string;
+    FHttpsBindAddress: string;
+    FHttp3BindAddress: string;
     FProtocolMode: TServerProtocolMode;
     FHttpAction: THttpActionOnDualMode;
     FRunning: Boolean;
@@ -249,8 +253,8 @@ type
     FQuicForceStatelessRetry: Boolean;
     FQuicAlpnProtocol: string;
     function ProcessClientCertificate(var OverlappedEx: TOverlappedEx): Boolean;
-    function IsWebSocketOriginAllowed(const AOrigin: string): Boolean;
-    function IsWebTransportOriginAllowed(const AOrigin: string): Boolean;
+    function IsWebSocketOriginAllowed(const AOrigin: string; const AHost: string = ''): Boolean;
+    function IsWebTransportOriginAllowed(const AOrigin: string; const AHost: string = ''): Boolean;
     function SelectWebSocketSubProtocol(const APath, AClientProtocols: string): string;
     function TrackIPConnect(const AIP: string): Boolean;
     procedure TrackIPDisconnect(const AIP: string);
@@ -263,6 +267,10 @@ type
     function InitializeWinsock: Boolean;
     function CreateListenSocket: Boolean;
     function CreateHttpListenSocket: Boolean;
+    function ResolveBindAddr(const AAddress: string; out AValue: u_long): Boolean;
+    function EffectiveHttpBindAddress: string;
+    function EffectiveHttpsBindAddress: string;
+    function EffectiveHttp3BindAddress: string;
     function CreateCompletionPort: Boolean;
     function LoadServerCertificate: Boolean;
     function InitializeSSLCredentials: Boolean;
@@ -288,7 +296,7 @@ type
     procedure ProcessHttpRequest(OverlappedEx: POverlappedEx);
     procedure HandleHttp3Request(
       Sender: TObject;
-      const AMethod, APath: string;
+      const AMethod, APath, ARemoteIP: string;
       const AHeaders: TArray<TPair<string, string>>;
       const ABody: TBytes;
       const AClientCert: TGClientCertInfo;
@@ -312,7 +320,7 @@ type
     procedure TriggerWebSocketWrite(Session: TWebSocketSession);
     procedure CleanupWebSocketSession(Session: TWebSocketSession; const Reason: string);
     constructor Create(APort: Word = 443;
-                       ASubjectName:String = 'localhost';
+                       ASubjectName:String = '';
                        ACertificateStore:String= 'GHttpsIOCPSvr';
                        ASecretKey:String = 'Abcd1234Efgh5678Ijkl9012Mnop3456Qrst7890Uvwx1234Yz!';
                        AMaxConnections: Integer = 2000;
@@ -386,6 +394,10 @@ type
     property HttpAction: THttpActionOnDualMode read FHttpAction write FHttpAction;
     property HttpsPort: Word read FHttpsPort;
     property HttpPort: Word read FHttpPort write FHttpPort;
+    property BindAddress: string read FBindAddress write FBindAddress;
+    property HttpBindAddress: string read FHttpBindAddress write FHttpBindAddress;
+    property HttpsBindAddress: string read FHttpsBindAddress write FHttpsBindAddress;
+    property Http3BindAddress: string read FHttp3BindAddress write FHttp3BindAddress;
     property EnableCORS: Boolean read FEnableCORS write FEnableCORS;
     property CORSAllowedOrigins: string read FCORSAllowedOrigins write FCORSAllowedOrigins;
     property CORSAllowedMethods: string read FCORSAllowedMethods write FCORSAllowedMethods;
@@ -412,10 +424,66 @@ type
     function LoadCACertificate(const AFileName: string): Boolean;
   end;
 
+function GetPrimaryIPv4Address: string;
 
 implementation
 
 uses TypInfo, System.Hash;
+
+function GetPrimaryIPv4Address: string;
+var
+  WSAData: TWSAData;
+  NeedCleanup: Boolean;
+  Sock: TSocket;
+  TargetAddr, LocalAddr: sockaddr_in;
+  LocalAddrLen: Integer;
+  EnvHost: string;
+  HostName: array[0..255] of AnsiChar;
+  HostEnt: PHostEnt;
+begin
+  EnvHost := Trim(GetEnvironmentVariable('SERVER_HOST'));
+  if EnvHost <> '' then
+    Exit(EnvHost);
+
+  Result := '127.0.0.1';
+  NeedCleanup := False;
+  if WSAStartup(MAKEWORD(2, 2), WSAData) = 0 then
+    NeedCleanup := True;
+
+  Sock := socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if Sock <> INVALID_SOCKET then
+  begin
+    FillChar(TargetAddr, SizeOf(TargetAddr), 0);
+    TargetAddr.sin_family := AF_INET;
+    TargetAddr.sin_port := htons(53);
+    TargetAddr.sin_addr.S_addr := inet_addr('1.1.1.1');
+
+    if connect(Sock, TSockAddr(TargetAddr), SizeOf(TargetAddr)) = 0 then
+    begin
+      LocalAddrLen := SizeOf(LocalAddr);
+      FillChar(LocalAddr, SizeOf(LocalAddr), 0);
+      if getsockname(Sock, TSockAddr(LocalAddr), LocalAddrLen) = 0 then
+      begin
+        if LocalAddr.sin_addr.S_addr <> 0 then
+          Result := string(inet_ntoa(LocalAddr.sin_addr));
+      end;
+    end;
+    closesocket(Sock);
+  end;
+
+  if (Result = '127.0.0.1') or (Result = '0.0.0.0') then
+  begin
+    if gethostname(HostName, SizeOf(HostName)) = 0 then
+    begin
+      HostEnt := gethostbyname(HostName);
+      if (HostEnt <> nil) and (HostEnt^.h_addr_list <> nil) and (HostEnt^.h_addr_list^ <> nil) then
+        Result := string(inet_ntoa(PInAddr(HostEnt^.h_addr_list^)^));
+    end;
+  end;
+
+  if NeedCleanup then
+    WSACleanup;
+end;
 
 function IsMsQuicDllAvailable(out AErrorDetails: string): Boolean;
 var
@@ -658,6 +726,10 @@ begin
   FHttpsPort := APort;
   FHttpPort := AHttpPort;
   FHttpAction := AHttpAction;
+  FBindAddress := '';
+  FHttpBindAddress := '';
+  FHttpsBindAddress := '';
+  FHttp3BindAddress := '';
 
   if (FHttpsPort > 0) and (FHttpPort > 0) then
     FProtocolMode := pmDualHttpAndHttps
@@ -687,7 +759,10 @@ begin
   FMaxResponseSize := AMaxResponseSize;
   FChunkSize := AChunkSize;
   FMonitorRun := AMonitorRun;
-  FSubjectName := ASubjectName;
+  if ASubjectName <> '' then
+    FSubjectName := ASubjectName
+  else
+    FSubjectName := GetPrimaryIPv4Address;
   FCertificateStore := ACertificateStore;
   FEnableHttp3 := (FProtocolMode <> pmHttpOnly);
   FHttp3Server := nil;
@@ -1105,6 +1180,44 @@ begin
   Result := WSAStartup(MAKEWORD(2, 2), WSAData) = 0;
 end;
 
+function TGHttpsServerIOCP.ResolveBindAddr(const AAddress: string; out AValue: u_long): Boolean;
+begin
+  AValue := u_long(INADDR_ANY);
+  if AAddress = '' then
+    Exit(True);
+  if SameText(AAddress, 'localhost') then
+  begin
+    AValue := inet_addr('127.0.0.1');
+    Exit(True);
+  end;
+  AValue := inet_addr(PAnsiChar(AnsiString(AAddress)));
+  Result := (AValue <> u_long(INADDR_NONE)) or (AAddress = '255.255.255.255');
+end;
+
+function TGHttpsServerIOCP.EffectiveHttpBindAddress: string;
+begin
+  if FHttpBindAddress <> '' then
+    Result := FHttpBindAddress
+  else
+    Result := FBindAddress;
+end;
+
+function TGHttpsServerIOCP.EffectiveHttpsBindAddress: string;
+begin
+  if FHttpsBindAddress <> '' then
+    Result := FHttpsBindAddress
+  else
+    Result := FBindAddress;
+end;
+
+function TGHttpsServerIOCP.EffectiveHttp3BindAddress: string;
+begin
+  if FHttp3BindAddress <> '' then
+    Result := FHttp3BindAddress
+  else
+    Result := EffectiveHttpsBindAddress;
+end;
+
 function TGHttpsServerIOCP.CreateListenSocket: Boolean;
 const
   SO_EXCLUSIVEADDRUSE = Integer(not SO_REUSEADDR);
@@ -1113,8 +1226,14 @@ var
   SockAddrIn: TSockAddrIn absolute SockAddr;
   OptVal: Integer;
   ErrCode: Integer;
+  BindValue: u_long;
 begin
   Result := False;
+  if not ResolveBindAddr(EffectiveHttpsBindAddress, BindValue) then
+  begin
+    Logger.Error('CRITICAL ERROR: Invalid HTTPS bind address: %s', [EffectiveHttpsBindAddress]);
+    Exit;
+  end;
   FListenSocket := WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, nil, 0, WSA_FLAG_OVERLAPPED);
   if FListenSocket = INVALID_SOCKET then
   begin
@@ -1132,7 +1251,7 @@ begin
 
   FillChar(SockAddr, SizeOf(SockAddr), 0);
   SockAddrIn.sin_family := AF_INET;
-  SockAddrIn.sin_addr.S_addr := INADDR_ANY;
+  SockAddrIn.sin_addr.S_addr := BindValue;
   SockAddrIn.sin_port := htons(FPort);
 
   if bind(FListenSocket, SockAddr, SizeOf(SockAddr)) = SOCKET_ERROR then
@@ -1166,10 +1285,16 @@ var
   SockAddrIn: TSockAddrIn absolute SockAddr;
   OptVal: Integer;
   ErrCode: Integer;
+  BindValue: u_long;
 begin
   Result := False;
   if FHttpPort = 0 then
     Exit(True);
+  if not ResolveBindAddr(EffectiveHttpBindAddress, BindValue) then
+  begin
+    Logger.Error('CRITICAL ERROR: Invalid HTTP bind address: %s', [EffectiveHttpBindAddress]);
+    Exit;
+  end;
 
   FListenSocketHTTP := WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, nil, 0, WSA_FLAG_OVERLAPPED);
   if FListenSocketHTTP = INVALID_SOCKET then
@@ -1188,7 +1313,7 @@ begin
 
   FillChar(SockAddr, SizeOf(SockAddr), 0);
   SockAddrIn.sin_family := AF_INET;
-  SockAddrIn.sin_addr.S_addr := INADDR_ANY;
+  SockAddrIn.sin_addr.S_addr := BindValue;
   SockAddrIn.sin_port := htons(FHttpPort);
 
   if bind(FListenSocketHTTP, SockAddr, SizeOf(SockAddr)) = SOCKET_ERROR then
@@ -1314,6 +1439,7 @@ var
   NCryptFreeObject: TNCryptFreeObject;
   NCryptLib: HMODULE;
   PrevContext: PCCERT_CONTEXT;
+  HasExpiredInTargetStore: Boolean;
 
   function TrySearchInStore(SystemStoreFlags: DWORD; const SystemStoreName, StoreName: string): Boolean;
   const CERT_STORE_READONLY_FLAG = $00008000;
@@ -1368,6 +1494,8 @@ var
 
         if CertVerifyTimeValidity(nil, FCertContext^.pCertInfo) <> 0 then
         begin
+          if CertVerifyTimeValidity(nil, FCertContext^.pCertInfo) > 0 then
+            HasExpiredInTargetStore := True;
           Logger.Warn('Certificate candidate at %p is expired or not yet valid. Searching next...', [FCertContext]);
           PrevContext := FCertContext;
           Continue;
@@ -1424,19 +1552,40 @@ begin
   if FCertificateStore = '' then
     FCertificateStore := 'GHttpsIOCPSvr';
 
-  FSubjectName := 'localhost';
+  if FSubjectName = '' then
+    FSubjectName := GetPrimaryIPv4Address;
   Logger.Info('LoadServerCertificate START');
 
   Result := TrySearchInStore(CERT_SYSTEM_STORE_LOCAL_MACHINE, 'LocalMachine', FCertificateStore);
   if not Result then
     Result := TrySearchInStore(CERT_SYSTEM_STORE_CURRENT_USER, 'CurrentUser', FCertificateStore);
-  if not Result then
+  if not Result and not HasExpiredInTargetStore then
     Result := TrySearchInStore(CERT_SYSTEM_STORE_LOCAL_MACHINE, 'LocalMachine', 'My');
+
+  if not Result and (FSubjectName <> 'localhost') then
+  begin
+    var OrigSubject := FSubjectName;
+    FSubjectName := 'localhost';
+    Result := TrySearchInStore(CERT_SYSTEM_STORE_LOCAL_MACHINE, 'LocalMachine', FCertificateStore);
+    if not Result then
+      Result := TrySearchInStore(CERT_SYSTEM_STORE_CURRENT_USER, 'CurrentUser', FCertificateStore);
+    if not Result and not HasExpiredInTargetStore then
+      Result := TrySearchInStore(CERT_SYSTEM_STORE_LOCAL_MACHINE, 'LocalMachine', 'My');
+    if Result then
+      Logger.Info(Format('Certificate for "%s" not found, fallen back to localhost certificate', [OrigSubject]))
+    else
+      FSubjectName := OrigSubject;
+  end;
 
   if not Result then
   begin
-    Logger.Error('No valid certificate with accessible private key "CN=%s" found in stores (LocalMachine\GHttpsIOCPSvr, CurrentUser\GHttpsIOCPSvr, LocalMachine\My)', [FSubjectName]);
-    Logger.Info('To create/re-create the required CNG certificate, run in PowerShell (as Admin): .\gen_quic_cert.ps1');
+    if HasExpiredInTargetStore then
+      Logger.Error('CRITICAL ERROR: TLS certificate "CN=%s" in store "%s" is EXPIRED. Startup aborted. Run .\gen_w3c_wt_cert.ps1 as Administrator to generate a new 14-day certificate.', [FSubjectName, FCertificateStore])
+    else
+    begin
+      Logger.Error('No valid certificate with accessible private key "CN=%s" found in stores (LocalMachine\%s, CurrentUser\%s)', [FSubjectName, FCertificateStore, FCertificateStore]);
+      Logger.Info('To create/re-create the required CNG certificate, run in PowerShell (as Admin): .\gen_w3c_wt_cert.ps1');
+    end;
   end;
 
   Logger.Info(Format('LoadServerCertificate END - Result: %s, FCertContext: %p', [BoolToStr(Result, True), FCertContext]));
@@ -1803,13 +1952,13 @@ begin
   if FListenSocket <> INVALID_SOCKET then
   begin
     AcceptConnection2(FListenSocket);
-    Logger.Info('HTTPS server listening on port ' + IntToStr(FHttpsPort));
+    Logger.Info('HTTPS server listening on ' + IfThen(EffectiveHttpsBindAddress = '', '0.0.0.0', EffectiveHttpsBindAddress) + ':' + IntToStr(FHttpsPort));
   end;
 
   if FListenSocketHTTP <> INVALID_SOCKET then
   begin
     AcceptConnection2(FListenSocketHTTP);
-    Logger.Info('HTTP server listening on port ' + IntToStr(FHttpPort));
+    Logger.Info('HTTP server listening on ' + IfThen(EffectiveHttpBindAddress = '', '0.0.0.0', EffectiveHttpBindAddress) + ':' + IntToStr(FHttpPort));
   end;
 
   if FEnableHttp3 and (FProtocolMode <> pmHttpOnly) then
@@ -1854,6 +2003,7 @@ begin
         begin
           FHttp3Server.QuicServer.ForceStatelessRetry := FQuicForceStatelessRetry;
           FHttp3Server.QuicServer.RequiredServerName := FQuicRequiredServerName;
+          FHttp3Server.QuicServer.BindAddress := EffectiveHttp3BindAddress;
           if FQuicAlpnProtocol <> '' then
           begin
 
@@ -1869,7 +2019,7 @@ begin
         end;
 
         FHttp3Server.Start(FHttpsPort);
-        Logger.Info(Format('HTTP/3 & WebTransport (UDP) server listening on port %d', [FHttpsPort]));
+        Logger.Info(Format('HTTP/3 & WebTransport (UDP) server listening on %s:%d', [IfThen(EffectiveHttp3BindAddress = '', '0.0.0.0', EffectiveHttp3BindAddress), FHttpsPort]));
       end;
     except
       on E: Exception do
@@ -2064,6 +2214,18 @@ begin
     except
       on E: Exception do
         Logger.Error('Exception in CertFreeCertificateContext(FH3CertContext): ' + E.Message);
+    end;
+  end;
+
+  if Assigned(FIPTrackerLock) and Assigned(FIPTracker) then
+  begin
+    FIPTrackerLock.Enter;
+    try
+      for var Item in FIPTracker.Values do
+        Item.Free;
+      FIPTracker.Clear;
+    finally
+      FIPTrackerLock.Leave;
     end;
   end;
 
@@ -2836,11 +2998,25 @@ begin
   end;
 end;
 
-function TGHttpsServerIOCP.IsWebSocketOriginAllowed(const AOrigin: string): Boolean;
+function IsLoopbackHostOrIP(const AHost: string): Boolean;
+var
+  H: string;
+begin
+  H := LowerCase(Trim(AHost));
+  if Pos('::ffff:', H) = 1 then
+    H := Copy(H, 8, MaxInt);
+  Result := (H = 'localhost') or (H = '::1') or (H = '127.0.0.1') or (Pos('127.', H) = 1);
+end;
+
+function TGHttpsServerIOCP.IsWebSocketOriginAllowed(const AOrigin: string; const AHost: string): Boolean;
 var
   AllowedList: TArray<string>;
   AllowedItem: string;
   TrimmedOrigin: string;
+  TrimmedHost: string;
+  OriginHost: string;
+  HostNoPort: string;
+  ColonPos: Integer;
 begin
   Result := False;
   TrimmedOrigin := Trim(AOrigin);
@@ -2848,6 +3024,58 @@ begin
   begin
     Result := True;
     Exit;
+  end;
+
+  if SameText(TrimmedOrigin, 'null') then
+    Exit(False);
+
+  TrimmedHost := Trim(AHost);
+  if TrimmedHost <> '' then
+  begin
+    if SameText('http://' + TrimmedHost, TrimmedOrigin) or
+       SameText('https://' + TrimmedHost, TrimmedOrigin) then
+    begin
+      Result := True;
+      Exit;
+    end;
+
+    OriginHost := TrimmedOrigin;
+    if Pos('://', OriginHost) > 0 then
+      OriginHost := Copy(OriginHost, Pos('://', OriginHost) + 3, MaxInt);
+    if Pos('/', OriginHost) > 0 then
+      OriginHost := Copy(OriginHost, 1, Pos('/', OriginHost) - 1);
+    if (Length(OriginHost) > 0) and (OriginHost[1] = '[') then
+    begin
+      if Pos(']', OriginHost) > 0 then
+        OriginHost := Copy(OriginHost, 1, Pos(']', OriginHost));
+    end
+    else
+    begin
+      ColonPos := Pos(':', OriginHost);
+      if ColonPos > 0 then
+        OriginHost := Copy(OriginHost, 1, ColonPos - 1);
+    end;
+
+    HostNoPort := TrimmedHost;
+    if (Length(HostNoPort) > 0) and (HostNoPort[1] = '[') then
+    begin
+      if Pos(']', HostNoPort) > 0 then
+        HostNoPort := Copy(HostNoPort, 1, Pos(']', HostNoPort));
+    end
+    else
+    begin
+      ColonPos := Pos(':', HostNoPort);
+      if ColonPos > 0 then
+        HostNoPort := Copy(HostNoPort, 1, ColonPos - 1);
+    end;
+
+    if (OriginHost <> '') and (HostNoPort <> '') and
+       (SameText(OriginHost, HostNoPort) or SameText(OriginHost, TrimmedHost) or
+        (IsLoopbackHostOrIP(OriginHost) and IsLoopbackHostOrIP(HostNoPort))) then
+    begin
+      Result := True;
+      Exit;
+    end;
   end;
 
   if (FAllowedWebSocketOrigins = '') or (FAllowedWebSocketOrigins = '*') then
@@ -2870,11 +3098,15 @@ begin
   end;
 end;
 
-function TGHttpsServerIOCP.IsWebTransportOriginAllowed(const AOrigin: string): Boolean;
+function TGHttpsServerIOCP.IsWebTransportOriginAllowed(const AOrigin: string; const AHost: string): Boolean;
 var
   AllowedList: TArray<string>;
   AllowedItem: string;
   TrimmedOrigin: string;
+  TrimmedHost: string;
+  OriginHost: string;
+  HostNoPort: string;
+  ColonPos: Integer;
 begin
   Result := False;
   TrimmedOrigin := Trim(AOrigin);
@@ -2882,6 +3114,58 @@ begin
   begin
     Result := True;
     Exit;
+  end;
+
+  if SameText(TrimmedOrigin, 'null') then
+    Exit(False);
+
+  TrimmedHost := Trim(AHost);
+  if TrimmedHost <> '' then
+  begin
+    if SameText('http://' + TrimmedHost, TrimmedOrigin) or
+       SameText('https://' + TrimmedHost, TrimmedOrigin) then
+    begin
+      Result := True;
+      Exit;
+    end;
+
+    OriginHost := TrimmedOrigin;
+    if Pos('://', OriginHost) > 0 then
+      OriginHost := Copy(OriginHost, Pos('://', OriginHost) + 3, MaxInt);
+    if Pos('/', OriginHost) > 0 then
+      OriginHost := Copy(OriginHost, 1, Pos('/', OriginHost) - 1);
+    if (Length(OriginHost) > 0) and (OriginHost[1] = '[') then
+    begin
+      if Pos(']', OriginHost) > 0 then
+        OriginHost := Copy(OriginHost, 1, Pos(']', OriginHost));
+    end
+    else
+    begin
+      ColonPos := Pos(':', OriginHost);
+      if ColonPos > 0 then
+        OriginHost := Copy(OriginHost, 1, ColonPos - 1);
+    end;
+
+    HostNoPort := TrimmedHost;
+    if (Length(HostNoPort) > 0) and (HostNoPort[1] = '[') then
+    begin
+      if Pos(']', HostNoPort) > 0 then
+        HostNoPort := Copy(HostNoPort, 1, Pos(']', HostNoPort));
+    end
+    else
+    begin
+      ColonPos := Pos(':', HostNoPort);
+      if ColonPos > 0 then
+        HostNoPort := Copy(HostNoPort, 1, ColonPos - 1);
+    end;
+
+    if (OriginHost <> '') and (HostNoPort <> '') and
+       (SameText(OriginHost, HostNoPort) or SameText(OriginHost, TrimmedHost) or
+        (IsLoopbackHostOrIP(OriginHost) and IsLoopbackHostOrIP(HostNoPort))) then
+    begin
+      Result := True;
+      Exit;
+    end;
   end;
 
   if (FAllowedWebTransportOrigins = '') or (FAllowedWebTransportOrigins = '*') then
@@ -3330,7 +3614,7 @@ begin
       var OriginHeader: string := Request.Headers.GetHeader('Origin').Trim;
       if OriginHeader <> '' then
       begin
-        if not IsWebSocketOriginAllowed(OriginHeader) then
+        if not IsWebSocketOriginAllowed(OriginHeader, Request.Headers.GetHeader('Host')) then
         begin
           Response.SetForbidden('Origin not allowed for WebSocket upgrade');
           ContinueSendingResponse(OverlappedEx);
@@ -3430,7 +3714,7 @@ begin
       Endpoint := nil;
       if not FEndpoints.TryGetValue(Key, Endpoint) then
       begin
-        if Request.RequestInfo.Method = hmGET then
+        if (Request.RequestInfo.Method = hmGET) and (Request.RequestInfo.Path = '/') then
         begin
           var RootKey := GetEndpointKey(hmGET, '/');
           FEndpoints.TryGetValue(RootKey, Endpoint);
@@ -3520,7 +3804,7 @@ end;
 
 procedure TGHttpsServerIOCP.HandleHttp3Request(
   Sender: TObject;
-  const AMethod, APath: string;
+  const AMethod, APath, ARemoteIP: string;
   const AHeaders: TArray<TPair<string, string>>;
   const ABody: TBytes;
   const AClientCert: TGClientCertInfo;
@@ -3558,7 +3842,7 @@ begin
     Exit;
   end;
 
-  if (CurrentHttp3RemoteIP <> '') and (not CheckIPRateLimit(CurrentHttp3RemoteIP)) then
+  if (ARemoteIP <> '') and (not CheckIPRateLimit(ARemoteIP)) then
   begin
     AStatusCode := 429;
     SetLength(AExtraHeaders, 1);
@@ -5526,7 +5810,7 @@ var
   PurePath: string;
 begin
   Result := False;
-  if not IsWebTransportOriginAllowed(Info.Origin) then
+  if not IsWebTransportOriginAllowed(Info.Origin, Info.Authority) then
     Exit;
   PurePath := LowerCase(Info.Path);
   var QMark := Pos('?', PurePath);
@@ -5569,24 +5853,36 @@ procedure TGHttpsServerIOCP.WebTransportSessionClosed(Sender: TObject; SessionId
 var
   Item: TWebTransportRouteItem;
   PurePath: string;
+  Callbacks: array of TWebTransportClosedProc;
+  CB: TWebTransportClosedProc;
 begin
+  SetLength(Callbacks, 0);
   FLock.Enter;
   try
     if Assigned(FWebTransportSessionRoutes) and FWebTransportSessionRoutes.TryGetValue(SessionId, PurePath) then
     begin
       FWebTransportSessionRoutes.Remove(SessionId);
       if FWebTransportRoutes.TryGetValue(PurePath, Item) and Assigned(Item.OnSessionClosed) then
-        Item.OnSessionClosed(SessionId);
+      begin
+        SetLength(Callbacks, 1);
+        Callbacks[0] := Item.OnSessionClosed;
+      end;
     end
     else
     begin
       for Item in FWebTransportRoutes.Values do
         if Assigned(Item.OnSessionClosed) then
-           Item.OnSessionClosed(SessionId);
+        begin
+          SetLength(Callbacks, Length(Callbacks) + 1);
+          Callbacks[High(Callbacks)] := Item.OnSessionClosed;
+        end;
     end;
   finally
     FLock.Leave;
   end;
+
+  for CB in Callbacks do
+    CB(SessionId);
 end;
 
 procedure TGHttpsServerIOCP.WebTransportStreamData(Sender: TObject; Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes);

@@ -512,6 +512,8 @@ function FreeContextBuffer(pvContextBuffer: Pointer): SECURITY_STATUS; stdcall;
 procedure SafeFreeSSLBuffer(var Buffer: Pointer);
 procedure AppendBytesToFile(const FileName: string; const Data: TBytes);
 
+function GetPrimaryIPv4Address: string;
+
 implementation
 
 uses System.SyncObjs;
@@ -685,5 +687,61 @@ begin
   end;
 end;
 
+
+
+function GetPrimaryIPv4Address: string;
+var
+  WSAData: TWSAData;
+  NeedCleanup: Boolean;
+  Sock: TSocket;
+  TargetAddr, LocalAddr: sockaddr_in;
+  LocalAddrLen: Integer;
+  EnvHost: string;
+  HostName: array[0..255] of AnsiChar;
+  HostEnt: PHostEnt;
+begin
+  EnvHost := Trim(GetEnvironmentVariable('SERVER_HOST'));
+  if EnvHost <> '' then
+    Exit(EnvHost);
+
+  Result := '127.0.0.1';
+  NeedCleanup := False;
+  if WSAStartup(MAKEWORD(2, 2), WSAData) = 0 then
+    NeedCleanup := True;
+
+  Sock := socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if Sock <> INVALID_SOCKET then
+  begin
+    FillChar(TargetAddr, SizeOf(TargetAddr), 0);
+    TargetAddr.sin_family := AF_INET;
+    TargetAddr.sin_port := htons(53);
+    TargetAddr.sin_addr.S_addr := inet_addr('1.1.1.1');
+
+    if connect(Sock, TSockAddr(TargetAddr), SizeOf(TargetAddr)) = 0 then
+    begin
+      LocalAddrLen := SizeOf(LocalAddr);
+      FillChar(LocalAddr, SizeOf(LocalAddr), 0);
+      if getsockname(Sock, TSockAddr(LocalAddr), LocalAddrLen) = 0 then
+      begin
+        if LocalAddr.sin_addr.S_addr <> 0 then
+          Result := string(inet_ntoa(LocalAddr.sin_addr));
+      end;
+    end;
+    closesocket(Sock);
+  end;
+
+  if (Result = '127.0.0.1') or (Result = '0.0.0.0') then
+  begin
+    if gethostname(HostName, SizeOf(HostName)) = 0 then
+    begin
+      HostEnt := gethostbyname(HostName);
+      if (HostEnt <> nil) and (HostEnt^.h_addr_list <> nil) and (HostEnt^.h_addr_list^ <> nil) then
+        Result := string(inet_ntoa(PInAddr(HostEnt^.h_addr_list^)^));
+    end;
+  end;
+
+  if NeedCleanup then
+    WSACleanup;
+end;
 
 end.

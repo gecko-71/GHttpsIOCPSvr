@@ -36,6 +36,7 @@ uses
   Quick.Logger,
   GTerm.Types,
   GTerm.AppConfig,
+  GTerm.UserConfig,
   GTerm.ConPty,
   MsQuic.Types,
   WebTransport.Types,
@@ -44,24 +45,30 @@ uses
 type
   TGTermSession = class
   private
+    FRefCount: Integer;
     FWTSession: TWTSessionContext;
     FWTStream: HQUIC;
     FConPty: TGTermConPty;
     FCols: Integer;
     FRows: Integer;
     FProfile: TGTermAppProfile;
+    FUsername: string;
+    FRole: string;
     FClosed: Boolean;
     FStopping: Integer;
     FSessionLock: TCriticalSection;
     FConnectedTick: UInt64;
     FLastActivityTick: UInt64;
+    FInitialBuffer: TBytes;
     procedure HandlePtyDataReceived(const AData: TBytes; ACount: Integer);
     procedure HandleProcessTerminated(AExitCode: DWORD);
     procedure SendClientText(const AText: string);
     procedure ProcessSingleClientMessage(const AMessageText: string);
   public
-    constructor Create(AWTSession: PWTSessionContext; const AProfile: TGTermAppProfile);
+    constructor Create(AWTSession: PWTSessionContext; const AProfile: TGTermAppProfile; const AUsername: string = ''; const ARole: string = '');
     destructor Destroy; override;
+    procedure Retain;
+    procedure Release;
     procedure SetWTStream(ASession: PWTSessionContext; AStream: HQUIC);
     procedure Start;
     procedure Stop;
@@ -74,6 +81,7 @@ type
     property WTStream: HQUIC read FWTStream;
     property ConPty: TGTermConPty read FConPty;
     property Profile: TGTermAppProfile read FProfile;
+    property Username: string read FUsername;
     property Cols: Integer read FCols;
     property Rows: Integer read FRows;
   end;
@@ -82,6 +90,7 @@ type
     SessionId: UInt64;
     AppKey: string;
     ProfileName: string;
+    Username: string;
     ProcessId: DWORD;
     Cols: Integer;
     Rows: Integer;
@@ -112,6 +121,7 @@ type
     destructor Destroy; override;
     procedure RegisterSession(SessionKey: Pointer; ASession: TGTermSession);
     function FindSession(SessionKey: Pointer): TGTermSession;
+    function AcquireSession(SessionKey: Pointer): TGTermSession;
     procedure UnregisterAndFreeSession(SessionKey: Pointer);
     function GetSessionSnapshots: TArray<TGTermSessionInfo>;
     function TerminateSessionById(ASessionId: UInt64): Boolean;
@@ -122,15 +132,18 @@ type
 
 implementation
 
-constructor TGTermSession.Create(AWTSession: PWTSessionContext; const AProfile: TGTermAppProfile);
+constructor TGTermSession.Create(AWTSession: PWTSessionContext; const AProfile: TGTermAppProfile; const AUsername: string = ''; const ARole: string = '');
 begin
   inherited Create;
+  FRefCount := 1;
   if AWTSession <> nil then
     FWTSession := AWTSession^
   else
     FWTSession := Default(TWTSessionContext);
   FWTStream := nil;
   FProfile := AProfile;
+  FUsername := AUsername;
+  FRole := ARole;
   FClosed := False;
   FStopping := 0;
   FConnectedTick := GetTickCount64;
@@ -167,14 +180,38 @@ begin
   inherited Destroy;
 end;
 
+procedure TGTermSession.Retain;
+begin
+  TInterlocked.Increment(FRefCount);
+end;
+
+procedure TGTermSession.Release;
+begin
+  if TInterlocked.Decrement(FRefCount) <= 0 then
+    Free;
+end;
+
 procedure TGTermSession.SetWTStream(ASession: PWTSessionContext; AStream: HQUIC);
 var
   IsNewStream: Boolean;
+  PendingBytes: TBytes;
 begin
   IsNewStream := (FWTStream = nil) or (FWTStream <> AStream);
   if ASession <> nil then
     FWTSession := ASession^;
   FWTStream := AStream;
+  if FSessionLock <> nil then
+    FSessionLock.Enter;
+  try
+    PendingBytes := FInitialBuffer;
+    SetLength(FInitialBuffer, 0);
+  finally
+    if FSessionLock <> nil then
+      FSessionLock.Leave;
+  end;
+  Logger.Info(Format('[Session] SetWTStream called: Stream=%p, PendingBytes=%d', [Pointer(AStream), Length(PendingBytes)]));
+  if (FWTStream <> nil) and (Length(PendingBytes) > 0) then
+    FWTSession.SendOnStream(FWTStream, PendingBytes, False);
   FLastActivityTick := GetTickCount64;
   if not FConPty.Running then
     Start;
@@ -183,7 +220,11 @@ begin
 end;
 
 procedure TGTermSession.Start;
+var
+  Started: Boolean;
 begin
+  if FProfile.Sandbox = smInvalid then Exit;
+  if FClosed or (FStopping <> 0) then Exit;
   if not FConPty.Running then
   begin
     FConPty.SandboxMode := FProfile.Sandbox;
@@ -191,7 +232,19 @@ begin
     FConPty.OnProcessTerminated := HandleProcessTerminated;
     Logger.Info(Format('[Session] Starting session for profile "%s" (Command: %s) sandbox=%d net=%s',
       [FProfile.ProfileName, FProfile.CommandLine, Ord(FProfile.Sandbox), IfThen(FProfile.NetworkAccess, 'true', 'false')]));
-    FConPty.StartProcess(FProfile.CommandLine, FProfile.WorkingDirectory, FProfile.AllowedDirsRead, FProfile.AllowedDirsWrite, FProfile.EnvironmentVars, FProfile.NetworkAccess);
+    Started := FConPty.StartProcess(FProfile.CommandLine, FProfile.WorkingDirectory, FProfile.AllowedDirsRead, FProfile.AllowedDirsWrite, FProfile.EnvironmentVars, FProfile.NetworkAccess);
+    if not Started then
+    begin
+      Logger.Error(Format('[Session] Process failed to start for app: %s', [FProfile.ProfileName]));
+      var ErrMsg := #13#10#27'[1;31m[GTermBox Error] Application unavailable: "' + FProfile.ProfileName + '"'#27'[0m'#13#10 +
+                    #27'[33mThe specified application is not installed on this server.'#27'[0m'#13#10#13#10;
+      var ErrBytes := TEncoding.UTF8.GetBytes(ErrMsg);
+      if FWTStream <> nil then
+        FWTSession.SendOnStream(FWTStream, ErrBytes, False);
+      SendClientText('{"type":"app_error","app":"' + FProfile.ProfileName + '","reason":"process_failed"}');
+      Stop;
+      Exit;
+    end;
   end;
 end;
 
@@ -201,16 +254,64 @@ var
   WantedProfile: TGTermAppProfile;
   CurrentSandbox: string;
 begin
+  if FUsername <> '' then
+  begin
+    var EffectiveRole := FRole;
+    if EffectiveRole = '' then EffectiveRole := 'user';
+    if not TGTermAppConfig.Instance.CanRoleAccessApp(EffectiveRole, AAppKey) or
+       not TGTermUserConfig.Instance.CanAccessApp(FUsername, AAppKey) then
+    begin
+      Logger.Warn(Format('[Session] SwitchProfile forbidden for user "%s" (role: %s) to app "%s"',
+        [FUsername, EffectiveRole, AAppKey]));
+      Stop;
+      Exit;
+    end;
+  end;
+
   CurrentSandbox := ExtractFileName(FProfile.WorkingDirectory);
   if TGTermAppConfig.Instance.FindById(AAppKey, Entry) then
     WantedProfile := Entry.ToProfile(CurrentSandbox)
   else
     WantedProfile := TGTermAppConfig.Instance.GetDefaultProfile(CurrentSandbox);
 
+
+
+  var UserEntry: TUserEntry;
+  if (FUsername <> '') and TGTermUserConfig.Instance.FindUser(FUsername, UserEntry) then
+  begin
+    WantedProfile.NetworkAccess := WantedProfile.NetworkAccess and UserEntry.Grants.Network;
+    if (Pos('powershell', LowerCase(WantedProfile.CommandLine)) > 0) or SameText(AAppKey, 'powershell') or SameText(AAppKey, 'admin-powershell') then
+    begin
+      if UserEntry.CanPowerShellAccessEverywhere then
+        WantedProfile.Sandbox := smJobOnly
+      else
+      begin
+        WantedProfile.Sandbox := smStandard;
+        SetLength(WantedProfile.EnvironmentVars, Length(WantedProfile.EnvironmentVars) + 1);
+        WantedProfile.EnvironmentVars[High(WantedProfile.EnvironmentVars)] := 'GTERM_RESTRICT_PS=1';
+      end;
+    end
+    else
+    begin
+      if UserEntry.IsAdmin or UserEntry.Grants.FullDiskAccess then
+        WantedProfile.Sandbox := smJobOnly
+      else if not UserEntry.Grants.AllowJobOnly then
+        WantedProfile.Sandbox := smStandard;
+    end;
+  end
+  else if SameText(FRole, 'admin') then
+    WantedProfile.Sandbox := smJobOnly;
+  if (WantedProfile.Sandbox = smJobOnly) and not SameText(FRole, 'admin') and not (TGTermUserConfig.Instance.FindUser(FUsername, UserEntry) and (UserEntry.Grants.AllowJobOnly or UserEntry.Grants.FullDiskAccess)) then
+    WantedProfile.Sandbox := smStandard;
+
   if FProfile.ProfileName <> WantedProfile.ProfileName then
   begin
     if FConPty.Running then
       FConPty.StopProcess;
+    if Length(WantedProfile.AllowedDirsRead) = 0 then
+      WantedProfile.AllowedDirsRead := FProfile.AllowedDirsRead;
+    if Length(WantedProfile.AllowedDirsWrite) = 0 then
+      WantedProfile.AllowedDirsWrite := FProfile.AllowedDirsWrite;
     FCols := WantedProfile.DefaultCols;
     FRows := WantedProfile.DefaultRows;
     FProfile := WantedProfile;
@@ -269,35 +370,68 @@ procedure TGTermSession.SendInitialScreen;
 begin
   if FClosed or (FWTStream = nil) then Exit;
   if Assigned(FConPty) and FConPty.Running then
-    FConPty.Resize(FCols, FRows);
+    begin
+      FConPty.Resize(FCols, FRows + 1);
+      FConPty.Resize(FCols, FRows);
+    end;
 end;
 
 procedure TGTermSession.HandlePtyDataReceived(const AData: TBytes; ACount: Integer);
 begin
-  if FClosed or (FStopping <> 0) or (Length(AData) = 0) then Exit;
+  Retain;
+  try
+    if FClosed or (FStopping <> 0) or (Length(AData) = 0) then Exit;
+    FLastActivityTick := GetTickCount64;
+    Logger.Info(Format('[Session] PTY data received: %d bytes (Stream=%p)', [Length(AData), Pointer(FWTStream)]));
 
-  if FWTStream <> nil then
-    FWTSession.SendOnStream(FWTStream, AData, False);
+    if FWTStream <> nil then
+      begin
+        FWTSession.SendOnStream(FWTStream, AData, False);
+      end
+      else
+      begin
+        if FSessionLock <> nil then
+          FSessionLock.Enter;
+        try
+          var OldLen := Length(FInitialBuffer);
+          if OldLen + Length(AData) < 524288 then
+          begin
+            SetLength(FInitialBuffer, OldLen + Length(AData));
+            Move(AData[0], FInitialBuffer[OldLen], Length(AData));
+          end;
+        finally
+          if FSessionLock <> nil then
+            FSessionLock.Leave;
+        end;
+      end;
+  finally
+    Release;
+  end;
 end;
 
 procedure TGTermSession.HandleProcessTerminated(AExitCode: DWORD);
 begin
-  Logger.Warn(Format('[Session] Process terminated with exit code %d', [AExitCode]));
-  SendClientText('{"type":"logout","reason":"terminated"}');
-  Stop;
+  Retain;
+  try
+    Logger.Warn(Format('[Session] Process terminated with exit code %d', [AExitCode]));
+    SendClientText('{"type":"logout","reason":"terminated"}');
+    Stop;
+  finally
+    Release;
+  end;
 end;
 
 procedure TGTermSession.ProcessClientMessage(const AMessageText: string);
 var
   CleanText: string;
 begin
-  if FClosed or (AMessageText = '') then Exit;
+  if FClosed or (FStopping <> 0) or (AMessageText = '') or (Length(AMessageText) > 65536) then Exit;
   FLastActivityTick := GetTickCount64;
 
   CleanText := Trim(AMessageText);
   if (CleanText <> '') and (CleanText[1] = '{') and (CleanText[Length(CleanText)] = '}') then
     ProcessSingleClientMessage(CleanText)
-  else
+  else if Assigned(FConPty) and FConPty.Running then
     FConPty.WriteInput(AMessageText);
 end;
 
@@ -321,14 +455,14 @@ begin
     if MsgType = 'input' then
     begin
       var InputStr := JsonObj.GetValue<string>('data', '');
-      if InputStr <> '' then
+      if (InputStr <> '') and Assigned(FConPty) and FConPty.Running then
         FConPty.WriteInput(InputStr);
     end
     else if MsgType = 'resize' then
     begin
       NewCols := JsonObj.GetValue<Integer>('cols', FCols);
       NewRows := JsonObj.GetValue<Integer>('rows', FRows);
-      if (NewCols > 0) and (NewRows > 0) then
+      if (NewCols > 0) and (NewRows > 0) and Assigned(FConPty) and FConPty.Running then
       begin
         FCols := NewCols;
         FRows := NewRows;
@@ -430,6 +564,19 @@ begin
   end;
 end;
 
+function TGTermSessionManager.AcquireSession(SessionKey: Pointer): TGTermSession;
+begin
+  Result := nil;
+  if (Self = nil) or (FLock = nil) or (FSessions = nil) then Exit;
+  TMonitor.Enter(FLock);
+  try
+    if FSessions.TryGetValue(SessionKey, Result) and Assigned(Result) then
+      Result.Retain;
+  finally
+    TMonitor.Exit(FLock);
+  end;
+end;
+
 procedure TGTermSessionManager.UnregisterAndFreeSession(SessionKey: Pointer);
 var
   Session: TGTermSession;
@@ -450,7 +597,7 @@ begin
   if Assigned(Session) then
   begin
     Session.Stop;
-    Session.Free;
+    Session.Release;
   end;
 end;
 
@@ -505,22 +652,29 @@ end;
 
 procedure TGTermSessionManager.Clear;
 var
+  SessionList: TList<TGTermSession>;
   Session: TGTermSession;
 begin
   if (Self = nil) or (FLock = nil) or (FSessions = nil) then Exit;
-  TMonitor.Enter(FLock);
+  SessionList := TList<TGTermSession>.Create;
   try
-    for Session in FSessions.Values do
-    begin
-      if Assigned(Session) then
-      begin
-        Session.Stop;
-        Session.Free;
-      end;
+    TMonitor.Enter(FLock);
+    try
+      for Session in FSessions.Values do
+        if Assigned(Session) then
+          SessionList.Add(Session);
+      FSessions.Clear;
+    finally
+      TMonitor.Exit(FLock);
     end;
-    FSessions.Clear;
+
+    for Session in SessionList do
+    begin
+      Session.Stop;
+      Session.Release;
+    end;
   finally
-    TMonitor.Exit(FLock);
+    SessionList.Free;
   end;
 end;
 
@@ -543,6 +697,7 @@ begin
           Info.SessionId := UInt64(Pair.Key);
           Info.AppKey := Pair.Value.Profile.ProfileName;
           Info.ProfileName := Pair.Value.Profile.ProfileName;
+          Info.Username := Pair.Value.Username;
           if Assigned(Pair.Value.ConPty) then
             Info.ProcessId := Pair.Value.ConPty.ProcessId
           else

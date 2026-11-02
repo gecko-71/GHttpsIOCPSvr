@@ -1057,10 +1057,10 @@ begin
       begin
         Logger.Info('=====================================================');
         Logger.Info('  HLS Live Cinema Broadcast Running on port: ' + IntToStr(SERVER_PORT));
-        Logger.Info('  Web UI Stream URL:    https://localhost:' + IntToStr(SERVER_PORT) + '/');
-        Logger.Info('  VLC Stream URL:       https://localhost:' + IntToStr(SERVER_PORT) + '/live/stream.m3u8');
-        Logger.Info('  WebSocket Status:     wss://localhost:' + IntToStr(SERVER_PORT) + '/status-ws');
-        Logger.Info('  WebTransport Status:  https://localhost:' + IntToStr(SERVER_PORT) + '/status-wt');
+        Logger.Info('  Web UI Stream URL:    https://' + GetPrimaryIPv4Address + ':' + IntToStr(SERVER_PORT) + '/');
+        Logger.Info('  VLC Stream URL:       https://' + GetPrimaryIPv4Address + ':' + IntToStr(SERVER_PORT) + '/live/stream.m3u8');
+        Logger.Info('  WebSocket Status:     wss://' + GetPrimaryIPv4Address + ':' + IntToStr(SERVER_PORT) + '/status-ws');
+        Logger.Info('  WebTransport Status:  https://' + GetPrimaryIPv4Address + ':' + IntToStr(SERVER_PORT) + '/status-wt');
         Logger.Info('  Active Protocols:     HTTP/1.1 + HTTP/2 + HTTP/3 + WS + WebTransport');
         Logger.Info('=====================================================');
         Logger.Info('Press ENTER to shut down server cleanly...');
@@ -1087,7 +1087,7 @@ begin
       begin
         Writeln;
         Writeln('================================================================');
-        Writeln(Format('  CRITICAL ERROR: Failed to start server on https://localhost:%d/', [SERVER_PORT]));
+        Writeln(Format('  CRITICAL ERROR: Failed to start server on https://%s:%d/', [GetPrimaryIPv4Address, SERVER_PORT]));
         Writeln('  Server cannot run due to startup failure (e.g. missing required DLL or certificate).');
         Writeln('  Application will terminate now.');
         Writeln('================================================================');

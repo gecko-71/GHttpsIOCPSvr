@@ -1,4 +1,4 @@
-﻿{
+{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -154,7 +154,7 @@ begin
     Logger.Info('  Active mTLS Level:   %s', [mTLSModeStr]);
     Logger.Info('============================================================');
 
-    Server := TGHttpsServerIOCP.Create(HttpsPortParam, 'localhost',
+    Server := TGHttpsServerIOCP.Create(HttpsPortParam, GetPrimaryIPv4Address,
                                        CertStoreNameParam,
                                       'SuperSecretDemo10MtlsKey1234567890!',
                                       2000, 1000000,

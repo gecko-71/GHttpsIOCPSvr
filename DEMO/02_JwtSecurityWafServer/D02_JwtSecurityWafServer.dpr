@@ -52,8 +52,9 @@ uses
   OverlappedExPool in '..\..\src\OverlappedExPool.pas',
   WinApiAdditions in '..\..\src\WinApiAdditions.pas';
 
+var
+  SERVER_HOST: string = '';
 const
-  SERVER_HOST = 'localhost';
   SERVER_PORT = 8082;
   CertStoreName = 'GHttpsIOCPSvr';
   SECRET_KEY = 'SuperSecretWafKeyForDemo02JwtSecurityAndWafProtection123!';
@@ -201,6 +202,7 @@ begin
 end;
 
 begin
+  SERVER_HOST := GetPrimaryIPv4Address;
   ConfigureFastMM;
   try
     Logger.Providers.Add(GlobalLogFileProvider);

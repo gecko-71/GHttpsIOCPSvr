@@ -1,4 +1,4 @@
-﻿program D04_WebSocketChatAndTelemetryServer;
+program D04_WebSocketChatAndTelemetryServer;
 
 {
   MIT License
@@ -49,8 +49,9 @@ uses
   OverlappedExPool in '..\..\src\OverlappedExPool.pas',
   WinApiAdditions in '..\..\src\WinApiAdditions.pas';
 
+var
+  SERVER_HOST: string = '';
 const
-  SERVER_HOST = 'localhost';
   SERVER_PORT = 8443;
   CertStoreName = 'GHttpsIOCPSvr';
 
@@ -176,7 +177,7 @@ begin
           '      <span id="wsStatus" class="status-badge status-offline"><span class="dot"></span> Disconnected</span>' + sLineBreak +
         '    </div>' + sLineBreak +
         '    <div>' + sLineBreak +
-          '      <span>Socket Address: </span><strong style="color: var(--accent);">wss://localhost:8443/ws</strong>' + sLineBreak +
+          '      <span>Socket Address: </span><strong style="color: var(--accent);">wss://' + SERVER_HOST + ':8443/ws</strong>' + sLineBreak +
         '    </div>' + sLineBreak +
       '  </div>' + sLineBreak +
  
@@ -359,6 +360,7 @@ begin
 end;
 
 begin
+  SERVER_HOST := GetPrimaryIPv4Address;
   ConfigureFastMM;
   try
     Logger.Providers.Add(GlobalLogFileProvider);

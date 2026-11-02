@@ -554,7 +554,7 @@ begin
     var WebRootDir := GetWebRootDir;
     Logger.Info('Web Root Directory: ' + WebRootDir);
 
-    var Server := TGHttpsServerIOCP.Create(SERVER_PORT, 'localhost', CertStoreName, 'YourSuperSecretKeyThatIsVeryLongAndVerySecure123!', 2000, 1000000);
+    var Server := TGHttpsServerIOCP.Create(SERVER_PORT, GetPrimaryIPv4Address, CertStoreName, 'YourSuperSecretKeyThatIsVeryLongAndVerySecure123!', 2000, 1000000);
     try
       Server.SetSSLShutdownOptions(True, 200);
 
@@ -694,7 +694,7 @@ begin
 
       if Server.Start then
       begin
-        Logger.Info(Format('Morse Audio Radio server started successfully at https://localhost:%d/', [SERVER_PORT]));
+        Logger.Info(Format('Morse Audio Radio server started successfully at https://%s:%d/', [GetPrimaryIPv4Address, SERVER_PORT]));
 
         var BroadcastThread := TMorseBroadcastThread.Create(Server, DEFAULT_BROADCAST_TEXT);
         GBroadcastThread := BroadcastThread;

@@ -1,7 +1,7 @@
 ﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{F1E2D3C4-B5A6-47F8-9012-3456789ABCDE}</ProjectGuid>
-        <ProjectVersion>20.1</ProjectVersion>
+        <ProjectVersion>20.3</ProjectVersion>
         <FrameworkType>None</FrameworkType>
         <MainSource>GTermBoxServer.dpr</MainSource>
         <Base>True</Base>
@@ -93,6 +93,7 @@
         <DCCReference Include="GHttpsIOCPSvr\Http3DelphiV3\MsQuic.Types.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Types.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Session.pas"/>
+        <DCCReference Include="src\GTerm.AmsiScanner.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

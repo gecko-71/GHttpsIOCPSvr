@@ -1,2 +1,23 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
-<BorlandProject/>
+<BorlandProject>
+	<ProjectSortOrder AutoSort="0" SortType="0">
+    <File Path="src"/>
+    <File Path="src\GTerm.AmsiScanner.pas"/>
+    <File Path="src\GTerm.AppConfig.pas"/>
+    <File Path="src\GTerm.ConPty.Loader.pas"/>
+    <File Path="src\GTerm.ConPty.pas"/>
+    <File Path="src\GTerm.Session.pas"/>
+    <File Path="src\GTerm.Types.pas"/>
+    <File Path="src\GTerm.UserConfig.pas"/>
+    <File Path="GHttpsIOCPSvr\src\GHttpsServerIOCP.pas"/>
+    <File Path="GHttpsIOCPSvr\src\GJWTManager.pas"/>
+    <File Path="GHttpsIOCPSvr\src\GRequest.pas"/>
+    <File Path="GHttpsIOCPSvr\src\GRequestBody.pas"/>
+    <File Path="GHttpsIOCPSvr\src\GResponse.pas"/>
+    <File Path="GHttpsIOCPSvr\src\OverlappedExPool.pas"/>
+    <File Path="GHttpsIOCPSvr\src\WinApiAdditions.pas"/>
+    <File Path="GHttpsIOCPSvr\Http3DelphiV3\MsQuic.Types.pas"/>
+    <File Path="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Types.pas"/>
+    <File Path="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Session.pas"/>
+  </ProjectSortOrder>
+</BorlandProject>

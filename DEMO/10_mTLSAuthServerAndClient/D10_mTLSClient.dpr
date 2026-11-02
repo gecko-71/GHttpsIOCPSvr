@@ -34,7 +34,7 @@ uses
   MtlsClientUtils in 'MtlsClientUtils.pas';
 
 var
-  ServerHost: string = '127.0.0.1';
+  ServerHost: string = '';
   ServerPort: Word = 8453;
   CertsDir: string = 'cercts_client';
 
@@ -255,6 +255,17 @@ end;
 
 begin
   try
+    ServerHost := GetEnvironmentVariable('SERVER_HOST');
+    if ServerHost = '' then
+    begin
+      if ParamCount >= 1 then
+        ServerHost := ParamStr(1)
+      else
+        ServerHost := GetPrimaryIPv4Address;
+    end;
+    if ParamCount >= 2 then
+      ServerPort := StrToIntDef(ParamStr(2), 8453);
+
     CertsDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'cercts_client');
     if not DirectoryExists(CertsDir) then
     begin

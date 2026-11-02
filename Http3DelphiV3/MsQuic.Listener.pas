@@ -51,7 +51,7 @@ type
     constructor Create(const AApi: PQuicApiTable; ARegistration: TMsQuicRegistration);
     destructor Destroy; override;
 
-    procedure Start(const AlpnProtocol: AnsiString; Port: Word);
+    procedure Start(const AlpnProtocol: AnsiString; Port: Word; const BindAddress: string = '');
     procedure Stop;
 
     property Handle: HQUIC read FHandle;
@@ -91,11 +91,12 @@ begin
   inherited Destroy;
 end;
 
-procedure TMsQuicListener.Start(const AlpnProtocol: AnsiString; Port: Word);
+procedure TMsQuicListener.Start(const AlpnProtocol: AnsiString; Port: Word; const BindAddress: string);
 var
   AlpnBuffer: QUIC_BUFFER;
   Status: QUIC_STATUS;
   LocalAddr: TSOCKADDR_INET;
+  Ipv4Value: u_long;
 begin
   if (FApi = nil) or (FHandle = nil) then
      Exit;
@@ -108,7 +109,16 @@ begin
   AlpnBuffer.Buffer := PByte(PAnsiChar(FAlpnStorage));
 
   FillChar(LocalAddr, SizeOf(LocalAddr), 0);
-  LocalAddr.si_family := AF_UNSPEC;
+  if BindAddress = '' then
+    LocalAddr.si_family := AF_UNSPEC
+  else
+  begin
+    Ipv4Value := inet_addr(PAnsiChar(AnsiString(BindAddress)));
+    if (Ipv4Value = u_long(INADDR_NONE)) and (BindAddress <> '255.255.255.255') then
+      raise EMsQuicError.Create('Invalid IPv4 bind address for QUIC listener: ' + BindAddress, $C000000D);
+    LocalAddr.si_family := AF_INET;
+    LocalAddr.Ipv4.sin_addr.S_addr := Ipv4Value;
+  end;
   LocalAddr.Ipv4.sin_port := htons(Port);
 
   Status := FApi.ListenerStart(FHandle, @AlpnBuffer, 1, @LocalAddr);

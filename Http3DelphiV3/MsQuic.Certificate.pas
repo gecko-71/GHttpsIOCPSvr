@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) 2026 GECKO-71
@@ -242,6 +242,14 @@ begin
         hStoreToSearch, X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, 0,
         CERT_FIND_SUBJECT_STR_W, PWideChar(FallbackSubject), nil
       );
+
+      if (pSearchContext = nil) and (FallbackSubject <> 'localhost') then
+      begin
+        pSearchContext := CertFindCertificateInStore(
+          hStoreToSearch, X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, 0,
+          CERT_FIND_SUBJECT_STR_W, PWideChar('localhost'), nil
+        );
+      end;
     end;
 
     if pSearchContext <> nil then

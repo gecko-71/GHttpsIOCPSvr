@@ -104,7 +104,7 @@ begin
     Logger.Info('  Client Thumbprint (USB):%s', [PinnedClientThumbprint]);
     Logger.Info('============================================================');
 
-    Server := TGHttpsServerIOCP.Create(HttpsPortParam, 'localhost', CertStoreNameParam,
+    Server := TGHttpsServerIOCP.Create(HttpsPortParam, GetPrimaryIPv4Address, CertStoreNameParam,
                                       'SuperSecretSimpleMtlsKey123456789!',
                                       2000, 1000000,
                                       DEFAULT_MAX_REQUEST_HEDER_SIZE,
@@ -161,7 +161,7 @@ begin
       end;
 
       Logger.Info('[INFO] Simple mTLS server is running.');
-      Logger.Info('  Secured endpoint: https://localhost:%d/api/secret-data', [HttpsPortParam]);
+      Logger.Info('  Secured endpoint: https://%s:%d/api/secret-data', [GetPrimaryIPv4Address, HttpsPortParam]);
       Logger.Info('  Press [ENTER] to stop the server.');
       Logger.Info('------------------------------------------------------------');
 

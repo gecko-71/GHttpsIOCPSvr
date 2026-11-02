@@ -26,7 +26,7 @@ unit GTerm.AppConfig;
 interface
 
 uses
-  System.SysUtils, System.Classes, System.JSON, System.IOUtils,
+  Winapi.Windows, System.SysUtils, System.Classes, System.JSON, System.IOUtils,
   System.Generics.Collections,
   Quick.Logger, GTerm.Types;
 
@@ -46,14 +46,18 @@ type
     AllowedDirsWrite: TArray<string>;
     Roles: TArray<string>;
     function ToProfile(const ASandboxDir: string = ''): TGTermAppProfile;
+    function IsExecutableAvailable: Boolean;
   end;
 
   TGTermAppConfig = class
   private
     FApps: TArray<TAppEntry>;
+    FConfigPath: string;
+    FLastWriteTime: TDateTime;
     class var FInstance: TGTermAppConfig;
     class function GetInstance: TGTermAppConfig; static;
     function ParseSandbox(const S: string): TSandboxMode;
+    procedure CheckReload;
   public
     procedure LoadFromFile(const APath: string);
     function FindById(const AId: string; out AEntry: TAppEntry): Boolean;
@@ -65,6 +69,8 @@ type
     class property Instance: TGTermAppConfig read GetInstance;
     class destructor Destroy;
   end;
+
+procedure DeployAppToSandbox(const ASrcDir, ADstDir: string);
 
 implementation
 
@@ -89,8 +95,21 @@ begin
     Result := smJobOnly
   else if Lower = 'standard' then
     Result := smStandard
+  else if Lower = 'none' then
+    Result := smNone
   else
-    Result := smNone;
+    Result := smInvalid;
+end;
+
+procedure TGTermAppConfig.CheckReload;
+var
+  CurrTime: TDateTime;
+begin
+  if (FConfigPath <> '') and FileExists(FConfigPath) then
+  begin
+    if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
+      LoadFromFile(FConfigPath);
+  end;
 end;
 
 procedure TGTermAppConfig.LoadFromFile(const APath: string);
@@ -112,6 +131,9 @@ begin
     Logger.Warn(Format('[Config] apps.json not found at: %s — using hardcoded defaults', [APath]));
     Exit;
   end;
+
+  FConfigPath := APath;
+  FileAge(APath, FLastWriteTime);
 
   try
     with TStringList.Create do
@@ -225,6 +247,7 @@ end;
 
 function TGTermAppConfig.FindByIndex(AIndex: Integer; out AEntry: TAppEntry): Boolean;
 begin
+  CheckReload;
   if (AIndex >= 0) and (AIndex < Length(FApps)) then
   begin
     AEntry := FApps[AIndex];
@@ -238,6 +261,7 @@ var
   I: Integer;
   Lower: string;
 begin
+  CheckReload;
   Lower := LowerCase(AId);
   for I := 0 to High(FApps) do
   begin
@@ -252,11 +276,13 @@ end;
 
 function TGTermAppConfig.AppCount: Integer;
 begin
+  CheckReload;
   Result := Length(FApps);
 end;
 
 function TGTermAppConfig.GetDefaultProfile(const ASandboxDir: string = ''): TGTermAppProfile;
 begin
+  CheckReload;
   if Length(FApps) > 0 then
     Result := FApps[0].ToProfile(ASandboxDir)
   else
@@ -277,6 +303,7 @@ end;
 
 function TGTermAppConfig.GetDefaultAppId: string;
 begin
+  CheckReload;
   if Length(FApps) > 0 then
     Result := FApps[0].Id
   else
@@ -289,6 +316,7 @@ var
   I: Integer;
   RoleLower: string;
 begin
+  CheckReload;
   Result := False;
   if not FindById(AAppId, App) then Exit;
   if Length(App.Roles) = 0 then Exit(True);
@@ -297,6 +325,40 @@ begin
   begin
     if (App.Roles[I] = '*') or (LowerCase(Trim(App.Roles[I])) = RoleLower) then
       Exit(True);
+  end;
+end;
+
+procedure DeployAppToSandbox(const ASrcDir, ADstDir: string);
+var
+  SearchRec: TSearchRec;
+  SrcItem, DstItem: string;
+begin
+  if not TDirectory.Exists(ADstDir) then
+    TDirectory.CreateDirectory(ADstDir);
+
+  if FindFirst(TPath.Combine(ASrcDir, '*'), faAnyFile, SearchRec) = 0 then
+  begin
+    try
+      repeat
+        if (SearchRec.Name <> '.') and (SearchRec.Name <> '..') then
+        begin
+          SrcItem := TPath.Combine(ASrcDir, SearchRec.Name);
+          DstItem := TPath.Combine(ADstDir, SearchRec.Name);
+          if (SearchRec.Attr and faDirectory) <> 0 then
+            DeployAppToSandbox(SrcItem, DstItem)
+          else
+          begin
+            if not FileExists(DstItem) then
+            begin
+              if not CreateHardLinkW(PChar(DstItem), PChar(SrcItem), nil) then
+                CopyFileW(PChar(SrcItem), PChar(DstItem), False);
+            end;
+          end;
+        end;
+      until FindNext(SearchRec) <> 0;
+    finally
+      FindClose(SearchRec);
+    end;
   end;
 end;
 
@@ -309,15 +371,10 @@ var
   Arg: string;
   ArgsStr: string;
   ActualSandbox: string;
+  MasterAppDir: string;
+  SandboxAppDir: string;
 begin
   ExeDir := ExtractFilePath(ParamStr(0));
-
-  FullCmd := Command;
-  if not TPath.IsPathRooted(FullCmd) then
-  begin
-    if FileExists(ExeDir + FullCmd) or DirectoryExists(ExeDir + FullCmd) then
-      FullCmd := ExeDir + FullCmd;
-  end;
 
   if ASandboxDir <> '' then
     ActualSandbox := ASandboxDir
@@ -327,7 +384,7 @@ begin
   if ActualSandbox <> '' then
   begin
     if not TPath.IsPathRooted(ActualSandbox) then
-      FullWorkDir := ExeDir + ActualSandbox
+      FullWorkDir := TPath.Combine(ExeDir, ActualSandbox)
     else
       FullWorkDir := ActualSandbox;
     ForceDirectories(FullWorkDir);
@@ -336,15 +393,76 @@ begin
     FullWorkDir := ExeDir;
 
   ArgsStr := '';
+  FullCmd := Command;
+  if SameText(FullCmd, 'python.exe') and FileExists(TPath.Combine(ExeDir, 'Python\python.exe')) then
+    FullCmd := 'Python\python.exe';
+
+  if not TPath.IsPathRooted(FullCmd) then
+  begin
+    if FileExists(TPath.Combine(ExeDir, FullCmd)) or DirectoryExists(TPath.Combine(ExeDir, FullCmd)) then
+    begin
+      MasterAppDir := ExtractFilePath(TPath.Combine(ExeDir, FullCmd));
+      if (ActualSandbox <> '') and DirectoryExists(MasterAppDir) then
+      begin
+        SandboxAppDir := TPath.Combine(FullWorkDir, 'apps\' + LowerCase(Id));
+        DeployAppToSandbox(MasterAppDir, SandboxAppDir);
+        FullCmd := TPath.Combine(SandboxAppDir, ExtractFileName(FullCmd));
+      end
+      else
+        FullCmd := TPath.Combine(ExeDir, FullCmd);
+    end
+    else
+    begin
+      var SBuf: array[0..MAX_PATH] of Char;
+      var SFPart: PChar;
+      if SearchPath(nil, PChar(FullCmd), nil, MAX_PATH, SBuf, SFPart) > 0 then
+        FullCmd := PChar(@SBuf[0]);
+    end;
+  end;
+
+  if SameText(Id, 'pytui') then
+  begin
+    var LocalPyDir := TPath.Combine(ExeDir, 'Python');
+    if (ActualSandbox <> '') and DirectoryExists(LocalPyDir) then
+    begin
+      var SandboxPyDir := TPath.Combine(FullWorkDir, 'apps\python');
+      DeployAppToSandbox(LocalPyDir, SandboxPyDir);
+      var SandboxPyExe := TPath.Combine(SandboxPyDir, 'python.exe');
+      var SandboxAppPy := TPath.Combine(ExtractFilePath(FullCmd), 'app.py');
+      if FileExists(SandboxPyExe) and FileExists(SandboxAppPy) then
+      begin
+        FullCmd := SandboxPyExe;
+        ArgsStr := ' "' + SandboxAppPy + '"';
+      end;
+    end
+    else if DirectoryExists(LocalPyDir) then
+    begin
+      var HostPyExe := TPath.Combine(LocalPyDir, 'python.exe');
+      var HostAppPy := TPath.Combine(ExtractFilePath(FullCmd), 'app.py');
+      if FileExists(HostPyExe) and FileExists(HostAppPy) then
+      begin
+        FullCmd := HostPyExe;
+        ArgsStr := ' "' + HostAppPy + '"';
+      end;
+    end;
+  end;
+
+  if (Pos('far.exe', LowerCase(FullCmd)) > 0) or SameText(Id, 'far') then
+  begin
+    ForceDirectories(TPath.Combine(FullWorkDir, 'profile'));
+    ForceDirectories(TPath.Combine(FullWorkDir, 'profile\local'));
+    ForceDirectories(TPath.Combine(FullWorkDir, 'profile\PluginsData'));
+    ForceDirectories(TPath.Combine(FullWorkDir, 'profile\local\PluginsData'));
+    ForceDirectories(TPath.Combine(FullWorkDir, 'profile\Menus'));
+    ForceDirectories(TPath.Combine(FullWorkDir, 'profile\Macros\scripts'));
+  end;
+
   for I := 0 to High(Args) do
   begin
     Arg := Args[I];
-    if ASandboxDir <> '' then
-    begin
-      if WorkingDir <> '' then
-        Arg := StringReplace(Arg, WorkingDir, FullWorkDir, [rfReplaceAll, rfIgnoreCase]);
-      Arg := StringReplace(Arg, '%SANDBOX%', FullWorkDir, [rfReplaceAll, rfIgnoreCase]);
-    end;
+    if WorkingDir <> '' then
+      Arg := StringReplace(Arg, WorkingDir, FullWorkDir, [rfReplaceAll, rfIgnoreCase]);
+    Arg := StringReplace(Arg, '%SANDBOX%', FullWorkDir, [rfReplaceAll, rfIgnoreCase]);
 
     if (Arg = '.') or (Arg = '.\') then
       Arg := FullWorkDir
@@ -353,16 +471,25 @@ begin
        (DirectoryExists(ExeDir + Arg) or FileExists(ExeDir + Arg)) then
       Arg := ExeDir + Arg;
 
-    if Arg.StartsWith('-') or Arg.StartsWith('/') then
-      ArgsStr := ArgsStr + ' ' + Arg
+    var EscArg: string;
+    EscArg := StringReplace(Arg, '"', '\"', [rfReplaceAll]);
+    if (EscArg = '') or (Pos(' ', EscArg) > 0) or (Pos('"', Arg) > 0) or not (Arg.StartsWith('-') or Arg.StartsWith('/')) then
+      ArgsStr := ArgsStr + ' "' + EscArg + '"'
     else
-      ArgsStr := ArgsStr + ' "' + Arg + '"';
+      ArgsStr := ArgsStr + ' ' + EscArg;
   end;
 
   Result.ProfileName      := Name;
   Result.CommandLine      := '"' + FullCmd + '"' + ArgsStr;
   Result.WorkingDirectory := FullWorkDir;
-  Result.EnvironmentVars  := Env;
+  SetLength(Result.EnvironmentVars, Length(Env));
+  for I := 0 to High(Env) do
+  begin
+    Arg := Env[I];
+    if ASandboxDir <> '' then
+      Arg := StringReplace(Arg, '%SANDBOX%', FullWorkDir, [rfReplaceAll, rfIgnoreCase]);
+    Result.EnvironmentVars[I] := Arg;
+  end;
   Result.DefaultCols      := Cols;
   Result.DefaultRows      := Rows;
   Result.Sandbox          := Sandbox;
@@ -370,6 +497,34 @@ begin
   Result.AllowedDirsRead  := AllowedDirsRead;
   Result.AllowedDirsWrite := AllowedDirsWrite;
   Result.Roles            := Roles;
+end;
+
+function TAppEntry.IsExecutableAvailable: Boolean;
+var
+  ExeDir: string;
+  Cmd: string;
+  WinDir: string;
+  SysDir: string;
+begin
+  ExeDir := ExtractFilePath(ParamStr(0));
+  Cmd := Command;
+  if TPath.IsPathRooted(Cmd) then
+    Exit(FileExists(Cmd));
+
+  if FileExists(ExeDir + Cmd) then
+    Exit(True);
+
+  if (Pos('\', Cmd) = 0) and (Pos('/', Cmd) = 0) then
+  begin
+    WinDir := GetEnvironmentVariable('WINDIR');
+    SysDir := WinDir + '\System32\';
+    if FileExists(SysDir + Cmd) or
+       FileExists(SysDir + 'WindowsPowerShell\v1.0\' + Cmd) or
+       (FileSearch(Cmd, GetEnvironmentVariable('PATH')) <> '') then
+      Exit(True);
+  end;
+
+  Result := False;
 end;
 
 end.

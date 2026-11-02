@@ -26,6 +26,7 @@ program ManageUsers;
 {$APPTYPE CONSOLE}
 
 uses
+  Winapi.Windows,
   System.SysUtils,
   System.Classes,
   System.IOUtils,
@@ -45,6 +46,8 @@ function GetUsersPath: string;
 begin
   Result := TPath.Combine(GetExeDir, 'users.json');
 end;
+
+function HasFlag(const AName: string): Boolean; forward;
 
 function GetAppsPath: string;
 begin
@@ -66,8 +69,8 @@ end;
 
 procedure BackupFile(const AFilePath: string);
 var
-  Dir, BaseName, Ext, Prefix, Candidate: string;
-  Idx: Integer;
+  Dir, BaseName, Ext, Prefix, OldF, NewF: string;
+  I: Integer;
 begin
   if not FileExists(AFilePath) then
     Exit;
@@ -75,15 +78,25 @@ begin
   BaseName := ExtractFileName(AFilePath);
   Ext := ExtractFileExt(AFilePath);
   Prefix := ChangeFileExt(BaseName, '');
-  Idx := 1;
-  while True do
+
+  OldF := TPath.Combine(Dir, Format('%s_v5%s', [Prefix, Ext]));
+  if FileExists(OldF) then
+    TFile.Delete(OldF);
+
+  for I := 4 downto 1 do
   begin
-    Candidate := TPath.Combine(Dir, Format('%s_v%d%s', [Prefix, Idx, Ext]));
-    if not FileExists(Candidate) then
-      Break;
-    Inc(Idx);
+    OldF := TPath.Combine(Dir, Format('%s_v%d%s', [Prefix, I, Ext]));
+    NewF := TPath.Combine(Dir, Format('%s_v%d%s', [Prefix, I + 1, Ext]));
+    if FileExists(OldF) then
+    begin
+      if FileExists(NewF) then
+        TFile.Delete(NewF);
+      TFile.Move(OldF, NewF);
+    end;
   end;
-  TFile.Copy(AFilePath, Candidate);
+
+  NewF := TPath.Combine(Dir, Format('%s_v1%s', [Prefix, Ext]));
+  TFile.Copy(AFilePath, NewF);
 end;
 
 function SplitComma(const AText: string): TArray<string>;
@@ -150,10 +163,35 @@ end;
 procedure SaveRootObject(const AFilePath: string; ARoot: TJSONObject);
 var
   RawBytes: TBytes;
+  TempFile, AltPath, BaseDir, FileName: string;
 begin
   BackupFile(AFilePath);
   RawBytes := TEncoding.UTF8.GetBytes(ARoot.Format(2) + sLineBreak);
-  TFile.WriteAllBytes(AFilePath, RawBytes);
+  TempFile := AFilePath + '.tmp';
+  TFile.WriteAllBytes(TempFile, RawBytes);
+  if not MoveFileExW(PWideChar(TempFile), PWideChar(AFilePath), MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+  begin
+    DeleteFile(PWideChar(TempFile));
+    TFile.WriteAllBytes(AFilePath, RawBytes);
+  end;
+
+  BaseDir := ExtractFilePath(AFilePath);
+  FileName := ExtractFileName(AFilePath);
+  AltPath := TPath.GetFullPath(TPath.Combine(BaseDir, '..\..\' + FileName));
+  if FileExists(AltPath) and not SameText(AltPath, AFilePath) then
+  begin
+    BackupFile(AltPath);
+    TFile.WriteAllBytes(AltPath, RawBytes);
+  end
+  else
+  begin
+    AltPath := TPath.GetFullPath(TPath.Combine(BaseDir, 'Win64\Debug\' + FileName));
+    if FileExists(AltPath) and not SameText(AltPath, AFilePath) then
+    begin
+      BackupFile(AltPath);
+      TFile.WriteAllBytes(AltPath, RawBytes);
+    end;
+  end;
 end;
 
 function FindObj(AObj: TJSONObject; const AName: string): TJSONObject;
@@ -249,7 +287,7 @@ var
   UsersArr: TJSONArray;
   UserObj, GrantsObj: TJSONObject;
   I: Integer;
-  UName, URole, USandbox, AppsStr, NetStr, JobStr: string;
+  UName, URole, USandbox, AppsStr, NetStr, JobStr, FullDiskStr, CertStr: string;
   AppsArr: TJSONArray;
 begin
   UsersArr := LoadUsersArray(GetUsersPath, Root);
@@ -260,16 +298,18 @@ begin
       Exit;
     end;
 
-    Writeln(Format('%-12s %-8s %-5s %-8s %-16s %-24s', ['Username', 'Role', 'Net', 'JobOnly', 'Sandbox', 'Apps']));
-    Writeln(StringOfChar('-', 75));
+    Writeln(Format('%-12s %-8s %-16s %-5s %-8s %-9s %-16s %-20s', ['Username', 'Role', 'Cert', 'Net', 'JobOnly', 'FullDisk', 'Sandbox', 'Apps']));
+    Writeln(StringOfChar('-', 100));
     for I := 0 to UsersArr.Count - 1 do
     begin
       UserObj := UsersArr.Items[I] as TJSONObject;
       UName := GetStr(UserObj, 'username');
       URole := GetStr(UserObj, 'role', 'user');
       USandbox := GetStr(UserObj, 'sandbox');
+      CertStr := GetStr(UserObj, 'clientCertificate', '-');
       NetStr := 'YES';
       JobStr := 'NO';
+      FullDiskStr := 'NO';
       GrantsObj := FindObj(UserObj, 'grants');
       if GrantsObj <> nil then
       begin
@@ -277,13 +317,15 @@ begin
           NetStr := 'NO';
         if GetBool(GrantsObj, 'allowJobOnly', False) then
           JobStr := 'YES';
+        if GetBool(GrantsObj, 'fullDiskAccess', False) then
+          FullDiskStr := 'YES';
       end;
       AppsArr := FindArr(UserObj, 'apps');
       if AppsArr <> nil then
         AppsStr := string.Join(', ', JsonArrayToArray(AppsArr))
       else
         AppsStr := '*';
-      Writeln(Format('%-12s %-8s %-5s %-8s %-16s %-24s', [UName, URole, NetStr, JobStr, USandbox, AppsStr]));
+      Writeln(Format('%-12s %-8s %-16s %-5s %-8s %-9s %-16s %-20s', [UName, URole, CertStr, NetStr, JobStr, FullDiskStr, USandbox, AppsStr]));
     end;
     Writeln;
     Writeln(Format('Total users: %d', [UsersArr.Count]));
@@ -293,9 +335,102 @@ begin
   end;
 end;
 
+procedure ShowUser(const AUsername: string);
+var
+  Root: TJSONObject;
+  UsersArr: TJSONArray;
+  UserObj, GrantsObj: TJSONObject;
+  I: Integer;
+  Found: Boolean;
+  UName, URole, USandbox, AppsStr, SaltStr, HashStr: string;
+  NetStr, JobStr, FullDiskStr, UploadStr, DownloadStr, ReadStr, WriteStr: string;
+  AppsArr, ReadArr, WriteArr: TJSONArray;
+begin
+  if AUsername = '' then
+  begin
+    Writeln('[ERROR] Username required. Usage: ManageUsers show <username>');
+    Exit;
+  end;
+  UsersArr := LoadUsersArray(GetUsersPath, Root);
+  try
+    Found := False;
+    for I := 0 to UsersArr.Count - 1 do
+    begin
+      UserObj := UsersArr.Items[I] as TJSONObject;
+      UName := GetStr(UserObj, 'username');
+      if SameText(UName, AUsername) then
+      begin
+        Found := True;
+        URole := GetStr(UserObj, 'role', 'user');
+        USandbox := GetStr(UserObj, 'sandbox');
+        SaltStr := GetStr(UserObj, 'salt');
+        HashStr := GetStr(UserObj, 'passwordHash');
+        NetStr := 'YES';
+        JobStr := 'NO';
+        FullDiskStr := 'NO';
+        UploadStr := 'YES';
+        DownloadStr := 'YES';
+        ReadStr := '';
+        WriteStr := '';
+        GrantsObj := FindObj(UserObj, 'grants');
+        if GrantsObj <> nil then
+        begin
+          if not GetBool(GrantsObj, 'network', True) then
+            NetStr := 'NO';
+          if GetBool(GrantsObj, 'allowJobOnly', False) then
+            JobStr := 'YES';
+          if GetBool(GrantsObj, 'fullDiskAccess', False) then
+            FullDiskStr := 'YES';
+          if not GetBool(GrantsObj, 'upload', True) then
+            UploadStr := 'NO';
+          if not GetBool(GrantsObj, 'download', True) then
+            DownloadStr := 'NO';
+          ReadArr := FindArr(GrantsObj, 'allowedDirsRead');
+          if ReadArr <> nil then
+            ReadStr := string.Join(', ', JsonArrayToArray(ReadArr));
+          WriteArr := FindArr(GrantsObj, 'allowedDirsWrite');
+          if WriteArr <> nil then
+            WriteStr := string.Join(', ', JsonArrayToArray(WriteArr));
+        end;
+        AppsArr := FindArr(UserObj, 'apps');
+        if AppsArr <> nil then
+          AppsStr := string.Join(', ', JsonArrayToArray(AppsArr))
+        else
+          AppsStr := '*';
+
+        Writeln('============================================================');
+        Writeln(Format(' User Details: %s', [UName]));
+        Writeln('============================================================');
+        Writeln(Format('  Role:             %s', [URole]));
+        Writeln(Format('  Client Certificate: %s', [GetStr(UserObj, 'clientCertificate', 'None (Password auth only)')]));
+        Writeln(Format('  Sandbox:          %s', [USandbox]));
+        Writeln(Format('  Network Access:   %s', [NetStr]));
+        Writeln(Format('  Job-Only Access:  %s', [JobStr]));
+        Writeln(Format('  Full Disk Access: %s', [FullDiskStr]));
+        Writeln(Format('  PowerShell Outside Sandbox: %s', [IfThen(GetBool(GrantsObj, 'powershellAccessEverywhere', GetBool(GrantsObj, 'powershellOutsideSandbox', False)), 'YES', 'NO')]));
+        Writeln(Format('  Upload Access:    %s', [UploadStr]));
+        Writeln(Format('  Download Access:  %s', [DownloadStr]));
+        Writeln(Format('  Allowed Apps:     %s', [AppsStr]));
+        Writeln(Format('  Allowed Read:     %s', [ReadStr]));
+        Writeln(Format('  Allowed Write:    %s', [WriteStr]));
+        Writeln(Format('  Salt:             %s', [SaltStr]));
+        Writeln(Format('  Password Hash:    %s', [HashStr]));
+        Writeln('============================================================');
+        Writeln;
+        Break;
+      end;
+    end;
+    if not Found then
+      Writeln(Format('[ERROR] User ''%s'' not found.', [AUsername]));
+  finally
+    Root.Free;
+  end;
+end;
+
 procedure AddUser(const AUsername, APassword: string; const AApps: TArray<string>;
   const ASandbox, ARole: string; ANetwork, AAllowJobOnly, AFullDisk: Boolean;
-  const ADirsRead, ADirsWrite: TArray<string>);
+  const ADirsRead, ADirsWrite: TArray<string>; AUpload: Boolean = True; ADownload: Boolean = True;
+  APowerShellOutsideSandbox: Boolean = False; const AClientCert: string = '');
 var
   Root: TJSONObject;
   UsersArr: TJSONArray;
@@ -304,8 +439,21 @@ var
   Salt, PwdHash, FullSandbox: string;
   EffectiveRole, EffectiveSandbox: string;
   EffectiveApps, EffectiveDirsRead, EffectiveDirsWrite: TArray<string>;
-  EffectiveJobOnly, EffectiveFullDisk: Boolean;
+  EffectiveJobOnly, EffectiveFullDisk, EffectivePowerShellEverywhere: Boolean;
 begin
+  if (AUsername = '') or (Pos(' ', AUsername) > 0) or (Pos(':', AUsername) > 0) or
+     (Pos('/', AUsername) > 0) or (Pos('\', AUsername) > 0) or (Pos('"', AUsername) > 0) then
+  begin
+    Writeln(Format('[ERROR] Invalid username ''%s''. Usernames cannot contain spaces, colons, or slashes.', [AUsername]));
+    Exit;
+  end;
+
+  if Length(APassword) < 4 then
+  begin
+    Writeln('[ERROR] Password is too short. Minimum 4 characters required.');
+    Exit;
+  end;
+
   EffectiveRole := ARole;
   if EffectiveRole = '' then
     EffectiveRole := 'user';
@@ -321,13 +469,14 @@ begin
     if SameText(EffectiveRole, 'admin') then
       EffectiveApps := ['*']
     else
-      EffectiveApps := ['far', 'edit', 'powershell'];
+      EffectiveApps := ['far', 'edit', 'powershell', 'pytui', 'python'];
   end;
 
   if SameText(EffectiveRole, 'admin') then
   begin
     EffectiveJobOnly := True;
     EffectiveFullDisk := True;
+    EffectivePowerShellEverywhere := True;
     EffectiveDirsRead := ['*'];
     EffectiveDirsWrite := ['*'];
   end
@@ -335,6 +484,7 @@ begin
   begin
     EffectiveJobOnly := AAllowJobOnly;
     EffectiveFullDisk := AFullDisk;
+    EffectivePowerShellEverywhere := APowerShellOutsideSandbox;
     EffectiveDirsRead := ADirsRead;
     EffectiveDirsWrite := ADirsWrite;
   end;
@@ -345,6 +495,11 @@ begin
     TDirectory.CreateDirectory(FullSandbox);
     Writeln('[OK] Created sandbox directory: ', FullSandbox);
   end;
+  TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'AppData'));
+  TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'Documents'));
+  TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'tmp'));
+  TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'profile'));
+  TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'apps'));
 
   UsersArr := LoadUsersArray(GetUsersPath, Root);
   try
@@ -357,12 +512,18 @@ begin
     UserObj.AddPair('salt', Salt);
     UserObj.AddPair('passwordHash', PwdHash);
     UserObj.AddPair('sandbox', EffectiveSandbox);
+    if AClientCert <> '' then
+      UserObj.AddPair('clientCertificate', AClientCert);
     UserObj.AddPair('apps', ArrayToJsonArray(EffectiveApps));
 
     GrantsObj := TJSONObject.Create;
     GrantsObj.AddPair('network', TJSONBool.Create(ANetwork));
     GrantsObj.AddPair('allowJobOnly', TJSONBool.Create(EffectiveJobOnly));
     GrantsObj.AddPair('fullDiskAccess', TJSONBool.Create(EffectiveFullDisk));
+    GrantsObj.AddPair('powershellAccessEverywhere', TJSONBool.Create(EffectivePowerShellEverywhere));
+    GrantsObj.AddPair('powershellOutsideSandbox', TJSONBool.Create(EffectivePowerShellEverywhere));
+    GrantsObj.AddPair('upload', TJSONBool.Create(AUpload));
+    GrantsObj.AddPair('download', TJSONBool.Create(ADownload));
     GrantsObj.AddPair('allowedDirsRead', ArrayToJsonArray(EffectiveDirsRead));
     GrantsObj.AddPair('allowedDirsWrite', ArrayToJsonArray(EffectiveDirsWrite));
     UserObj.AddPair('grants', GrantsObj);
@@ -375,6 +536,13 @@ begin
         ExistingIdx := I;
         Break;
       end;
+    end;
+
+    if (ExistingIdx >= 0) and not HasFlag('force') then
+    begin
+      Writeln(Format('[ERROR] User ''%s'' already exists! Use edit command or --force.', [AUsername]));
+      UserObj.Free;
+      Exit;
     end;
 
     if ExistingIdx >= 0 then
@@ -457,7 +625,9 @@ var
   UserObj: TJSONObject;
   I: Integer;
   Found: Boolean;
+  SandboxDir, FullSandbox, CanonicalSandbox, CanonicalExeDir, ParentSandbox: string;
 begin
+  SandboxDir := '';
   UsersArr := LoadUsersArray(GetUsersPath, Root);
   try
     Found := False;
@@ -466,6 +636,7 @@ begin
       UserObj := UsersArr.Items[I] as TJSONObject;
       if SameText(GetStr(UserObj, 'username'), AUsername) then
       begin
+        SandboxDir := GetStr(UserObj, 'sandbox');
         UsersArr.Remove(I).Free;
         Found := True;
         Break;
@@ -477,6 +648,39 @@ begin
       SaveRootObject(GetUsersPath, Root);
       Writeln;
       Writeln(Format('User ''%s'' deleted from configuration.', [AUsername]));
+      if SandboxDir <> '' then
+      begin
+        FullSandbox := TPath.Combine(GetExeDir, SandboxDir);
+        if TDirectory.Exists(FullSandbox) then
+        begin
+          CanonicalSandbox := TPath.GetFullPath(FullSandbox);
+          CanonicalExeDir := TPath.GetFullPath(GetExeDir);
+          if (CanonicalSandbox <> CanonicalExeDir) and (Length(CanonicalSandbox) > Length(CanonicalExeDir)) then
+          begin
+            try
+              TDirectory.Delete(FullSandbox, True);
+              Writeln(Format('[OK] Deleted sandbox directory from disk: %s', [FullSandbox]));
+            except
+              on E: Exception do
+                Writeln(Format('[WARN] Could not delete sandbox directory: %s (%s)', [FullSandbox, E.Message]));
+            end;
+          end;
+        end;
+        ParentSandbox := TPath.Combine(ExtractFilePath(ExcludeTrailingPathDelimiter(GetExeDir)), SandboxDir);
+        if TDirectory.Exists(ParentSandbox) then
+        begin
+          CanonicalSandbox := TPath.GetFullPath(ParentSandbox);
+          CanonicalExeDir := TPath.GetFullPath(ExtractFilePath(ExcludeTrailingPathDelimiter(GetExeDir)));
+          if (CanonicalSandbox <> CanonicalExeDir) and (Length(CanonicalSandbox) > Length(CanonicalExeDir)) then
+          begin
+            try
+              TDirectory.Delete(ParentSandbox, True);
+              Writeln(Format('[OK] Deleted parent sandbox directory from disk: %s', [ParentSandbox]));
+            except
+            end;
+          end;
+        end;
+      end;
       Writeln;
     end
     else
@@ -534,6 +738,80 @@ begin
   end;
 end;
 
+procedure ShowApp(const AAppId: string);
+var
+  Root: TJSONObject;
+  AppsArr: TJSONArray;
+  AppObj: TJSONObject;
+  I: Integer;
+  Found: Boolean;
+  AppId, AppName, Sandbox, NetStr, Cmd, RolesStr, WDir, ArgsStr, EnvStr: string;
+  ColsVal, RowsVal: Integer;
+  RolesArr, ArgsArr, EnvArr: TJSONArray;
+begin
+  if AAppId = '' then
+  begin
+    Writeln('[ERROR] App ID required. Usage: ManageUsers show-app <id>');
+    Exit;
+  end;
+  AppsArr := LoadAppsArray(GetAppsPath, Root);
+  try
+    Found := False;
+    for I := 0 to AppsArr.Count - 1 do
+    begin
+      AppObj := AppsArr.Items[I] as TJSONObject;
+      AppId := GetStr(AppObj, 'id');
+      if SameText(AppId, AAppId) then
+      begin
+        Found := True;
+        AppName := GetStr(AppObj, 'name');
+        Cmd := GetStr(AppObj, 'command');
+        Sandbox := GetStr(AppObj, 'sandbox', 'standard');
+        WDir := GetStr(AppObj, 'workingDir');
+        ColsVal := GetInt(AppObj, 'cols', 120);
+        RowsVal := GetInt(AppObj, 'rows', 30);
+        NetStr := 'NO';
+        if GetBool(AppObj, 'network', False) then
+          NetStr := 'YES';
+        ArgsArr := FindArr(AppObj, 'args');
+        if ArgsArr <> nil then
+          ArgsStr := string.Join(', ', JsonArrayToArray(ArgsArr))
+        else
+          ArgsStr := '';
+        EnvArr := FindArr(AppObj, 'env');
+        if EnvArr <> nil then
+          EnvStr := string.Join(', ', JsonArrayToArray(EnvArr))
+        else
+          EnvStr := '';
+        RolesArr := FindArr(AppObj, 'roles');
+        if RolesArr <> nil then
+          RolesStr := string.Join(', ', JsonArrayToArray(RolesArr))
+        else
+          RolesStr := 'admin, user';
+
+        Writeln('============================================================');
+        Writeln(Format(' App Details: %s (%s)', [AppName, AppId]));
+        Writeln('============================================================');
+        Writeln(Format('  Command:          %s', [Cmd]));
+        Writeln(Format('  Arguments:        %s', [ArgsStr]));
+        Writeln(Format('  Sandbox Mode:     %s', [Sandbox]));
+        Writeln(Format('  Working Dir:      %s', [WDir]));
+        Writeln(Format('  Network Access:   %s', [NetStr]));
+        Writeln(Format('  Allowed Roles:    %s', [RolesStr]));
+        Writeln(Format('  Terminal Window:  %d cols x %d rows', [ColsVal, RowsVal]));
+        Writeln(Format('  Environment:      %s', [EnvStr]));
+        Writeln('============================================================');
+        Writeln;
+        Break;
+      end;
+    end;
+    if not Found then
+      Writeln(Format('[ERROR] App ''%s'' not found.', [AAppId]));
+  finally
+    Root.Free;
+  end;
+end;
+
 procedure AddApp(const AId, AName, ACommand: string; const AArgs: TArray<string>;
   const AWorkingDir: string; const AEnv: TArray<string>; ACols, ARows: Integer;
   const ASandbox: string; ANetwork: Boolean; const ADirsRead, ADirsWrite, ARoles: TArray<string>);
@@ -543,6 +821,12 @@ var
   AppObj: TJSONObject;
   ExistingIdx, I: Integer;
 begin
+  if (AId = '') or (Pos(' ', AId) > 0) or (Pos('/', AId) > 0) or (Pos('\', AId) > 0) then
+  begin
+    Writeln(Format('[ERROR] Invalid app ID ''%s''. App IDs cannot contain spaces or slashes.', [AId]));
+    Exit;
+  end;
+
   AppsArr := LoadAppsArray(GetAppsPath, Root);
   try
     AppObj := TJSONObject.Create;
@@ -602,9 +886,16 @@ var
   Root: TJSONObject;
   AppsArr: TJSONArray;
   AppObj: TJSONObject;
-  I: Integer;
+  I, J, K: Integer;
   Found: Boolean;
+  Sandboxes: TArray<string>;
+  SDir, Shim, SAppDir, MasterAppDir, LowerId: string;
+  UsersRoot: TJSONObject;
+  UsersArr, UserAppsArr: TJSONArray;
+  UserObj: TJSONObject;
+  UsersModified: Boolean;
 begin
+  LowerId := LowerCase(AId);
   AppsArr := LoadAppsArray(GetAppsPath, Root);
   try
     Found := False;
@@ -624,6 +915,72 @@ begin
       SaveRootObject(GetAppsPath, Root);
       Writeln;
       Writeln(Format('App ''%s'' deleted from configuration.', [AId]));
+
+      if FileExists(GetUsersPath) then
+      begin
+        UsersArr := LoadUsersArray(GetUsersPath, UsersRoot);
+        try
+          UsersModified := False;
+          for J := 0 to UsersArr.Count - 1 do
+          begin
+            UserObj := UsersArr.Items[J] as TJSONObject;
+            UserAppsArr := UserObj.GetValue('apps') as TJSONArray;
+            if UserAppsArr <> nil then
+            begin
+              for K := UserAppsArr.Count - 1 downto 0 do
+              begin
+                if SameText(UserAppsArr.Items[K].Value, AId) then
+                begin
+                  UserAppsArr.Remove(K).Free;
+                  UsersModified := True;
+                end;
+              end;
+            end;
+          end;
+          if UsersModified then
+          begin
+            SaveRootObject(GetUsersPath, UsersRoot);
+            Writeln(Format('[OK] Removed app ''%s'' from user(s) in %s', [AId, GetUsersPath]));
+          end;
+        finally
+          UsersRoot.Free;
+        end;
+      end;
+
+      if TDirectory.Exists(GetExeDir) then
+      begin
+        Sandboxes := TDirectory.GetDirectories(GetExeDir, 'sandbox_*');
+        for SDir in Sandboxes do
+        begin
+          Shim := TPath.Combine(SDir, AId + '.cmd');
+          if TFile.Exists(Shim) then
+          begin
+            try
+              TFile.Delete(Shim);
+              Writeln(Format('[OK] Deleted app shim: %s', [Shim]));
+            except
+            end;
+          end;
+          SAppDir := TPath.Combine(SDir, 'apps\' + LowerId);
+          if TDirectory.Exists(SAppDir) then
+          begin
+            try
+              TDirectory.Delete(SAppDir, True);
+              Writeln(Format('[OK] Deleted app sandbox directory: %s', [SAppDir]));
+            except
+            end;
+          end;
+        end;
+        MasterAppDir := TPath.Combine(GetExeDir, 'apps\' + LowerId);
+        if TDirectory.Exists(MasterAppDir) then
+        begin
+          try
+            TDirectory.Delete(MasterAppDir, True);
+            Writeln(Format('[OK] Deleted app directory: %s', [MasterAppDir]));
+          except
+          end;
+        end;
+      end;
       Writeln;
     end
     else
@@ -643,10 +1000,10 @@ var
   Arg: string;
 begin
   Result := ADefault;
-  for I := 1 to ParamCount - 1 do
+  for I := 1 to ParamCount do
   begin
     Arg := ParamStr(I);
-    if SameText(Arg, '--' + AName) then
+    if SameText(Arg, '--' + AName) and (I < ParamCount) and (not ParamStr(I + 1).StartsWith('--')) then
     begin
       Result := ParamStr(I + 1);
       Exit;
@@ -683,7 +1040,13 @@ begin
     if Arg.StartsWith('--') then
     begin
       if not (SameText(Arg, '--network') or SameText(Arg, '--no-network') or
-              SameText(Arg, '--allow-job-only') or SameText(Arg, '--no-job-only')) then
+              SameText(Arg, '--allow-job-only') or SameText(Arg, '--no-job-only') or
+              SameText(Arg, '--full-disk') or SameText(Arg, '--no-full-disk') or
+              SameText(Arg, '--powershell-outside-sandbox') or SameText(Arg, '--no-powershell-outside-sandbox') or
+              SameText(Arg, '--powershell-access-everywhere') or SameText(Arg, '--no-powershell-access-everywhere') or
+              SameText(Arg, '--upload') or SameText(Arg, '--no-upload') or
+              SameText(Arg, '--download') or SameText(Arg, '--no-download') or
+              SameText(Arg, '--force')) then
       begin
         if not Arg.Contains('=') then
           Inc(I);
@@ -701,7 +1064,7 @@ end;
 
 procedure EditUserCLI;
 var
-  Username, RoleVal, SandboxVal, AppsVal, ReadVal, WriteVal: string;
+  Username, RoleVal, SandboxVal, AppsVal, ReadVal, WriteVal, CertVal: string;
   Root: TJSONObject;
   UsersArr: TJSONArray;
   UserObj, GrantsObj: TJSONObject;
@@ -729,6 +1092,17 @@ begin
         begin
           UserObj.RemovePair('role').Free;
           UserObj.AddPair('role', RoleVal);
+        end;
+
+        CertVal := GetOptionValue('cert');
+        if CertVal = '' then
+          CertVal := GetOptionValue('client-cert');
+        if CertVal <> '' then
+        begin
+          if UserObj.Values['clientCertificate'] <> nil then
+            UserObj.RemovePair('clientCertificate').Free;
+          if not SameText(CertVal, 'none') and not SameText(CertVal, 'clear') then
+            UserObj.AddPair('clientCertificate', CertVal);
         end;
 
         SandboxVal := GetOptionValue('sandbox');
@@ -775,6 +1149,72 @@ begin
           GrantsObj.AddPair('allowJobOnly', TJSONBool.Create(False));
         end;
 
+        if HasFlag('full-disk') then
+        begin
+          GrantsObj.RemovePair('fullDiskAccess').Free;
+          GrantsObj.AddPair('fullDiskAccess', TJSONBool.Create(True));
+        end
+        else if HasFlag('no-full-disk') then
+        begin
+          GrantsObj.RemovePair('fullDiskAccess').Free;
+          GrantsObj.AddPair('fullDiskAccess', TJSONBool.Create(False));
+        end;
+
+        if HasFlag('powershell-outside-sandbox') or HasFlag('powershell-access-everywhere') then
+        begin
+          GrantsObj.RemovePair('powershellAccessEverywhere').Free;
+          GrantsObj.RemovePair('powershellOutsideSandbox').Free;
+          GrantsObj.AddPair('powershellAccessEverywhere', TJSONBool.Create(True));
+          GrantsObj.AddPair('powershellOutsideSandbox', TJSONBool.Create(True));
+        end
+        else if HasFlag('no-powershell-outside-sandbox') or HasFlag('no-powershell-access-everywhere') then
+        begin
+          GrantsObj.RemovePair('powershellAccessEverywhere').Free;
+          GrantsObj.RemovePair('powershellOutsideSandbox').Free;
+          GrantsObj.AddPair('powershellAccessEverywhere', TJSONBool.Create(False));
+          GrantsObj.AddPair('powershellOutsideSandbox', TJSONBool.Create(False));
+        end;
+
+        if HasFlag('upload') then
+        begin
+          GrantsObj.RemovePair('upload').Free;
+          GrantsObj.AddPair('upload', TJSONBool.Create(True));
+        end
+        else if HasFlag('no-upload') then
+        begin
+          GrantsObj.RemovePair('upload').Free;
+          GrantsObj.AddPair('upload', TJSONBool.Create(False));
+        end
+        else
+        begin
+          var UpVal := GetOptionValue('upload');
+          if UpVal <> '' then
+          begin
+            GrantsObj.RemovePair('upload').Free;
+            GrantsObj.AddPair('upload', TJSONBool.Create(SameText(UpVal, 'true') or SameText(UpVal, '1') or SameText(UpVal, 'yes')));
+          end;
+        end;
+
+        if HasFlag('download') then
+        begin
+          GrantsObj.RemovePair('download').Free;
+          GrantsObj.AddPair('download', TJSONBool.Create(True));
+        end
+        else if HasFlag('no-download') then
+        begin
+          GrantsObj.RemovePair('download').Free;
+          GrantsObj.AddPair('download', TJSONBool.Create(False));
+        end
+        else
+        begin
+          var DownVal := GetOptionValue('download');
+          if DownVal <> '' then
+          begin
+            GrantsObj.RemovePair('download').Free;
+            GrantsObj.AddPair('download', TJSONBool.Create(SameText(DownVal, 'true') or SameText(DownVal, '1') or SameText(DownVal, 'yes')));
+          end;
+        end;
+
         ReadVal := GetOptionValue('dirs-read');
         if ReadVal <> '' then
         begin
@@ -805,6 +1245,39 @@ begin
       Writeln(Format('[ERROR] User ''%s'' not found.', [Username]));
       Writeln;
     end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure BindClientCert(const AUsername, ACertFileOrThumb: string);
+var
+  Root: TJSONObject;
+  UsersArr: TJSONArray;
+  UserObj: TJSONObject;
+  I: Integer;
+  Found: Boolean;
+begin
+  UsersArr := LoadUsersArray(GetUsersPath, Root);
+  try
+    Found := False;
+    for I := 0 to UsersArr.Count - 1 do
+    begin
+      UserObj := UsersArr.Items[I] as TJSONObject;
+      if SameText(GetStr(UserObj, 'username'), AUsername) then
+      begin
+        Found := True;
+        if UserObj.Values['clientCertificate'] <> nil then
+          UserObj.RemovePair('clientCertificate').Free;
+        if (ACertFileOrThumb <> '') and not SameText(ACertFileOrThumb, 'none') and not SameText(ACertFileOrThumb, 'clear') then
+          UserObj.AddPair('clientCertificate', ACertFileOrThumb);
+        SaveRootObject(GetUsersPath, Root);
+        Writeln(Format('[OK] Successfully bound client certificate ''%s'' to user ''%s''.', [ACertFileOrThumb, AUsername]));
+        Break;
+      end;
+    end;
+    if not Found then
+      Writeln(Format('[ERROR] User ''%s'' not found.', [AUsername]));
   finally
     Root.Free;
   end;
@@ -938,13 +1411,448 @@ begin
   end;
 end;
 
+procedure CopyDirTree(const ASrcDir, ADstDir: string; const AExcludeSubstrings: TArray<string> = nil);
+var
+  Files, Dirs: TArray<string>;
+  F, D, DstFile, DstSubDir: string;
+  Skip: Boolean;
+  I: Integer;
+begin
+  if not TDirectory.Exists(ASrcDir) then Exit;
+  if not TDirectory.Exists(ADstDir) then
+    TDirectory.CreateDirectory(ADstDir);
+
+  Files := TDirectory.GetFiles(ASrcDir);
+  for F in Files do
+  begin
+    Skip := False;
+    if Assigned(AExcludeSubstrings) then
+    begin
+      for I := 0 to High(AExcludeSubstrings) do
+      begin
+        if Pos(LowerCase(AExcludeSubstrings[I]), LowerCase(F)) > 0 then
+        begin
+          Skip := True;
+          Break;
+        end;
+      end;
+    end;
+    if not Skip then
+    begin
+      DstFile := TPath.Combine(ADstDir, ExtractFileName(F));
+      try
+        TFile.Copy(F, DstFile, True);
+      except
+      end;
+    end;
+  end;
+
+  Dirs := TDirectory.GetDirectories(ASrcDir);
+  for D in Dirs do
+  begin
+    Skip := False;
+    if Assigned(AExcludeSubstrings) then
+    begin
+      for I := 0 to High(AExcludeSubstrings) do
+      begin
+        if Pos(LowerCase(AExcludeSubstrings[I]), LowerCase(D)) > 0 then
+        begin
+          Skip := True;
+          Break;
+        end;
+      end;
+    end;
+    if not Skip then
+    begin
+      DstSubDir := TPath.Combine(ADstDir, ExtractFileName(D));
+      CopyDirTree(D, DstSubDir, AExcludeSubstrings);
+    end;
+  end;
+end;
+
+procedure RunIcaclsGrant(const APath, ASidGrant: string);
+var
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  CmdLine: string;
+begin
+  if not TDirectory.Exists(APath) and not TFile.Exists(APath) then Exit;
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESHOWWINDOW;
+  SI.wShowWindow := SW_HIDE;
+  CmdLine := Format('icacls "%s" /grant %s /T /C /Q', [APath, ASidGrant]);
+  UniqueString(CmdLine);
+  if CreateProcess(nil, PChar(CmdLine), nil, nil, False, CREATE_NO_WINDOW, nil, nil, SI, PI) then
+  begin
+    WaitForSingleObject(PI.hProcess, 15000);
+    CloseHandle(PI.hProcess);
+    CloseHandle(PI.hThread);
+  end;
+end;
+
+procedure EnsureDefaultAppsJson(const AFilePath: string);
+var
+  Root: TJSONObject;
+  AppsArr: TJSONArray;
+  App: TJSONObject;
+  ArgsArr, EnvArr, RolesArr: TJSONArray;
+begin
+  if TFile.Exists(AFilePath) then Exit;
+
+  Root := TJSONObject.Create;
+  try
+    AppsArr := TJSONArray.Create;
+
+    App := TJSONObject.Create;
+    App.AddPair('id', 'powershell');
+    App.AddPair('name', 'PowerShell');
+    App.AddPair('command', 'powershell.exe');
+    ArgsArr := TJSONArray.Create;
+    ArgsArr.Add('-NoExit');
+    ArgsArr.Add('-NoLogo');
+    ArgsArr.Add('-ExecutionPolicy');
+    ArgsArr.Add('Bypass');
+    App.AddPair('args', ArgsArr);
+    EnvArr := TJSONArray.Create;
+    EnvArr.Add('TERM=xterm-256color');
+    EnvArr.Add('COLORTERM=truecolor');
+    App.AddPair('env', EnvArr);
+    App.AddPair('cols', TJSONNumber.Create(120));
+    App.AddPair('rows', TJSONNumber.Create(30));
+    App.AddPair('sandbox', 'job-only');
+    App.AddPair('network', TJSONBool.Create(False));
+    App.AddPair('allowedDirs', TJSONArray.Create);
+    App.AddPair('allowedDirsWrite', TJSONArray.Create);
+    RolesArr := TJSONArray.Create;
+    RolesArr.Add('user');
+    RolesArr.Add('admin');
+    App.AddPair('roles', RolesArr);
+    AppsArr.AddElement(App);
+
+    App := TJSONObject.Create;
+    App.AddPair('id', 'admin-powershell');
+    App.AddPair('name', 'PowerShell Administrator');
+    App.AddPair('command', 'powershell.exe');
+    ArgsArr := TJSONArray.Create;
+    ArgsArr.Add('-NoExit');
+    ArgsArr.Add('-NoLogo');
+    ArgsArr.Add('-ExecutionPolicy');
+    ArgsArr.Add('Bypass');
+    App.AddPair('args', ArgsArr);
+    EnvArr := TJSONArray.Create;
+    EnvArr.Add('TERM=xterm-256color');
+    EnvArr.Add('COLORTERM=truecolor');
+    App.AddPair('env', EnvArr);
+    App.AddPair('cols', TJSONNumber.Create(120));
+    App.AddPair('rows', TJSONNumber.Create(30));
+    App.AddPair('sandbox', 'standard');
+    App.AddPair('network', TJSONBool.Create(True));
+    App.AddPair('allowedDirs', TJSONArray.Create);
+    App.AddPair('allowedDirsWrite', TJSONArray.Create);
+    RolesArr := TJSONArray.Create;
+    RolesArr.Add('admin');
+    App.AddPair('roles', RolesArr);
+    AppsArr.AddElement(App);
+
+    Root.AddPair('apps', AppsArr);
+    TFile.WriteAllText(AFilePath, Root.Format(2) + sLineBreak, TEncoding.UTF8);
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure EnsureDefaultUsersJson(const AFilePath: string);
+var
+  Root, AdminObj, Usr1Obj, AdminGrants, Usr1Grants: TJSONObject;
+  UsersArr, AdminApps, Usr1Apps, RArr, WArr: TJSONArray;
+  AdminSalt, Usr1Salt: string;
+begin
+  if TFile.Exists(AFilePath) then Exit;
+
+  Root := TJSONObject.Create;
+  try
+    UsersArr := TJSONArray.Create;
+
+    AdminSalt := GenerateSalt('admin');
+    AdminObj := TJSONObject.Create;
+    AdminObj.AddPair('username', 'admin');
+    AdminObj.AddPair('role', 'admin');
+    AdminObj.AddPair('salt', AdminSalt);
+    AdminObj.AddPair('passwordHash', ComputeHash(AdminSalt, '1234'));
+    AdminObj.AddPair('sandbox', 'sandbox_admin');
+    AdminObj.AddPair('clientCertificate', 'admin.crt');
+    AdminApps := TJSONArray.Create;
+    AdminApps.Add('*');
+    AdminObj.AddPair('apps', AdminApps);
+    AdminGrants := TJSONObject.Create;
+    AdminGrants.AddPair('network', TJSONBool.Create(True));
+    AdminGrants.AddPair('allowJobOnly', TJSONBool.Create(True));
+    AdminGrants.AddPair('fullDiskAccess', TJSONBool.Create(True));
+    AdminGrants.AddPair('powershellAccessEverywhere', TJSONBool.Create(True));
+    AdminGrants.AddPair('powershellOutsideSandbox', TJSONBool.Create(True));
+    AdminGrants.AddPair('upload', TJSONBool.Create(True));
+    AdminGrants.AddPair('download', TJSONBool.Create(True));
+    RArr := TJSONArray.Create;
+    RArr.Add('*');
+    AdminGrants.AddPair('allowedDirsRead', RArr);
+    WArr := TJSONArray.Create;
+    WArr.Add('*');
+    AdminGrants.AddPair('allowedDirsWrite', WArr);
+    AdminObj.AddPair('grants', AdminGrants);
+    UsersArr.AddElement(AdminObj);
+
+    Usr1Salt := GenerateSalt('usr1');
+    Usr1Obj := TJSONObject.Create;
+    Usr1Obj.AddPair('username', 'usr1');
+    Usr1Obj.AddPair('role', 'user');
+    Usr1Obj.AddPair('salt', Usr1Salt);
+    Usr1Obj.AddPair('passwordHash', ComputeHash(Usr1Salt, '1234'));
+    Usr1Obj.AddPair('sandbox', 'sandbox_usr1');
+    Usr1Obj.AddPair('clientCertificate', 'usr1.crt');
+    Usr1Apps := TJSONArray.Create;
+    Usr1Apps.Add('powershell');
+    Usr1Obj.AddPair('apps', Usr1Apps);
+    Usr1Grants := TJSONObject.Create;
+    Usr1Grants.AddPair('network', TJSONBool.Create(False));
+    Usr1Grants.AddPair('allowJobOnly', TJSONBool.Create(False));
+    Usr1Grants.AddPair('fullDiskAccess', TJSONBool.Create(False));
+    Usr1Grants.AddPair('powershellAccessEverywhere', TJSONBool.Create(False));
+    Usr1Grants.AddPair('powershellOutsideSandbox', TJSONBool.Create(False));
+    Usr1Grants.AddPair('upload', TJSONBool.Create(True));
+    Usr1Grants.AddPair('download', TJSONBool.Create(True));
+    RArr := TJSONArray.Create;
+    RArr.Add('AppData');
+    RArr.Add('Documents');
+    RArr.Add('tmp');
+    RArr.Add('profile');
+    RArr.Add('apps');
+    Usr1Grants.AddPair('allowedDirsRead', RArr);
+    WArr := TJSONArray.Create;
+    WArr.Add('AppData');
+    WArr.Add('Documents');
+    WArr.Add('tmp');
+    WArr.Add('profile');
+    WArr.Add('apps');
+    Usr1Grants.AddPair('allowedDirsWrite', WArr);
+    Usr1Obj.AddPair('grants', Usr1Grants);
+    UsersArr.AddElement(Usr1Obj);
+
+    Root.AddPair('users', UsersArr);
+    TFile.WriteAllText(AFilePath, Root.Format(2) + sLineBreak, TEncoding.UTF8);
+  finally
+    Root.Free;
+  end;
+end;
+
+function ResolveSystemPathExecutable(const AExeName: string): string;
+var
+  SBuf: array[0..MAX_PATH] of Char;
+  SFPart: PChar;
+begin
+  Result := '';
+  if SearchPath(nil, PChar(AExeName), nil, MAX_PATH, SBuf, SFPart) > 0 then
+    Result := PChar(@SBuf[0]);
+end;
+
+procedure InitializeEnvironment(const ATargetDir: string = '');
+var
+  BaseDir, SDir, Candidate: string;
+  Candidates: TArray<string>;
+begin
+  if ATargetDir <> '' then
+    BaseDir := TPath.GetFullPath(ATargetDir)
+  else
+    BaseDir := GetExeDir;
+
+  Writeln('=== Initializing GTermBox Environment in: ', BaseDir, ' ===');
+  TDirectory.CreateDirectory(BaseDir);
+
+  TDirectory.CreateDirectory(TPath.Combine(BaseDir, 'web'));
+  TDirectory.CreateDirectory(TPath.Combine(BaseDir, 'Log'));
+  TDirectory.CreateDirectory(TPath.Combine(BaseDir, 'trusted_clients'));
+  TDirectory.CreateDirectory(TPath.Combine(BaseDir, 'client_keys'));
+
+  SDir := TPath.Combine(BaseDir, 'sandbox_admin');
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'AppData'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'Documents'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'tmp'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\local'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\PluginsData'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\local\PluginsData'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Menus'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Macros\scripts'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'apps'));
+
+  SDir := TPath.Combine(BaseDir, 'sandbox_usr1');
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'AppData'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'Documents'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'tmp'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\local'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\PluginsData'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\local\PluginsData'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Menus'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Macros\scripts'));
+  TDirectory.CreateDirectory(TPath.Combine(SDir, 'apps'));
+
+  if not TFile.Exists(TPath.Combine(BaseDir, 'web\index.html')) then
+  begin
+    Candidates := [
+      TPath.Combine(BaseDir, '..\web'),
+      TPath.Combine(BaseDir, '..\..\web'),
+      TPath.Combine(BaseDir, '..\..\GTermBox\web'),
+      TPath.Combine(GetCurrentDir, 'GTermBox\web'),
+      TPath.Combine(GetCurrentDir, 'web')
+    ];
+    for Candidate in Candidates do
+    begin
+      if TFile.Exists(TPath.Combine(Candidate, 'index.html')) then
+      begin
+        CopyDirTree(Candidate, TPath.Combine(BaseDir, 'web'));
+        Writeln('[OK] Deployed web assets from: ', Candidate);
+        Break;
+      end;
+    end;
+  end;
+
+
+
+
+
+
+
+
+
+
+  if not TFile.Exists(TPath.Combine(BaseDir, 'msquic.dll')) then
+  begin
+    Candidates := [
+      TPath.Combine(BaseDir, '..\msquic.dll'),
+      TPath.Combine(BaseDir, '..\..\msquic.dll'),
+      TPath.Combine(GetCurrentDir, 'msquic.dll'),
+      TPath.Combine(GetCurrentDir, 'GTermBox\Win64\Debug\msquic.dll')
+    ];
+    for Candidate in Candidates do
+    begin
+      if TFile.Exists(Candidate) then
+      begin
+        TFile.Copy(Candidate, TPath.Combine(BaseDir, 'msquic.dll'), True);
+        Writeln('[OK] Copied msquic.dll');
+        Break;
+      end;
+    end;
+  end;
+
+  if not TFile.Exists(TPath.Combine(BaseDir, 'ls-qpack.dll')) then
+  begin
+    Candidates := [
+      TPath.Combine(BaseDir, '..\ls-qpack.dll'),
+      TPath.Combine(BaseDir, '..\..\ls-qpack.dll'),
+      TPath.Combine(GetCurrentDir, 'ls-qpack.dll'),
+      TPath.Combine(GetCurrentDir, 'GTermBox\Win64\Debug\ls-qpack.dll')
+    ];
+    for Candidate in Candidates do
+    begin
+      if TFile.Exists(Candidate) then
+      begin
+        TFile.Copy(Candidate, TPath.Combine(BaseDir, 'ls-qpack.dll'), True);
+        Writeln('[OK] Copied ls-qpack.dll');
+        Break;
+      end;
+    end;
+  end;
+
+  EnsureDefaultAppsJson(TPath.Combine(BaseDir, 'apps.json'));
+  EnsureDefaultUsersJson(TPath.Combine(BaseDir, 'users.json'));
+
+  RunIcaclsGrant(TPath.Combine(BaseDir, 'sandbox_usr1'), '*S-1-15-2-1:(OI)(CI)F');
+  RunIcaclsGrant(TPath.Combine(BaseDir, 'sandbox_admin'), '*S-1-15-2-1:(OI)(CI)F');
+  RunIcaclsGrant(TPath.Combine(BaseDir, 'web'), '*S-1-15-2-1:(OI)(CI)RX');
+  if TDirectory.Exists(TPath.Combine(BaseDir, 'Python')) then
+    RunIcaclsGrant(TPath.Combine(BaseDir, 'Python'), '*S-1-15-2-1:(OI)(CI)RX');
+  if TDirectory.Exists(TPath.Combine(BaseDir, 'PyTui')) then
+    RunIcaclsGrant(TPath.Combine(BaseDir, 'PyTui'), '*S-1-15-2-1:(OI)(CI)RX');
+  if TDirectory.Exists(TPath.Combine(BaseDir, 'Far')) then
+    RunIcaclsGrant(TPath.Combine(BaseDir, 'Far'), '*S-1-15-2-1:(OI)(CI)RX');
+  if TDirectory.Exists(TPath.Combine(BaseDir, 'Edit')) then
+    RunIcaclsGrant(TPath.Combine(BaseDir, 'Edit'), '*S-1-15-2-1:(OI)(CI)RX');
+
+  Writeln('=== GTermBox environment initialization complete! ===');
+  Writeln;
+end;
+
+procedure PrintHelp;
+begin
+  Writeln('========================================================================');
+  Writeln('                GTermBox User & App Management Utility                  ');
+  Writeln('========================================================================');
+  Writeln;
+  Writeln('USAGE:');
+  Writeln('  ManageUsers <command> [arguments] [options]');
+  Writeln;
+  Writeln('USER COMMANDS (users.json):');
+  Writeln('  list                             List all configured users in tabular format');
+  Writeln('  show <username>                  Display detailed configuration card for a user');
+  Writeln('  add <username> <password>        Create a new user with standard/custom grants');
+  Writeln('  edit <username> [options]        Update role, sandbox, apps, cert or privilege grants');
+  Writeln('  bind-cert <user> <cert_file>     Bind client certificate (.crt or thumbprint) for mTLS');
+  Writeln('  passwd <username> <new_password> Change password and recalculate SHA-256 hash');
+  Writeln('  delete <username>                Remove user from configuration');
+  Writeln;
+  Writeln('APPLICATION COMMANDS (apps.json):');
+  Writeln('  list-apps                        List all registered terminal applications');
+  Writeln('  show-app <id>                    Display detailed configuration card for an app');
+  Writeln('  add-app <id> <name> <command>    Register a new application');
+  Writeln('  edit-app <id> [options]          Update application attributes and security mode');
+  Writeln('  delete-app <id>                  Remove application from configuration');
+  Writeln('  help                             Show this help manual');
+  Writeln;
+  Writeln('ENVIRONMENT COMMANDS:');
+  Writeln('  init-env [path]                  Initialize complete GTermBox directory structure,');
+  Writeln('                                   including web, Python, PyTui, Far, Edit, sandboxes,');
+  Writeln('                                   trusted_clients, client_keys, configs, and ACLs');
+  Writeln;
+  Writeln('USER OPTIONS:');
+  Writeln('  --role=user|admin                User role (default: user)');
+  Writeln('  --cert=<filename_or_thumb>       Bind client certificate for mTLS Zero-Trust auth');
+  Writeln('  --sandbox=<directory>            Custom sandbox folder (default: sandbox_<user>)');
+  Writeln('  --apps=<app1,app2,...>           Comma-separated allowed apps (default: all tools)');
+  Writeln('  --network / --no-network         Enable or disable outbound network access');
+  Writeln('  --upload / --no-upload           Enable or disable file upload to sandbox');
+  Writeln('  --download / --no-download       Enable or disable file download from sandbox');
+  Writeln('  --allow-job-only / --no-job-only Allow unrestricted access under Job Object limit');
+  Writeln('  --full-disk / --no-full-disk     Allow full disk host traversal');
+  Writeln('  --dirs-read=<dir1,dir2,...>      Allowed read directories');
+  Writeln('  --dirs-write=<dir1,dir2,...>     Allowed write directories');
+  Writeln('  --force                          Overwrite existing user without error');
+  Writeln;
+  Writeln('APP OPTIONS:');
+  Writeln('  --sandbox=standard|job-only|none Execution sandbox isolation level');
+  Writeln('  --args=<arg1,arg2,...>           Default arguments passed to command');
+  Writeln('  --working-dir=<path>             Initial working directory');
+  Writeln('  --network / --no-network         App network capability');
+  Writeln('  --roles=<role1,role2,...>        Allowed roles (e.g. admin,user)');
+  Writeln('  --cols=<number> / --rows=<num>   Default ConPTY terminal geometry (120x30)');
+  Writeln('  --env=<VAR1=VAL,VAR2=VAL>        Environment variables for session');
+  Writeln;
+  Writeln('EXAMPLES:');
+  Writeln('  ManageUsers add alice Secret123! --role=user --full-disk');
+  Writeln('  ManageUsers edit alice --no-network --no-full-disk');
+  Writeln('  ManageUsers show alice');
+  Writeln('  ManageUsers add-app htop "Htop Monitor" "htop.exe" --sandbox=job-only');
+  Writeln('  ManageUsers show-app far');
+  Writeln('========================================================================');
+  Writeln;
+end;
+
 procedure InteractiveMode;
 var
   Choice: string;
-  UName, Pwd, RoleChoice, AppsInput, SandboxInput, NetChoice, JobChoice: string;
+  UName, Pwd, RoleChoice, AppsInput, SandboxInput, NetChoice, JobChoice, FullDiskChoice, UploadChoice, DownloadChoice, PsChoice: string;
   DirsR, DirsW, Confirm: string;
   AppId, AppName, Cmd, SandboxMode, RolesInput: string;
-  ColsStr, RowsStr: string;
 begin
   while True do
   begin
@@ -955,14 +1863,18 @@ begin
     Writeln('3. Edit user parameters (role, apps, sandbox, grants)');
     Writeln('4. Change user password');
     Writeln('5. Delete user');
+    Writeln('6. Show user details');
     Writeln('--- Application Management (apps.json) ---');
-    Writeln('6. List applications');
-    Writeln('7. Add new application');
-    Writeln('8. Edit application parameters');
-    Writeln('9. Delete application');
+    Writeln('7. List applications');
+    Writeln('8. Add new application');
+    Writeln('9. Edit application parameters');
+    Writeln('10. Delete application');
+    Writeln('11. Show application details');
+    Writeln('12. Display help documentation');
+    Writeln('13. Initialize complete GTermBox environment');
     Writeln('0. Exit');
     Writeln;
-    Write('Select option [1-9, 0]: ');
+    Write('Select option [0-13]: ');
     Readln(Choice);
     Choice := Trim(Choice);
 
@@ -993,14 +1905,24 @@ begin
       RoleChoice := Trim(LowerCase(RoleChoice));
       if RoleChoice <> 'admin' then
         RoleChoice := 'user';
-      Write('Enter allowed apps comma-separated (default: * for admin, far,edit,powershell for user): ');
+      Write('Enter allowed apps comma-separated (default: * for admin, far,edit,powershell,pytui,python for user): ');
       Readln(AppsInput);
       Write('Enter sandbox dir (default: sandbox_' + UName + '): ');
       Readln(SandboxInput);
       Write('Enable network access? [Y/n, default: y]: ');
       Readln(NetChoice);
+      Write('Enable full disk access? [y/N, default: n]: ');
+      Readln(FullDiskChoice);
+      Write('Enable file upload to sandbox? [Y/n, default: y]: ');
+      Readln(UploadChoice);
+      Write('Enable file download from sandbox? [Y/n, default: y]: ');
+      Readln(DownloadChoice);
+      Write('Allow PowerShell access outside sandbox? [y/N, default: ' + IfThen(RoleChoice = 'admin', 'y', 'n') + ']: ');
+      Readln(PsChoice);
       AddUser(UName, Pwd, SplitComma(AppsInput), Trim(SandboxInput), RoleChoice,
-        not SameText(Trim(NetChoice), 'n'), False, False, nil, nil);
+        not SameText(Trim(NetChoice), 'n'), False, SameText(Trim(FullDiskChoice), 'y'), nil, nil,
+        not SameText(Trim(UploadChoice), 'n'), not SameText(Trim(DownloadChoice), 'n'),
+        SameText(Trim(PsChoice), 'y') or ((Trim(PsChoice) = '') and (RoleChoice = 'admin')));
     end
     else if Choice = '3' then
     begin
@@ -1019,12 +1941,20 @@ begin
       Readln(NetChoice);
       Write('Allow Job-Only full disk access? (y/n/leave blank to keep): ');
       Readln(JobChoice);
+      Write('Enable full disk access? (y/n/leave blank to keep): ');
+      Readln(FullDiskChoice);
+      Write('Enable file upload? (y/n/leave blank to keep): ');
+      Readln(UploadChoice);
+      Write('Enable file download? (y/n/leave blank to keep): ');
+      Readln(DownloadChoice);
+      Write('Allow PowerShell access outside sandbox? (y/n/leave blank to keep): ');
+      Readln(PsChoice);
       Write('Allowed read dirs comma-separated (leave blank to keep): ');
       Readln(DirsR);
       Write('Allowed write dirs comma-separated (leave blank to keep): ');
       Readln(DirsW);
 
-      var R, UUsersArr: TJSONArray;
+      var UUsersArr: TJSONArray;
       var RObj: TJSONObject;
       UUsersArr := LoadUsersArray(GetUsersPath, RObj);
       try
@@ -1077,6 +2007,50 @@ begin
               GObj.RemovePair('allowJobOnly').Free;
               GObj.AddPair('allowJobOnly', TJSONBool.Create(False));
             end;
+            if SameText(Trim(FullDiskChoice), 'y') then
+            begin
+              GObj.RemovePair('fullDiskAccess').Free;
+              GObj.AddPair('fullDiskAccess', TJSONBool.Create(True));
+            end
+            else if SameText(Trim(FullDiskChoice), 'n') then
+            begin
+              GObj.RemovePair('fullDiskAccess').Free;
+              GObj.AddPair('fullDiskAccess', TJSONBool.Create(False));
+            end;
+            if SameText(Trim(UploadChoice), 'y') then
+            begin
+              GObj.RemovePair('upload').Free;
+              GObj.AddPair('upload', TJSONBool.Create(True));
+            end
+            else if SameText(Trim(UploadChoice), 'n') then
+            begin
+              GObj.RemovePair('upload').Free;
+              GObj.AddPair('upload', TJSONBool.Create(False));
+            end;
+            if SameText(Trim(DownloadChoice), 'y') then
+            begin
+              GObj.RemovePair('download').Free;
+              GObj.AddPair('download', TJSONBool.Create(True));
+            end
+            else if SameText(Trim(DownloadChoice), 'n') then
+            begin
+              GObj.RemovePair('download').Free;
+              GObj.AddPair('download', TJSONBool.Create(False));
+            end;
+            if SameText(Trim(PsChoice), 'y') then
+            begin
+              GObj.RemovePair('powershellAccessEverywhere').Free;
+              GObj.RemovePair('powershellOutsideSandbox').Free;
+              GObj.AddPair('powershellAccessEverywhere', TJSONBool.Create(True));
+              GObj.AddPair('powershellOutsideSandbox', TJSONBool.Create(True));
+            end
+            else if SameText(Trim(PsChoice), 'n') then
+            begin
+              GObj.RemovePair('powershellAccessEverywhere').Free;
+              GObj.RemovePair('powershellOutsideSandbox').Free;
+              GObj.AddPair('powershellAccessEverywhere', TJSONBool.Create(False));
+              GObj.AddPair('powershellOutsideSandbox', TJSONBool.Create(False));
+            end;
             if Trim(DirsR) <> '' then
             begin
               GObj.RemovePair('allowedDirsRead').Free;
@@ -1120,8 +2094,15 @@ begin
         DeleteUser(Trim(UName));
     end
     else if Choice = '6' then
-      ListApps
+    begin
+      Write('Enter username to show: ');
+      Readln(UName);
+      if Trim(UName) <> '' then
+        ShowUser(Trim(UName));
+    end
     else if Choice = '7' then
+      ListApps
+    else if Choice = '8' then
     begin
       Write('Enter app ID (e.g. git-bash): ');
       Readln(AppId);
@@ -1142,7 +2123,7 @@ begin
       AddApp(Trim(AppId), Trim(AppName), Trim(Cmd), nil, '', ['TERM=xterm-256color', 'COLORTERM=truecolor'],
         120, 30, Trim(SandboxMode), SameText(Trim(NetChoice), 'y'), nil, nil, SplitComma(RolesInput));
     end
-    else if Choice = '8' then
+    else if Choice = '9' then
     begin
       Write('Enter app ID to edit: ');
       Readln(AppId);
@@ -1212,7 +2193,7 @@ begin
         RRoot.Free;
       end;
     end
-    else if Choice = '9' then
+    else if Choice = '10' then
     begin
       Write('Enter app ID to delete: ');
       Readln(AppId);
@@ -1220,7 +2201,18 @@ begin
       Readln(Confirm);
       if SameText(Trim(Confirm), 'y') then
         DeleteApp(Trim(AppId));
-    end;
+    end
+    else if Choice = '11' then
+    begin
+      Write('Enter app ID to show: ');
+      Readln(AppId);
+      if Trim(AppId) <> '' then
+        ShowApp(Trim(AppId));
+    end
+    else if Choice = '12' then
+      PrintHelp
+    else if Choice = '13' then
+      InitializeEnvironment('');
     Writeln;
   end;
 end;
@@ -1241,8 +2233,14 @@ begin
 
     Cmd := LowerCase(ParamStr(1));
 
-    if Cmd = 'list' then
+    if (Cmd = 'help') or (Cmd = '--help') or (Cmd = '-h') or (Cmd = '/?') then
+      PrintHelp
+    else if Cmd = 'list' then
       ListUsers
+    else if Cmd = 'show' then
+      ShowUser(GetPositionalArg(1))
+    else if Cmd = 'show-app' then
+      ShowApp(GetPositionalArg(1))
     else if Cmd = 'add' then
     begin
       UName := GetPositionalArg(1);
@@ -1258,8 +2256,52 @@ begin
       ReadStr := GetOptionValue('dirs-read', '');
       WriteStr := GetOptionValue('dirs-write', '');
       NetFlag := not HasFlag('no-network');
+      var UploadFlag: Boolean := True;
+      if HasFlag('no-upload') then
+        UploadFlag := False
+      else if HasFlag('upload') then
+        UploadFlag := True
+      else
+      begin
+        var UpOpt := GetOptionValue('upload');
+        if UpOpt <> '' then
+          UploadFlag := SameText(UpOpt, 'true') or SameText(UpOpt, '1') or SameText(UpOpt, 'yes');
+      end;
+
+      var DownloadFlag: Boolean := True;
+      if HasFlag('no-download') then
+        DownloadFlag := False
+      else if HasFlag('download') then
+        DownloadFlag := True
+      else
+      begin
+        var DownOpt := GetOptionValue('download');
+        if DownOpt <> '' then
+          DownloadFlag := SameText(DownOpt, 'true') or SameText(DownOpt, '1') or SameText(DownOpt, 'yes');
+      end;
+
+      var PsEverywhereFlag: Boolean := SameText(RolesStr, 'admin') or HasFlag('admin') or HasFlag('powershell-outside-sandbox') or HasFlag('powershell-access-everywhere');
+      if HasFlag('no-powershell-outside-sandbox') or HasFlag('no-powershell-access-everywhere') then
+        PsEverywhereFlag := False;
+
+      var ClientCertStr := GetOptionValue('cert', '');
+      if ClientCertStr = '' then
+        ClientCertStr := GetOptionValue('client-cert', '');
+
       AddUser(UName, Pwd, SplitComma(AppsStr), SandboxStr, RolesStr, NetFlag,
-        HasFlag('allow-job-only'), False, SplitComma(ReadStr), SplitComma(WriteStr));
+        HasFlag('allow-job-only'), HasFlag('full-disk'), SplitComma(ReadStr), SplitComma(WriteStr),
+        UploadFlag, DownloadFlag, PsEverywhereFlag, ClientCertStr);
+    end
+    else if (Cmd = 'bind-cert') or (Cmd = 'set-cert') or (Cmd = 'cert-bind') then
+    begin
+      UName := GetPositionalArg(1);
+      var CertArg := GetPositionalArg(2);
+      if (UName = '') or (CertArg = '') then
+      begin
+        Writeln('[ERROR] Usage: ManageUsers bind-cert <username> <cert_file_or_thumbprint>');
+        Exit;
+      end;
+      BindClientCert(UName, CertArg);
     end
     else if Cmd = 'edit' then
       EditUserCLI
@@ -1322,10 +2364,14 @@ begin
       end;
       DeleteApp(AppId);
     end
+    else if (Cmd = 'init-env') or (Cmd = 'setup-env') or (Cmd = 'init') then
+    begin
+      InitializeEnvironment(GetPositionalArg(1));
+    end
     else
     begin
-      Writeln('Unknown command: ', ParamStr(1));
-      Writeln('Available commands: list, add, edit, passwd, delete, list-apps, add-app, edit-app, delete-app');
+      Writeln(Format('[ERROR] Unknown command ''%s''.', [ParamStr(1)]));
+      Writeln('Type ''ManageUsers help'' to see available commands and options.');
     end;
   except
     on E: Exception do

@@ -35,6 +35,11 @@ type
     Network: Boolean;
     AllowJobOnly: Boolean;
     FullDiskAccess: Boolean;
+    PowerShellAccessEverywhere: Boolean;
+    PowerShellOutsideSandbox: Boolean;
+    Upload: Boolean;
+    Download: Boolean;
+    StorageQuotaMB: Integer;
     AllowedDirsRead: TArray<string>;
     AllowedDirsWrite: TArray<string>;
   end;
@@ -47,16 +52,24 @@ type
     Sandbox: string;
     Apps: TArray<string>;
     Grants: TUserGrants;
+    ClientCertificate: string;
     function HasApp(const AAppId: string): Boolean;
     function IsAdmin: Boolean;
+    function CanUpload: Boolean;
+    function CanDownload: Boolean;
+    function CanPowerShellAccessEverywhere: Boolean;
+    function GetStorageQuotaBytes: Int64;
   end;
 
   TGTermUserConfig = class
   private
     FUsers: TArray<TUserEntry>;
+    FConfigPath: string;
+    FLastWriteTime: TDateTime;
     class var FInstance: TGTermUserConfig;
     class function HashPassword(const APassword: string): string;
     class function HashPasswordWithSalt(const APassword, ASalt: string): string;
+    procedure CheckReload;
   public
     constructor Create;
     destructor Destroy; override;
@@ -66,6 +79,7 @@ type
     function ValidateUser(const AUsername, APassword: string; out AUser: TUserEntry): Boolean;
     function CanAccessApp(const AUsername, AAppId: string): Boolean;
     function FindUser(const AUsername: string; out AUser: TUserEntry): Boolean;
+    function FindUserByCert(const ACertIdentifier: string; out AUser: TUserEntry): Boolean;
   end;
 
 implementation
@@ -76,6 +90,8 @@ var
   Wanted: string;
 begin
   Wanted := LowerCase(Trim(AAppId));
+  if Wanted = 'files' then
+    Exit(CanUpload or CanDownload);
   for I := 0 to High(Apps) do
   begin
     if (Apps[I] = '*') or (LowerCase(Trim(Apps[I])) = Wanted) then
@@ -87,6 +103,38 @@ end;
 function TUserEntry.IsAdmin: Boolean;
 begin
   Result := SameText(Trim(Role), 'admin');
+end;
+
+function TUserEntry.CanUpload: Boolean;
+begin
+  if IsAdmin then
+    Exit(True);
+  Result := Grants.Upload;
+end;
+
+function TUserEntry.CanDownload: Boolean;
+begin
+  if IsAdmin then
+    Exit(True);
+  Result := Grants.Download;
+end;
+
+function TUserEntry.CanPowerShellAccessEverywhere: Boolean;
+begin
+  if Grants.PowerShellAccessEverywhere or Grants.PowerShellOutsideSandbox then
+    Exit(True);
+  if IsAdmin and Grants.FullDiskAccess then
+    Exit(True);
+  Result := False;
+end;
+
+function TUserEntry.GetStorageQuotaBytes: Int64;
+begin
+  if IsAdmin then
+    Exit(0);
+  if Grants.StorageQuotaMB <= 0 then
+    Exit(0);
+  Result := Int64(Grants.StorageQuotaMB) * 1024 * 1024;
 end;
 
 constructor TGTermUserConfig.Create;
@@ -170,6 +218,12 @@ begin
       if Entry.Sandbox = '' then
         Entry.Sandbox := UserObj.GetValue<string>('sandbox_dir', 'sandbox_' + Entry.Username);
 
+      Entry.ClientCertificate := UserObj.GetValue<string>('clientCertificate', '');
+      if Entry.ClientCertificate = '' then
+        Entry.ClientCertificate := UserObj.GetValue<string>('client_certificate', '');
+      if Entry.ClientCertificate = '' then
+        Entry.ClientCertificate := UserObj.GetValue<string>('cert', '');
+
       JsonVal := UserObj.FindValue('apps');
       if (JsonVal <> nil) and (JsonVal is TJSONArray) then
       begin
@@ -184,6 +238,11 @@ begin
       Entry.Grants.Network := False;
       Entry.Grants.AllowJobOnly := False;
       Entry.Grants.FullDiskAccess := False;
+      Entry.Grants.PowerShellAccessEverywhere := False;
+      Entry.Grants.PowerShellOutsideSandbox := False;
+      Entry.Grants.Upload := True;
+      Entry.Grants.Download := True;
+      Entry.Grants.StorageQuotaMB := 500;
       SetLength(Entry.Grants.AllowedDirsRead, 0);
       SetLength(Entry.Grants.AllowedDirsWrite, 0);
 
@@ -192,9 +251,19 @@ begin
         Entry.Grants.Network := True;
         Entry.Grants.AllowJobOnly := True;
         Entry.Grants.FullDiskAccess := True;
+        Entry.Grants.PowerShellAccessEverywhere := True;
+        Entry.Grants.PowerShellOutsideSandbox := True;
+        Entry.Grants.Upload := True;
+        Entry.Grants.Download := True;
+        Entry.Grants.StorageQuotaMB := 0;
         Entry.Grants.AllowedDirsRead := ['*'];
         Entry.Grants.AllowedDirsWrite := ['*'];
       end;
+
+      if UserObj.FindValue('storageQuotaMB') <> nil then
+        Entry.Grants.StorageQuotaMB := UserObj.GetValue<Integer>('storageQuotaMB', Entry.Grants.StorageQuotaMB)
+      else if UserObj.FindValue('quotaMB') <> nil then
+        Entry.Grants.StorageQuotaMB := UserObj.GetValue<Integer>('quotaMB', Entry.Grants.StorageQuotaMB);
 
       JsonVal := UserObj.FindValue('grants');
       if (JsonVal <> nil) and (JsonVal is TJSONObject) then
@@ -203,6 +272,17 @@ begin
         Entry.Grants.Network := GrantsObj.GetValue<Boolean>('network', Entry.Grants.Network);
         Entry.Grants.AllowJobOnly := GrantsObj.GetValue<Boolean>('allowJobOnly', Entry.Grants.AllowJobOnly);
         Entry.Grants.FullDiskAccess := GrantsObj.GetValue<Boolean>('fullDiskAccess', Entry.Grants.FullDiskAccess);
+        Entry.Grants.PowerShellAccessEverywhere := GrantsObj.GetValue<Boolean>('powershellAccessEverywhere', Entry.Grants.PowerShellAccessEverywhere);
+        Entry.Grants.PowerShellOutsideSandbox := GrantsObj.GetValue<Boolean>('powershellOutsideSandbox', Entry.Grants.PowerShellOutsideSandbox);
+        if (GrantsObj.FindValue('powershellAccessEverywhere') <> nil) and (GrantsObj.FindValue('powershellOutsideSandbox') = nil) then
+          Entry.Grants.PowerShellOutsideSandbox := Entry.Grants.PowerShellAccessEverywhere
+        else if (GrantsObj.FindValue('powershellOutsideSandbox') <> nil) and (GrantsObj.FindValue('powershellAccessEverywhere') = nil) then
+          Entry.Grants.PowerShellAccessEverywhere := Entry.Grants.PowerShellOutsideSandbox;
+        Entry.Grants.Upload := GrantsObj.GetValue<Boolean>('upload', Entry.Grants.Upload);
+        Entry.Grants.Download := GrantsObj.GetValue<Boolean>('download', Entry.Grants.Download);
+        Entry.Grants.StorageQuotaMB := GrantsObj.GetValue<Integer>('storageQuotaMB', Entry.Grants.StorageQuotaMB);
+        if GrantsObj.FindValue('quotaMB') <> nil then
+          Entry.Grants.StorageQuotaMB := GrantsObj.GetValue<Integer>('quotaMB', Entry.Grants.StorageQuotaMB);
 
         ArrVal := GrantsObj.FindValue('allowedDirsRead');
         if (ArrVal <> nil) and (ArrVal is TJSONArray) then
@@ -244,6 +324,9 @@ begin
     Exit;
   end;
 
+  FConfigPath := APath;
+  FileAge(APath, FLastWriteTime);
+
   try
     with TStringList.Create do
     try
@@ -267,11 +350,23 @@ begin
   end;
 end;
 
+procedure TGTermUserConfig.CheckReload;
+var
+  CurrTime: TDateTime;
+begin
+  if (FConfigPath <> '') and FileExists(FConfigPath) then
+  begin
+    if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
+      LoadFromFile(FConfigPath);
+  end;
+end;
+
 function TGTermUserConfig.ValidateUser(const AUsername, APassword: string; out AUser: TUserEntry): Boolean;
 var
   I: Integer;
   CalculatedHash: string;
 begin
+  CheckReload;
   for I := 0 to High(FUsers) do
   begin
     if SameText(FUsers[I].Username, AUsername) then
@@ -281,7 +376,7 @@ begin
       else
         CalculatedHash := HashPassword(APassword);
 
-      if SameText(FUsers[I].PasswordHash, CalculatedHash) or (FUsers[I].PasswordHash = APassword) then
+      if SameText(FUsers[I].PasswordHash, CalculatedHash) then
       begin
         AUser := FUsers[I];
         Exit(True);
@@ -295,6 +390,7 @@ function TGTermUserConfig.CanAccessApp(const AUsername, AAppId: string): Boolean
 var
   User: TUserEntry;
 begin
+  CheckReload;
   Result := FindUser(AUsername, User) and User.HasApp(AAppId);
 end;
 
@@ -302,6 +398,7 @@ function TGTermUserConfig.FindUser(const AUsername: string; out AUser: TUserEntr
 var
   I: Integer;
 begin
+  CheckReload;
   for I := 0 to High(FUsers) do
   begin
     if SameText(FUsers[I].Username, AUsername) then
@@ -310,6 +407,52 @@ begin
       Exit(True);
     end;
   end;
+  Result := False;
+end;
+
+function TGTermUserConfig.FindUserByCert(const ACertIdentifier: string; out AUser: TUserEntry): Boolean;
+var
+  I: Integer;
+  CleanId, CertFile, CertBase: string;
+begin
+  CheckReload;
+  CleanId := Trim(ACertIdentifier);
+  if CleanId = '' then
+    Exit(False);
+
+  for I := 0 to High(FUsers) do
+  begin
+    CertFile := Trim(FUsers[I].ClientCertificate);
+    if CertFile <> '' then
+    begin
+      if SameText(CertFile, CleanId) then
+      begin
+        AUser := FUsers[I];
+        Exit(True);
+      end;
+      if SameText(ExtractFileName(CertFile), ExtractFileName(CleanId)) then
+      begin
+        AUser := FUsers[I];
+        Exit(True);
+      end;
+      CertBase := ChangeFileExt(ExtractFileName(CertFile), '');
+      if SameText(CertBase, CleanId) or SameText(CertBase, ChangeFileExt(ExtractFileName(CleanId), '')) then
+      begin
+        AUser := FUsers[I];
+        Exit(True);
+      end;
+    end;
+  end;
+
+  for I := 0 to High(FUsers) do
+  begin
+    if SameText(FUsers[I].Username, CleanId) or SameText(FUsers[I].Username, ChangeFileExt(ExtractFileName(CleanId), '')) then
+    begin
+      AUser := FUsers[I];
+      Exit(True);
+    end;
+  end;
+
   Result := False;
 end;
 

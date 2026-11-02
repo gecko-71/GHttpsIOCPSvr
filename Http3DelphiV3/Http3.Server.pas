@@ -56,7 +56,7 @@ uses
 type
   THttp3HttpRequestEvent = procedure(
     Sender: TObject;
-    const AMethod, APath: string;
+    const AMethod, APath, ARemoteIP: string;
     const AHeaders: TArray<TPair<string, string>>;
     const ABody: TBytes;
     const AClientCert: TGClientCertInfo;
@@ -105,9 +105,6 @@ type
     property QuicServer: TQuicServer read FQuicServer;
   end;
 
-threadvar
-  CurrentHttp3RemoteIP: string;
-
 implementation
 
 const
@@ -120,7 +117,7 @@ begin
   FQpackLoader := TLsQpackLoader.Create('ls-qpack.dll');
   FQpackLoader.Start;
   Logger.Info('[HTTP/3] ls-qpack.dll loaded successfully.');
-  Logger.Info('Initializing THttp3Server on port 8443...');
+  Logger.Info('Initializing THttp3Server...');
   FSettingMaxFieldSectionSize := 32768;
   FSettingQpackMaxTableCapacity := 4096;
   FSettingQpackBlockedStreams := 100;
@@ -854,8 +851,7 @@ begin
                   var OutContentType: string := 'text/plain';
                   var OutBody: TBytes := nil;
                   var OutExtra: TArray<TPair<string, string>> := nil;
-                  CurrentHttp3RemoteIP := ConnCtx.RemoteIP;
-                  FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, nil, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
+                  FOnHttpRequest(Self, ReqMethod, ReqPath, ConnCtx.RemoteIP, StreamState.HeaderPairs, nil, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
                   if OutStatus <> 404 then
                   begin
                     SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
@@ -950,8 +946,7 @@ begin
             var OutContentType: string := 'text/plain';
             var OutBody: TBytes := nil;
             var OutExtra: TArray<TPair<string, string>> := nil;
-            CurrentHttp3RemoteIP := ConnCtx.RemoteIP;
-            FOnHttpRequest(Self, ReqMethod, ReqPath, StreamState.HeaderPairs, StreamState.RequestBody, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
+            FOnHttpRequest(Self, ReqMethod, ReqPath, ConnCtx.RemoteIP, StreamState.HeaderPairs, StreamState.RequestBody, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
             SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
           end
           else
@@ -1163,10 +1158,11 @@ end;
 
 procedure THttp3Server.Start(Port: Word);
 begin
+  Logger.Info(Format('Initializing THttp3Server on port %d...', [Port]));
   FQuicServer.Start(Port);
   if Assigned(FWebTransport) and (FQuicServer.MsQuic <> nil) then
     FWebTransport.Api := FQuicServer.MsQuic.Api;
-  Logger.Info('[HTTP/3] Server is listening for HTTP/3 connections on port %d', [Port]);
+  Logger.Info(Format('[HTTP/3] Server is listening for HTTP/3 connections on port %d', [Port]));
 end;
 
 procedure THttp3Server.Stop;

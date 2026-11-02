@@ -110,14 +110,16 @@ type
     FAppContainerSid: PSID;
     FAppContainerName: string;
     FStopping: Integer;
+    FGrantedDirs: TArray<string>;
     procedure CreatePipes;
     procedure ClosePipes;
     procedure SetupJobSandbox;
     function SetupAppContainer(const AWorkingDir: string; const AExeDir: string = ''; const AAllowedDirsRead: TArray<string> = nil; const AAllowedDirsWrite: TArray<string> = nil; const ANetworkCaps: TArray<SID_AND_ATTRIBUTES> = nil): Boolean;
     procedure CleanupSandbox;
     procedure GrantDirAccessToAppContainer(const ADir: string; AFullAccess: Boolean = True);
+    procedure RevokeDirAccessFromAppContainer(const ADir: string);
     function BuildSandboxEnvironment(const AWorkingDir: string; const AExtraEnv: TArray<string>): string;
-    procedure SetupPowerShellProfile(const AWorkingDir: string);
+    procedure SetupPowerShellProfile(const AWorkingDir: string; const AExtraEnv: TArray<string> = nil);
   public
     constructor Create(ACols: Integer = 80; ARows: Integer = 25);
     destructor Destroy; override;
@@ -291,8 +293,11 @@ function GetAce(pAcl: Pointer; dwAceIndex: DWORD; out pAce: Pointer): BOOL;
 function AddAce(pAcl: Pointer; dwAceRevision, dwStartingAceIndex: DWORD;
   pAceList: Pointer; nAceListLength: DWORD): BOOL;
   stdcall; external advapi32 name 'AddAce';
+function DeleteAce(pAcl: Pointer; dwAceIndex: DWORD): BOOL;
+  stdcall; external advapi32 name 'DeleteAce';
 
 function GetLengthSid(pSid: PSID): DWORD; stdcall; external advapi32 name 'GetLengthSid';
+function EqualSid(pSid1, pSid2: PSID): BOOL; stdcall; external advapi32 name 'EqualSid';
 
 function AddAccessAllowedAceEx(
   pAcl: Pointer;
@@ -556,6 +561,19 @@ begin
   SetInformationJobObject(FJobHandle, 6, @CpuInfo, SizeOf(CpuInfo));
 end;
 
+function ConvertStringSecurityDescriptorToSecurityDescriptorW(StringSecurityDescriptor: PWideChar;
+  StringSDRevision: DWORD; var SecurityDescriptor: Pointer; SecurityDescriptorSize: PULONG): BOOL; stdcall;
+  external advapi32 name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
+
+const
+  SANDBOX_DESKTOP_NAME = 'GTermBoxSandbox';
+  SANDBOX_DESKTOP_SDDL = 'D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;AC)';
+
+var
+  GSandboxDesktopLock: TCriticalSection = nil;
+  GSandboxDesktop: HDESK = 0;
+  GSandboxDesktopPath: string = '';
+
 procedure TGTermConPty.GrantDirAccessToAppContainer(const ADir: string; AFullAccess: Boolean);
 var
   OldDacl: Pointer;
@@ -568,6 +586,7 @@ var
   AccessMask: DWORD;
   WinDir: string;
   CleanDir: string;
+  AlreadyGranted: Boolean;
 begin
   if ADir = '' then Exit;
 
@@ -581,50 +600,133 @@ begin
   if not DirectoryExists(ADir) then Exit;
   if FAppContainerSid = nil then Exit;
 
-  Sd := nil;
-  OldDacl := nil;
-  if GetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-       nil, nil, @OldDacl, nil, @Sd) <> 0 then
+  var FileAttr: DWORD;
+  FileAttr := GetFileAttributesW(PWideChar(ADir));
+  if (FileAttr <> INVALID_FILE_ATTRIBUTES) and ((FileAttr and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
   begin
-    Logger.Warn(Format('[ConPTY] GetNamedSecurityInfo failed for: %s', [ADir]));
+    Logger.Warn(Format('[ConPTY] Skipping reparse point: %s', [ADir]));
     Exit;
   end;
 
+  if AFullAccess then
+    AccessMask := FILE_ALL_ACCESS
+  else
+    AccessMask := FILE_GENERIC_READ_EXECUTE;
+
+  if GSandboxDesktopLock <> nil then
+    GSandboxDesktopLock.Enter;
   try
-    FillChar(AclInfo, SizeOf(AclInfo), 0);
-    if OldDacl <> nil then
-      GetAclInformation(OldDacl, @AclInfo, SizeOf(AclInfo), AclSizeInformation);
+    Sd := nil;
+    OldDacl := nil;
+    if GetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+         nil, nil, @OldDacl, nil, @Sd) <> 0 then
+    begin
+      Logger.Warn(Format('[ConPTY] GetNamedSecurityInfo failed for: %s', [ADir]));
+      Exit;
+    end;
 
-    NewAclSize := AclInfo.AclBytesInUse + ACCESS_ALLOWED_ACE_HEADER_SIZE + GetLengthSid(FAppContainerSid) + 32;
-    GetMem(NewDacl, NewAclSize);
     try
-      if not InitializeAcl(NewDacl, NewAclSize, ACL_REVISION) then
-        Logger.Error(Format('[ConPTY] InitializeAcl failed: %d', [GetLastError]));
-
-      if AFullAccess then
-        AccessMask := FILE_ALL_ACCESS
-      else
-        AccessMask := FILE_GENERIC_READ_EXECUTE;
-
-      if not AddAccessAllowedAceEx(NewDacl, ACL_REVISION, OBJECT_INHERIT_ACE or CONTAINER_INHERIT_ACE, AccessMask, FAppContainerSid) then
-        Logger.Error(Format('[ConPTY] AddAccessAllowedAceEx failed: %d', [GetLastError]));
-
-      if OldDacl <> nil then
+      FillChar(AclInfo, SizeOf(AclInfo), 0);
+      AlreadyGranted := False;
+      if (OldDacl <> nil) and GetAclInformation(OldDacl, @AclInfo, SizeOf(AclInfo), AclSizeInformation) and (AclInfo.AceCount > 0) then
+      begin
         for I := 0 to AclInfo.AceCount - 1 do
           if GetAce(OldDacl, I, AcePtr) then
-            AddAce(NewDacl, ACL_REVISION, MAXDWORD, AcePtr,
-              PDWORD(AcePtr)^ shr 16);
+          begin
+            if (PByte(AcePtr)^ = 0) and EqualSid(PSID(PByte(AcePtr) + 8), FAppContainerSid) and
+               ((PDWORD(PByte(AcePtr) + 4)^ and AccessMask) = AccessMask) then
+            begin
+              AlreadyGranted := True;
+              Break;
+            end;
+          end;
+      end;
 
-      if SetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT,
-           DACL_SECURITY_INFORMATION, nil, nil, NewDacl, nil) = 0 then
-        Logger.Info(Format('[ConPTY] Granted AppContainer access to: %s', [ADir]))
-      else
-        Logger.Warn(Format('[ConPTY] SetNamedSecurityInfo failed for: %s', [ADir]));
+      if AlreadyGranted then
+        Exit;
+
+      NewAclSize := AclInfo.AclBytesInUse + ACCESS_ALLOWED_ACE_HEADER_SIZE + GetLengthSid(FAppContainerSid) + 32;
+      GetMem(NewDacl, NewAclSize);
+      try
+        if not InitializeAcl(NewDacl, NewAclSize, ACL_REVISION) then
+          Logger.Error(Format('[ConPTY] InitializeAcl failed: %d', [GetLastError]));
+
+        if not AddAccessAllowedAceEx(NewDacl, ACL_REVISION, OBJECT_INHERIT_ACE or CONTAINER_INHERIT_ACE, AccessMask, FAppContainerSid) then
+          Logger.Error(Format('[ConPTY] AddAccessAllowedAceEx failed: %d', [GetLastError]));
+
+        if (OldDacl <> nil) and (AclInfo.AceCount > 0) then
+          for I := 0 to AclInfo.AceCount - 1 do
+            if GetAce(OldDacl, I, AcePtr) then
+              if not EqualSid(PSID(PByte(AcePtr) + 8), FAppContainerSid) then
+                AddAce(NewDacl, ACL_REVISION, MAXDWORD, AcePtr,
+                  PDWORD(AcePtr)^ shr 16);
+
+        if SetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT,
+             DACL_SECURITY_INFORMATION, nil, nil, NewDacl, nil) = 0 then
+          Logger.Info(Format('[ConPTY] Granted AppContainer access to: %s', [ADir]))
+        else
+          Logger.Warn(Format('[ConPTY] SetNamedSecurityInfo failed for: %s', [ADir]));
+      finally
+        FreeMem(NewDacl);
+      end;
     finally
-      FreeMem(NewDacl);
+      if Sd <> nil then LocalFree(HLOCAL(Sd));
     end;
   finally
-    if Sd <> nil then LocalFree(HLOCAL(Sd));
+    if GSandboxDesktopLock <> nil then
+      GSandboxDesktopLock.Leave;
+  end;
+end;
+
+function GetSandboxDesktopPath: string;
+var
+  Sd: Pointer;
+  Sa: TSecurityAttributes;
+  WinStaName: array[0..255] of WideChar;
+  Needed: DWORD;
+begin
+  Result := '';
+  if GSandboxDesktopLock = nil then Exit;
+  GSandboxDesktopLock.Enter;
+  try
+    if GSandboxDesktop <> 0 then
+      Exit(GSandboxDesktopPath);
+
+    FillChar(WinStaName, SizeOf(WinStaName), 0);
+    Needed := 0;
+    if not GetUserObjectInformationW(GetProcessWindowStation, UOI_NAME, @WinStaName[0], SizeOf(WinStaName), Needed) then
+    begin
+      Logger.Warn(Format('[ConPTY] GetUserObjectInformation failed: %d', [GetLastError]));
+      Exit;
+    end;
+
+    Sd := nil;
+    if not ConvertStringSecurityDescriptorToSecurityDescriptorW(PWideChar(SANDBOX_DESKTOP_SDDL), 1, Sd, nil) then
+    begin
+      Logger.Warn(Format('[ConPTY] Sandbox desktop SDDL conversion failed: %d', [GetLastError]));
+      Exit;
+    end;
+    try
+      FillChar(Sa, SizeOf(Sa), 0);
+      Sa.nLength := SizeOf(Sa);
+      Sa.lpSecurityDescriptor := Sd;
+      Sa.bInheritHandle := False;
+      GSandboxDesktop := CreateDesktopW(PWideChar(SANDBOX_DESKTOP_NAME), nil, nil, 0, GENERIC_ALL, @Sa);
+    finally
+      LocalFree(HLOCAL(Sd));
+    end;
+
+    if GSandboxDesktop = 0 then
+    begin
+      Logger.Warn(Format('[ConPTY] CreateDesktop failed: %d', [GetLastError]));
+      Exit;
+    end;
+
+    GSandboxDesktopPath := string(PWideChar(@WinStaName[0])) + '\' + SANDBOX_DESKTOP_NAME;
+    Logger.Info(Format('[ConPTY] Sandbox desktop ready: %s', [GSandboxDesktopPath]));
+    Result := GSandboxDesktopPath;
+  finally
+    GSandboxDesktopLock.Leave;
   end;
 end;
 
@@ -651,7 +753,14 @@ var
   CapsCount: DWORD;
 begin
   Result := False;
-  ContainerName := 'GTermBox.' + Copy(TGUID.NewGuid.ToString, 2, 36);
+  var Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(AWorkingDir));
+  var SafeLeaf := '';
+  for var Ch in Leaf do
+    if CharInSet(Ch, ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) then
+      SafeLeaf := SafeLeaf + Ch;
+  if SafeLeaf = '' then
+    SafeLeaf := Copy(TGUID.NewGuid.ToString, 2, 36);
+  ContainerName := 'GTermBox.' + SafeLeaf;
   FAppContainerName := ContainerName;
 
   CapsPtr := nil;
@@ -721,9 +830,36 @@ begin
   Result := True;
 end;
 
-procedure TGTermConPty.CleanupSandbox;
+procedure TGTermConPty.RevokeDirAccessFromAppContainer(const ADir: string);
 var
-  ContainerToDelete: string;
+  OldDacl, Sd, AcePtr: Pointer;
+  AclInfo: TACL_SIZE_INFORMATION;
+  I: Integer;
+begin
+  if (ADir = '') or (FAppContainerSid = nil) or not DirectoryExists(ADir) then Exit;
+  Sd := nil;
+  OldDacl := nil;
+  if GetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+       nil, nil, @OldDacl, nil, @Sd) <> 0 then Exit;
+  try
+    if OldDacl = nil then Exit;
+    FillChar(AclInfo, SizeOf(AclInfo), 0);
+    GetAclInformation(OldDacl, @AclInfo, SizeOf(AclInfo), AclSizeInformation);
+    for I := Integer(AclInfo.AceCount) - 1 downto 0 do
+    begin
+      if GetAce(OldDacl, DWORD(I), AcePtr) then
+      begin
+        if EqualSid(PSID(PByte(AcePtr) + 8), FAppContainerSid) then
+          DeleteAce(OldDacl, DWORD(I));
+      end;
+    end;
+    SetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nil, nil, OldDacl, nil);
+  finally
+    if Sd <> nil then LocalFree(HLOCAL(Sd));
+  end;
+end;
+
+procedure TGTermConPty.CleanupSandbox;
 begin
   if FJobHandle <> 0 then
   begin
@@ -733,59 +869,227 @@ begin
 
   if FAppContainerSid <> nil then
   begin
+    SetLength(FGrantedDirs, 0);
     FreeSid(FAppContainerSid);
     FAppContainerSid := nil;
   end;
 
-  ContainerToDelete := FAppContainerName;
   FAppContainerName := '';
-  if ContainerToDelete <> '' then
-  begin
-    DeleteAppContainerProfile(PWideChar(ContainerToDelete));
-    Logger.Info(Format('[ConPTY] AppContainer profile deleted: %s', [ContainerToDelete]));
-  end;
 end;
 
-procedure TGTermConPty.SetupPowerShellProfile(const AWorkingDir: string);
+procedure TGTermConPty.SetupPowerShellProfile(const AWorkingDir: string; const AExtraEnv: TArray<string> = nil);
 const
-  PS_PROFILE_CONTENT = 'New-PSDrive -Name home -PSProvider FileSystem -Root $env:USERPROFILE | Out-Null' + #13#10 +
-                       'Set-Location home:' + #13#10;
+  PS_PROFILE_CONTENT = '(Get-PSProvider FileSystem).Home = $env:USERPROFILE' + #13#10 +
+                       'New-PSDrive -Name home -PSProvider FileSystem -Root "$env:USERPROFILE" | Out-Null' + #13#10 +
+                       'Microsoft.PowerShell.Management\Set-Location -LiteralPath ''home:\''' + #13#10 +
+                       'New-Item -Path Function:\__GTermResolve -Options Constant,AllScope -Value {' + #13#10 +
+                       '  param([string]$RawPath)' + #13#10 +
+                       '  $root = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd(''\'', ''/'')' + #13#10 +
+                       '  $base = (Microsoft.PowerShell.Management\Get-Location).ProviderPath.TrimEnd(''\'', ''/'')' + #13#10 +
+                       '  if (-not $base.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { $base = $root }' + #13#10 +
+                       '  if (-not $RawPath) { return $base }' + #13#10 +
+                       '  if (($RawPath -match ''^[a-zA-Z0-9_]+:'' -and $RawPath -notmatch ''^(?i)home:'') -or ($RawPath -match ''^\\\\'')) { return $null }' + #13#10 +
+                       '  $clean = $RawPath' + #13#10 +
+                       '  if ($clean -match ''^(?i)home:([\\/]|$)'') { $base = $root; $clean = $clean -replace ''^(?i)home:[\\/]*'', '''' }' + #13#10 +
+                       '  elseif ($clean -match ''^(?i)home:'') { $clean = $clean -replace ''^(?i)home:'', '''' }' + #13#10 +
+                       '  if ($clean -match ''^~([\\/]|$)'') { $base = $root; $clean = $clean -replace ''^~[\\/]*'', '''' }' + #13#10 +
+                       '  if (-not $clean) { return $base }' + #13#10 +
+                       '  try {' + #13#10 +
+                       '    $full = if ([System.IO.Path]::IsPathRooted($clean)) { [System.IO.Path]::GetFullPath($clean) } else { [System.IO.Path]::GetFullPath((Join-Path $base $clean)) }' + #13#10 +
+                       '  } catch { return $null }' + #13#10 +
+                       '  $fullTrim = $full.TrimEnd(''\'', ''/'')' + #13#10 +
+                       '  if ($fullTrim.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or $fullTrim.StartsWith($root + ''\'', [System.StringComparison]::OrdinalIgnoreCase)) { return $fullTrim }' + #13#10 +
+                       '  return $null' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\Set-Location -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param([Parameter(Position=0, ValueFromPipeline=$true)][string]$Path = ''home:\'', [string]$LiteralPath)' + #13#10 +
+                       '  $t = if ($LiteralPath) { $LiteralPath } else { $Path }' + #13#10 +
+                       '  $full = __GTermResolve $t' + #13#10 +
+                       '  if (-not $full) {' + #13#10 +
+                       '    $ex = New-Object System.UnauthorizedAccessException("Access to the path ''$t'' is denied.")' + #13#10 +
+                       '    $er = New-Object System.Management.Automation.ErrorRecord($ex, ''PathAccessDenied'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $t)' + #13#10 +
+                       '    $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '  }' + #13#10 +
+                       '  $root = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd(''\'', ''/'')' + #13#10 +
+                       '  $rel = $full.Substring($root.Length).TrimStart(''\'', ''/'')' + #13#10 +
+                       '  $targetHome = if ($rel) { "home:\$rel" } else { ''home:\'' }' + #13#10 +
+                       '  Microsoft.PowerShell.Management\Set-Location -LiteralPath $targetHome' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\Push-Location -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param([Parameter(Position=0, ValueFromPipeline=$true)][string]$Path = ''home:\'', [string]$LiteralPath)' + #13#10 +
+                       '  $t = if ($LiteralPath) { $LiteralPath } else { $Path }' + #13#10 +
+                       '  $full = __GTermResolve $t' + #13#10 +
+                       '  if (-not $full) {' + #13#10 +
+                       '    $ex = New-Object System.UnauthorizedAccessException("Access to the path ''$t'' is denied.")' + #13#10 +
+                       '    $er = New-Object System.Management.Automation.ErrorRecord($ex, ''PathAccessDenied'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $t)' + #13#10 +
+                       '    $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '  }' + #13#10 +
+                       '  $root = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd(''\'', ''/'')' + #13#10 +
+                       '  $rel = $full.Substring($root.Length).TrimStart(''\'', ''/'')' + #13#10 +
+                       '  $targetHome = if ($rel) { "home:\$rel" } else { ''home:\'' }' + #13#10 +
+                       '  Microsoft.PowerShell.Management\Push-Location -LiteralPath $targetHome' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\Get-ChildItem -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param([Parameter(Position=0, ValueFromPipeline=$true)][string]$Path, [string]$LiteralPath, [string]$Filter, [switch]$Force, [switch]$Recurse, [switch]$Name)' + #13#10 +
+                       '  $t = if ($LiteralPath) { $LiteralPath } else { $Path }' + #13#10 +
+                       '  if ($t -match ''^(?i)env:[\\/]*$'') { Microsoft.PowerShell.Management\Get-ChildItem -Path Env:; return }' + #13#10 +
+                       '  $check = if ($t) { $t -replace ''[\*\?]'', ''_'' } else { '''' }' + #13#10 +
+                       '  $full = __GTermResolve $check' + #13#10 +
+                       '  if (-not $full) {' + #13#10 +
+                       '    $ex = New-Object System.UnauthorizedAccessException("Access to the path ''$t'' is denied.")' + #13#10 +
+                       '    $er = New-Object System.Management.Automation.ErrorRecord($ex, ''DirUnauthorizedAccessError'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $t)' + #13#10 +
+                       '    $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '  }' + #13#10 +
+                       '  $root = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd(''\'', ''/'')' + #13#10 +
+                       '  $rel = $full.Substring($root.Length).TrimStart(''\'', ''/'')' + #13#10 +
+                       '  $targetHome = if ($rel) { "home:\$rel" } else { ''home:\'' }' + #13#10 +
+                       '  if ($t -match ''[\*\?]'') {' + #13#10 +
+                       '    $wrel = ($t -replace ''^(?i)home:[\\/]*'', '''').TrimStart(''\'', ''/'')' + #13#10 +
+                       '    $p = @{ Path = "home:\$wrel" }' + #13#10 +
+                       '  } else { $p = @{ LiteralPath = $targetHome } }' + #13#10 +
+                       '  if ($Filter) { $p[''Filter''] = $Filter }' + #13#10 +
+                       '  if ($Force) { $p[''Force''] = $true }' + #13#10 +
+                       '  if ($Recurse) { $p[''Recurse''] = $true }' + #13#10 +
+                       '  if ($Name) { $p[''Name''] = $true }' + #13#10 +
+                       '  Microsoft.PowerShell.Management\Get-ChildItem @p' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\New-PSDrive -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param()' + #13#10 +
+                       '  $ex = New-Object System.UnauthorizedAccessException("Creating new PSDrives is denied in sandbox.")' + #13#10 +
+                       '  $er = New-Object System.Management.Automation.ErrorRecord($ex, ''PSDriveAccessDenied'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)' + #13#10 +
+                       '  $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\Remove-PSDrive -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param()' + #13#10 +
+                       '  $ex = New-Object System.UnauthorizedAccessException("Removing PSDrives is denied in sandbox.")' + #13#10 +
+                       '  $er = New-Object System.Management.Automation.ErrorRecord($ex, ''PSDriveAccessDenied'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)' + #13#10 +
+                       '  $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\powershell -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param()' + #13#10 +
+                       '  $ex = New-Object System.UnauthorizedAccessException("Spawning nested PowerShell processes is denied in sandbox.")' + #13#10 +
+                       '  $er = New-Object System.Management.Automation.ErrorRecord($ex, ''SubshellAccessDenied'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)' + #13#10 +
+                       '  $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\powershell.exe -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param()' + #13#10 +
+                       '  $ex = New-Object System.UnauthorizedAccessException("Spawning nested PowerShell processes is denied in sandbox.")' + #13#10 +
+                       '  $er = New-Object System.Management.Automation.ErrorRecord($ex, ''SubshellAccessDenied'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)' + #13#10 +
+                       '  $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\Get-Location -Options Constant,AllScope -Value {' + #13#10 +
+                       '  if ((Microsoft.PowerShell.Management\Get-Location).Drive.Name -ne ''home'') { Microsoft.PowerShell.Management\Set-Location -LiteralPath ''home:\'' -ErrorAction SilentlyContinue }' + #13#10 +
+                       '  if ([System.IO.Directory]::GetCurrentDirectory() -ne $env:USERPROFILE) { [System.IO.Directory]::SetCurrentDirectory($env:USERPROFILE) }' + #13#10 +
+                       '  Microsoft.PowerShell.Management\Get-Location @args' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'New-Item -Path Function:\Remove-Item -Options Constant,AllScope -Value {' + #13#10 +
+                       '  [CmdletBinding()] param([Parameter(Position=0, ValueFromPipeline=$true)][string]$Path, [string]$LiteralPath, [switch]$Force, [switch]$Recurse)' + #13#10 +
+                       '  $t = if ($LiteralPath) { $LiteralPath } else { $Path }' + #13#10 +
+                       '  if (-not $t) { return }' + #13#10 +
+                       '  if ($t -match ''^(Function:|Alias:|Variable:|Env:|HKLM:|HKCU:|Cert:|WSMan:)'' ) {' + #13#10 +
+                       '    $ex = New-Object System.UnauthorizedAccessException("Access to the path ''$t'' is denied.")' + #13#10 +
+                       '    $er = New-Object System.Management.Automation.ErrorRecord($ex, ''RemoveItemUnauthorizedAccessError'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $t)' + #13#10 +
+                       '    $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '  }' + #13#10 +
+                       '  $full = __GTermResolve $t' + #13#10 +
+                       '  $root = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd(''\'', ''/'')' + #13#10 +
+                       '  if ((-not $full) -or ($full.Length -le $root.Length) -or ($full -match ''(?i)\\Documents(\\(Windows)?PowerShell|$)'')) {' + #13#10 +
+                       '    $ex = New-Object System.UnauthorizedAccessException("Access to the path ''$t'' is denied.")' + #13#10 +
+                       '    $er = New-Object System.Management.Automation.ErrorRecord($ex, ''RemoveItemUnauthorizedAccessError'', [System.Management.Automation.ErrorCategory]::PermissionDenied, $t)' + #13#10 +
+                       '    $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '  }' + #13#10 +
+                       '  if ([System.IO.File]::Exists($full)) { [System.IO.File]::Delete($full) }' + #13#10 +
+                       '  elseif ([System.IO.Directory]::Exists($full)) { [System.IO.Directory]::Delete($full, [bool]$Recurse) }' + #13#10 +
+                       '  else {' + #13#10 +
+                       '    $ex = New-Object System.IO.FileNotFoundException("Cannot find path ''$full'' because it does not exist.")' + #13#10 +
+                       '    $er = New-Object System.Management.Automation.ErrorRecord($ex, ''PathNotFound'', [System.Management.Automation.ErrorCategory]::ObjectNotFound, $full)' + #13#10 +
+                       '    $PSCmdlet.ThrowTerminatingError($er)' + #13#10 +
+                       '  }' + #13#10 +
+                       '} | Out-Null' + #13#10 +
+                       'Microsoft.PowerShell.Management\Remove-Item -Path Function:\prompt -Force -ErrorAction SilentlyContinue' + #13#10 +
+                       'New-Item -Path Function:\prompt -Options Constant,AllScope -Value {' + #13#10 +
+                       '  if ((Microsoft.PowerShell.Management\Get-Location).Drive.Name -ne ''home'') { Microsoft.PowerShell.Management\Set-Location -LiteralPath ''home:\'' -ErrorAction SilentlyContinue }' + #13#10 +
+                       '  if ([System.IO.Directory]::GetCurrentDirectory() -ne $env:USERPROFILE) { [System.IO.Directory]::SetCurrentDirectory($env:USERPROFILE) }' + #13#10 +
+                       '  "PS $($executionContext.SessionState.Path.CurrentLocation)$(''>'' * ($nestedPromptLevel + 1)) "' + #13#10 +
+                       '} | Out-Null' + #13#10;
 var
   ProfileDir5: string;
   ProfileFile5: string;
   ProfileDir7: string;
   ProfileFile7: string;
   SL: TStringList;
+  MustRestrict: Boolean;
+  EnvVar: string;
 begin
   ProfileDir5  := TPath.Combine(AWorkingDir, 'Documents\WindowsPowerShell');
   ProfileFile5 := TPath.Combine(ProfileDir5,  'Microsoft.PowerShell_profile.ps1');
   ProfileDir7  := TPath.Combine(AWorkingDir, 'Documents\PowerShell');
   ProfileFile7 := TPath.Combine(ProfileDir7,  'Microsoft.PowerShell_profile.ps1');
 
+  MustRestrict := False;
+  if FSandboxMode = smStandard then
+    MustRestrict := True
+  else
+  begin
+    for EnvVar in AExtraEnv do
+      if SameText(EnvVar, 'GTERM_RESTRICT_PS=1') then
+      begin
+        MustRestrict := True;
+        Break;
+      end;
+  end;
+
+  if not MustRestrict then
+  begin
+    if FileExists(ProfileFile5) and TFile.ReadAllText(ProfileFile5).Contains('New-PSDrive') then
+    begin
+      SetFileAttributesW(PWideChar(ProfileFile5), FILE_ATTRIBUTE_NORMAL);
+      TFile.Delete(ProfileFile5);
+    end;
+    if FileExists(ProfileFile7) and TFile.ReadAllText(ProfileFile7).Contains('New-PSDrive') then
+    begin
+      SetFileAttributesW(PWideChar(ProfileFile7), FILE_ATTRIBUTE_NORMAL);
+      TFile.Delete(ProfileFile7);
+    end;
+    Exit;
+  end;
+
   ForceDirectories(ProfileDir5);
   ForceDirectories(ProfileDir7);
 
-  if FAppContainerSid <> nil then
-  begin
-    GrantDirAccessToAppContainer(ProfileDir5, True);
-    GrantDirAccessToAppContainer(ProfileDir7, True);
-  end;
+  var Attr5, Attr7: DWORD;
+  Attr5 := GetFileAttributesW(PWideChar(ProfileFile5));
+  if (Attr5 <> INVALID_FILE_ATTRIBUTES) and ((Attr5 and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+    Exit;
+  Attr7 := GetFileAttributesW(PWideChar(ProfileFile7));
+  if (Attr7 <> INVALID_FILE_ATTRIBUTES) and ((Attr7 and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+    Exit;
 
   SL := TStringList.Create;
   try
     SL.Text := PS_PROFILE_CONTENT;
     if (not FileExists(ProfileFile5)) or (TFile.ReadAllText(ProfileFile5, TEncoding.UTF8) <> PS_PROFILE_CONTENT) then
     begin
+      SetFileAttributesW(PWideChar(ProfileFile5), FILE_ATTRIBUTE_NORMAL);
       SL.SaveToFile(ProfileFile5, TEncoding.UTF8);
       Logger.Info(Format('[ConPTY] PS profile updated: %s', [ProfileFile5]));
     end;
+    SetFileAttributesW(PWideChar(ProfileFile5), FILE_ATTRIBUTE_READONLY);
     if (not FileExists(ProfileFile7)) or (TFile.ReadAllText(ProfileFile7, TEncoding.UTF8) <> PS_PROFILE_CONTENT) then
     begin
+      SetFileAttributesW(PWideChar(ProfileFile7), FILE_ATTRIBUTE_NORMAL);
       SL.SaveToFile(ProfileFile7, TEncoding.UTF8);
       Logger.Info(Format('[ConPTY] PS7 profile updated: %s', [ProfileFile7]));
     end;
+    SetFileAttributesW(PWideChar(ProfileFile7), FILE_ATTRIBUTE_READONLY);
   finally
     SL.Free;
+  end;
+
+  if FAppContainerSid <> nil then
+  begin
+    GrantDirAccessToAppContainer(ProfileDir5, False);
+    GrantDirAccessToAppContainer(ProfileDir7, False);
   end;
 end;
 
@@ -854,15 +1158,24 @@ begin
       EnvMap.Values['HOMEPATH']     := PathPart;
       EnvMap.Values['TEMP']         := TempVal;
       EnvMap.Values['TMP']          := TempVal;
-      EnvMap.Values['PATH']         := AWorkingDir + ';' + PathVal;
+      EnvMap.Values['PATH']         := PathVal + ';' + AWorkingDir;
       EnvMap.Values['PSModulePath'] := GetEnvironmentVariable('SystemRoot') +
                                        '\System32\WindowsPowerShell\v1.0\Modules';
-      EnvMap.Values['PSExecutionPolicyPreference'] := 'Bypass';
+      if TDirectory.Exists(TPath.Combine(AWorkingDir, 'apps\python')) then
+      begin
+        EnvMap.Values['PYTHONHOME'] := TPath.Combine(AWorkingDir, 'apps\python');
+        EnvMap.Values['PYTHONNOUSERSITE'] := '1';
+      end
+      else if TDirectory.Exists(TPath.Combine(ExtractFilePath(ParamStr(0)), 'Python')) then
+      begin
+        EnvMap.Values['PYTHONHOME'] := TPath.Combine(ExtractFilePath(ParamStr(0)), 'Python');
+        EnvMap.Values['PYTHONNOUSERSITE'] := '1';
+      end;
 
       if DrivePart <> '' then
         EnvMap.Add('=' + DrivePart + '=' + AWorkingDir);
 
-      SetupPowerShellProfile(AWorkingDir);
+      SetupPowerShellProfile(AWorkingDir, AExtraEnv);
     end;
 
     for I := 0 to High(AExtraEnv) do
@@ -871,6 +1184,13 @@ begin
       EqPos := Pos('=', Line);
       if EqPos > 1 then
         EnvMap.Values[Copy(Line, 1, EqPos - 1)] := Copy(Line, EqPos + 1, MaxInt);
+    end;
+
+    for I := EnvMap.Count - 1 downto 0 do
+    begin
+      var K := LowerCase(EnvMap.Names[I]);
+      if (K = 'gterm_jwt_secret') or (K = 'jwt_secret') or (K = 'secret_key') or (K = 'gterm_config') then
+        EnvMap.Delete(I);
     end;
 
     Result := '';
@@ -901,8 +1221,10 @@ var
   EnvBlock: string;
   EnvPtr: PWideChar;
   NetCaps: TArray<SID_AND_ATTRIBUTES>;
+  DesktopPath: string;
 begin
   Result := False;
+  if FSandboxMode = smInvalid then Exit(False);
   StopProcess;
   FStopping := 0;
 
@@ -991,6 +1313,18 @@ begin
       FillChar(SiEx, SizeOf(SiEx), 0);
       SiEx.StartupInfo.cb := SizeOf(TStartupInfoExW);
       SiEx.lpAttributeList := AttrList;
+      SiEx.StartupInfo.dwFlags := STARTF_USESTDHANDLES;
+      SiEx.StartupInfo.hStdInput := 0;
+      SiEx.StartupInfo.hStdOutput := 0;
+      SiEx.StartupInfo.hStdError := 0;
+
+      DesktopPath := '';
+      if UseAppContainer then
+      begin
+        DesktopPath := GetSandboxDesktopPath;
+        if DesktopPath <> '' then
+          SiEx.StartupInfo.lpDesktop := PWideChar(DesktopPath);
+      end;
 
       StringToWideChar(ACommandLine, CmdLineBuf, Length(CmdLineBuf));
 
@@ -1000,29 +1334,31 @@ begin
         WorkingDirPtr := nil;
 
       SetErrorMode(SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
-      CreationFlags := EXTENDED_STARTUPINFO_PRESENT or CREATE_SUSPENDED;
+      CreationFlags := EXTENDED_STARTUPINFO_PRESENT;
 
       EnvBlock := '';
       EnvPtr := nil;
-      if AWorkingDir <> '' then
-      begin
-        EnvBlock := BuildSandboxEnvironment(AWorkingDir, AEnvironmentVars);
-        CreationFlags := CreationFlags or CREATE_UNICODE_ENVIRONMENT;
-        EnvPtr := PWideChar(EnvBlock);
-      end;
+      EnvBlock := BuildSandboxEnvironment(AWorkingDir, AEnvironmentVars);
+      CreationFlags := CreationFlags or CREATE_UNICODE_ENVIRONMENT;
+      EnvPtr := PWideChar(EnvBlock);
 
-      Result := CreateProcessExW(
-        nil,
-        CmdLineBuf,
-        nil,
-        nil,
-        False,
-        CreationFlags,
-        EnvPtr,
-        WorkingDirPtr,
-        SiEx,
-        FProcessInfo
-      );
+      SetConsoleCtrlHandler(nil, False);
+      try
+        Result := CreateProcessExW(
+          nil,
+          CmdLineBuf,
+          nil,
+          nil,
+          False,
+          CreationFlags,
+          EnvPtr,
+          WorkingDirPtr,
+          SiEx,
+          FProcessInfo
+        );
+      finally
+        SetConsoleCtrlHandler(nil, True);
+      end;
 
       if not Result then
         Logger.Error(Format('[ConPTY] CreateProcessW failed: %d for: %s', [GetLastError, ACommandLine]))
@@ -1052,8 +1388,6 @@ begin
 
     if FJobHandle <> 0 then
       AssignProcessToJobObject(FJobHandle, FProcessInfo.hProcess);
-
-    ResumeThread(FProcessInfo.hThread);
 
     if FInputRead <> 0 then begin CloseHandle(FInputRead); FInputRead := 0; end;
     if FOutputWrite <> 0 then begin CloseHandle(FOutputWrite); FOutputWrite := 0; end;
@@ -1144,6 +1478,10 @@ var
   Hr: HRESULT;
 begin
   Result := False;
+  if ACols < 10 then ACols := 10;
+  if ACols > 500 then ACols := 500;
+  if ARows < 5 then ARows := 5;
+  if ARows > 200 then ARows := 200;
   FCols := ACols;
   FRows := ARows;
   if FHPty <> 0 then
@@ -1177,5 +1515,16 @@ begin
   Bytes := TEncoding.UTF8.GetBytes(AStr);
   Result := WriteInput(Bytes);
 end;
+
+initialization
+  GSandboxDesktopLock := TCriticalSection.Create;
+
+finalization
+  if GSandboxDesktop <> 0 then
+  begin
+    CloseDesktop(GSandboxDesktop);
+    GSandboxDesktop := 0;
+  end;
+  FreeAndNil(GSandboxDesktopLock);
 
 end.

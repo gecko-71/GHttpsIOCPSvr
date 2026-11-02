@@ -14,9 +14,13 @@
 
 Write-Host "--- Generating W3C WebTransport Certificate (ECDSA P-256, 14 days) ---" -ForegroundColor Cyan
 
+$primaryIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet' -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1).IPAddress
+if (-not $primaryIp) { $primaryIp = '127.0.0.1' }
+$dnsNames = @($primaryIp, 'localhost', '127.0.0.1')
+
 # 1. Clean up old GHttpsIOCPSvr certificates
 Get-ChildItem Cert:\LocalMachine\GHttpsIOCPSvr -ErrorAction SilentlyContinue |
-    Where-Object { $_.Subject -like "*CN=localhost*" -or $_.FriendlyName -eq "GHttpsIOCPSvr" } |
+    Where-Object { $_.Subject -like "*CN=$primaryIp*" -or $_.Subject -like "*CN=localhost*" -or $_.FriendlyName -eq "GHttpsIOCPSvr" } |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
 # 2. Create new ECDSA P-256 certificate valid for exactly 14 days
@@ -24,7 +28,7 @@ $notBefore = (Get-Date).AddDays(-1)
 $notAfter  = (Get-Date).AddDays(13)
 
 $cert = New-SelfSignedCertificate `
-    -DnsName 'localhost', '127.0.0.1' `
+    -DnsName $dnsNames `
     -CertStoreLocation 'Cert:\LocalMachine\My' `
     -KeyAlgorithm ECDSA_nistP256 `
     -HashAlgorithm SHA256 `

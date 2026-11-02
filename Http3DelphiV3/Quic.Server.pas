@@ -96,6 +96,7 @@ type
   TQuicServer = class
   private
     FAlpnProtocol: AnsiString;
+    FBindAddress: string;
     FRequiredServerName: string;
     FForceStatelessRetry: Boolean;
     FHandshakesInFlight: Integer;
@@ -160,6 +161,7 @@ type
     property GracefulShutdownTimeoutMs:  Integer read FGracefulShutdownTimeoutMs
                                                   write FGracefulShutdownTimeoutMs;
     property AlpnProtocol: AnsiString read FAlpnProtocol write FAlpnProtocol;
+    property BindAddress: string read FBindAddress write FBindAddress;
     property RequiredServerName: string read FRequiredServerName write FRequiredServerName;
     property ForceStatelessRetry: Boolean read FForceStatelessRetry write FForceStatelessRetry;
     property HandshakesInFlight: Integer read FHandshakesInFlight;
@@ -198,7 +200,7 @@ var
   W: array[0..7] of Word;
   K: Integer;
 begin
-  Result := '127.0.0.1';
+  Result := '';
   if (Info = nil) or (Info.RemoteAddress = nil) then
     Exit;
   if Info.RemoteAddress.si_family = AF_INET then
@@ -214,14 +216,16 @@ begin
     for K := 0 to 7 do
       W[K] := ntohs(Info.RemoteAddress.Ipv6.sin6_addr.Word[K]);
     if (W[0] = 0) and (W[1] = 0) and (W[2] = 0) and (W[3] = 0) and (W[4] = 0) and (W[5] = $FFFF) then
+    begin
       Result := Format('%d.%d.%d.%d', [Info.RemoteAddress.Ipv6.sin6_addr.Byte[12],
                                        Info.RemoteAddress.Ipv6.sin6_addr.Byte[13],
                                        Info.RemoteAddress.Ipv6.sin6_addr.Byte[14],
-                                       Info.RemoteAddress.Ipv6.sin6_addr.Byte[15]])
+                                       Info.RemoteAddress.Ipv6.sin6_addr.Byte[15]]);
+    end
     else if (W[0] = 0) and (W[1] = 0) and (W[2] = 0) and (W[3] = 0) and (W[4] = 0) and (W[5] = 0) and (W[6] = 0) and (W[7] = 1) then
-      Result := '127.0.0.1'
+      Result := '::1'
     else
-      Result := LowerCase(Format('%x:%x:%x:%x::/64', [W[0], W[1], W[2], W[3]]));
+      Result := LowerCase(Format('%x:%x:%x:%x:%x:%x:%x:%x', [W[0], W[1], W[2], W[3], W[4], W[5], W[6], W[7]]));
   end;
 end;
 
@@ -775,8 +779,11 @@ begin
   Logger.Info('Certificate successfully loaded and bound to the configuration.');
   FListener := TMsQuicListener.Create(FMsQuic.Api, FRegistration);
   FListener.OnNewConnection := OnNewConnection;
-  FListener.Start(FAlpnProtocol, Port);
-  Logger.Info('Listener started on port %d', [Port]);
+  FListener.Start(FAlpnProtocol, Port, FBindAddress);
+  if FBindAddress <> '' then
+    Logger.Info('Listener started on %s:%d', [FBindAddress, Port])
+  else
+    Logger.Info('Listener started on port %d', [Port]);
 
   if GetProcessMemoryInfo(GetCurrentProcess(), @MemCounters, SizeOf(MemCounters)) then
   begin

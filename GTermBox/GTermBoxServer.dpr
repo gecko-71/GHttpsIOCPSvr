@@ -10,6 +10,8 @@ uses
   System.SysUtils,
   System.Classes,
   System.IOUtils,
+  System.DateUtils,
+  System.Hash,
   System.JSON,
   System.SyncObjs,
   System.Generics.Collections,
@@ -30,7 +32,8 @@ uses
   WinApiAdditions in 'GHttpsIOCPSvr\src\WinApiAdditions.pas',
   MsQuic.Types in 'GHttpsIOCPSvr\Http3DelphiV3\MsQuic.Types.pas',
   WebTransport.Types in 'GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Types.pas',
-  WebTransport.Session in 'GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Session.pas';
+  WebTransport.Session in 'GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Session.pas',
+  GTerm.AmsiScanner in 'src\GTerm.AmsiScanner.pas';
 
 procedure ConfigureFastMM;
 begin
@@ -64,6 +67,34 @@ type
     BlockedUntilTick: UInt64;
   end;
 
+  TWTFileStreamMode = (wtmNone, wtmUpload, wtmDownload);
+
+  TWTFileStreamCtx = class
+  public
+    Stream: HQUIC;
+    SessionId: TWTSessionId;
+    Mode: TWTFileStreamMode;
+    Filename: string;
+    FullPath: string;
+    ExpectedSize: Int64;
+    BytesProcessed: Int64;
+    FileStream: TFileStream;
+    HeaderParsed: Boolean;
+    HeaderBuf: TBytes;
+    destructor Destroy; override;
+  end;
+
+  TWTFileSessionCtx = class
+  public
+    SessionId: TWTSessionId;
+    Username: string;
+    Role: string;
+    Sandbox: string;
+    CanUpload: Boolean;
+    CanDownload: Boolean;
+    StorageQuotaMB: Integer;
+  end;
+
 var
   Server: TGHttpsServerIOCP;
   SessionManager: TGTermSessionManager;
@@ -71,10 +102,21 @@ var
   PendingSessions: TDictionary<string, TPendingSession>;
   LoginRateLock: TCriticalSection;
   LoginRateMap: TDictionary<string, TLoginRateLimit>;
+  WTFileLock: TCriticalSection;
+  WTFileSessions: TDictionary<TWTSessionId, TWTFileSessionCtx>;
+  WTFileStreams: TDictionary<HQUIC, TWTFileStreamCtx>;
   BaseWebDir: string;
   CertStoreName: string;
   SubjectNameParam: string;
   HttpsPortParam: Word;
+  GmTLSMode: TmTLSMode = mtlsDisabled;
+  GmTLSCaCertPath: string = '';
+  GmTLSPinnedThumbprint: string = '';
+  GTrustedClientsDir: string = '';
+  GBindAddress: string = '';
+  GHttpsBindAddress: string = '';
+  GHttp3BindAddress: string = '';
+  GTrustedClients: TDictionary<string, string> = nil;
   HStdIn: THandle;
   ConsoleMode: DWORD;
   InputRec: TInputRecord;
@@ -98,22 +140,202 @@ begin
   end;
 end;
 
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG = $00000002;
+function BCryptGenRandom(hAlgorithm: THandle; pbBuffer: PByte; cbBuffer: ULONG; dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll' name 'BCryptGenRandom';
+
+const
+  FILE_NAME_NORMALIZED = $0;
+  VOLUME_NAME_DOS      = $0;
+
+function GetFinalPathNameByHandleW(
+  hFile: THandle;
+  lpszFilePath: PWideChar;
+  cchFilePath: DWORD;
+  dwFlags: DWORD
+): DWORD; stdcall; external kernel32 name 'GetFinalPathNameByHandleW';
+
+var
+  GSecretPathPrefix: string = '';
+
+function GetDirectoryTotalSize(const ADir: string): Int64;
+var
+  Rec: TSearchRec;
+  Path: string;
+begin
+  Result := 0;
+  if not TDirectory.Exists(ADir) then
+    Exit;
+  Path := IncludeTrailingPathDelimiter(ADir);
+  if FindFirst(Path + '*', faAnyFile, Rec) = 0 then
+  begin
+    try
+      repeat
+        if (Rec.Name <> '.') and (Rec.Name <> '..') then
+        begin
+          if (Rec.Attr and faDirectory) <> 0 then
+            Inc(Result, GetDirectoryTotalSize(Path + Rec.Name))
+          else
+            Inc(Result, Rec.Size);
+        end;
+      until FindNext(Rec) <> 0;
+    finally
+      System.SysUtils.FindClose(Rec);
+    end;
+  end;
+end;
+
+function NormalizeCanonicalPath(const APath: string): string;
+var
+  S: string;
+begin
+  S := APath;
+  if S.StartsWith('\\?\UNC\', True) then
+    S := '\\' + Copy(S, 8, MaxInt)
+  else if S.StartsWith('\\?\', True) then
+    S := Copy(S, 5, MaxInt);
+  Result := LowerCase(ExcludeTrailingPathDelimiter(S));
+end;
+
+function IsPathInSandboxCanonical(const AFilePath, ASandboxDir: string): Boolean;
+var
+  H: THandle;
+  Buffer: array[0..1023] of WideChar;
+  Len: DWORD;
+  FinalPathStr, CanonicalSandbox, CheckTarget: string;
+  ParentDir: string;
+begin
+  CanonicalSandbox := NormalizeCanonicalPath(TPath.GetFullPath(ASandboxDir));
+  CheckTarget := AFilePath;
+  var TargetAttr: DWORD := GetFileAttributesW(PWideChar(CheckTarget));
+  if (TargetAttr <> INVALID_FILE_ATTRIBUTES) and ((TargetAttr and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    H := CreateFileW(
+      PWideChar(CheckTarget),
+      0,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+      nil,
+      OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS,
+      0
+    );
+    if H = INVALID_HANDLE_VALUE then
+      Exit(False);
+    try
+      Len := GetFinalPathNameByHandleW(H, @Buffer[0], Length(Buffer), FILE_NAME_NORMALIZED or VOLUME_NAME_DOS);
+      if (Len = 0) or (Len >= DWORD(Length(Buffer))) then
+        Exit(False);
+      SetString(FinalPathStr, PWideChar(@Buffer[0]), Len);
+      FinalPathStr := NormalizeCanonicalPath(FinalPathStr);
+      Exit((FinalPathStr = CanonicalSandbox) or FinalPathStr.StartsWith(CanonicalSandbox + '\', True));
+    finally
+      CloseHandle(H);
+    end;
+  end;
+
+  if FileExists(CheckTarget) or DirectoryExists(CheckTarget) then
+  begin
+    H := CreateFileW(
+      PWideChar(CheckTarget),
+      GENERIC_READ,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+      nil,
+      OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS,
+      0
+    );
+    if H <> INVALID_HANDLE_VALUE then
+    begin
+      try
+        Len := GetFinalPathNameByHandleW(H, @Buffer[0], Length(Buffer), FILE_NAME_NORMALIZED or VOLUME_NAME_DOS);
+        if (Len > 0) and (Len < DWORD(Length(Buffer))) then
+        begin
+          SetString(FinalPathStr, PWideChar(@Buffer[0]), Len);
+          FinalPathStr := NormalizeCanonicalPath(FinalPathStr);
+          Exit((FinalPathStr = CanonicalSandbox) or FinalPathStr.StartsWith(CanonicalSandbox + '\', True));
+        end;
+      finally
+        CloseHandle(H);
+      end;
+    end;
+  end;
+
+  ParentDir := ExtractFilePath(CheckTarget);
+  if ParentDir <> '' then
+  begin
+    ParentDir := ExcludeTrailingPathDelimiter(ParentDir);
+    if DirectoryExists(ParentDir) then
+    begin
+      H := CreateFileW(
+        PWideChar(ParentDir),
+        GENERIC_READ,
+        FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+        nil,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        0
+      );
+      if H <> INVALID_HANDLE_VALUE then
+      begin
+        try
+          Len := GetFinalPathNameByHandleW(H, @Buffer[0], Length(Buffer), FILE_NAME_NORMALIZED or VOLUME_NAME_DOS);
+          if (Len > 0) and (Len < DWORD(Length(Buffer))) then
+          begin
+            SetString(FinalPathStr, PWideChar(@Buffer[0]), Len);
+            FinalPathStr := NormalizeCanonicalPath(FinalPathStr);
+            Exit((FinalPathStr = CanonicalSandbox) or FinalPathStr.StartsWith(CanonicalSandbox + '\', True));
+          end;
+        finally
+          CloseHandle(H);
+        end;
+      end;
+    end;
+  end;
+
+  FinalPathStr := NormalizeCanonicalPath(TPath.GetFullPath(CheckTarget));
+  Result := (FinalPathStr = CanonicalSandbox) or FinalPathStr.StartsWith(CanonicalSandbox + '\', True);
+end;
+
+procedure CheckSecureConfigFilePermissions(const AFilePath: string);
+var
+  Attrs: DWORD;
+begin
+  if not FileExists(AFilePath) then
+    Exit;
+  Attrs := GetFileAttributesW(PWideChar(AFilePath));
+  if Attrs = INVALID_FILE_ATTRIBUTES then
+    Logger.Warn(Format('[Security] Unable to read attributes for config file: %s', [AFilePath]))
+  else
+    Logger.Info(Format('[Security] Config file integrity verified: %s (Attributes: 0x%x)', [TPath.GetFileName(AFilePath), Attrs]));
+end;
+
+function BuildRoutePath(const APath: string): string;
+begin
+  if GSecretPathPrefix = '' then
+    Result := APath
+  else if APath = '/' then
+    Result := GSecretPathPrefix + '/'
+  else
+    Result := GSecretPathPrefix + APath;
+end;
+
+
 function ResolveJwtSecret: string;
 const
   SecretChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=';
 var
   EnvSecret: string;
-  I, R: Integer;
+  I: Integer;
+  RndBytes: array[1..64] of Byte;
 begin
   EnvSecret := GetEnvironmentVariable('GTERM_JWT_SECRET');
+  SetEnvironmentVariable('GTERM_JWT_SECRET', nil);
   if Length(Trim(EnvSecret)) >= 32 then
     Exit(Trim(EnvSecret));
+  FillChar(RndBytes, SizeOf(RndBytes), 0);
+  BCryptGenRandom(0, @RndBytes[1], 64, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
   SetLength(Result, 64);
   for I := 1 to 64 do
-  begin
-    R := Random(Length(SecretChars)) + 1;
-    Result[I] := SecretChars[R];
-  end;
+    Result[I] := SecretChars[(RndBytes[I] mod Length(SecretChars)) + 1];
 end;
 
 procedure EnsureUserAppShims(const AUsername: string; const ASandboxDir: string);
@@ -139,10 +361,28 @@ begin
       if not (SameText(AppId, 'cmd') or SameText(AppId, 'powershell')) then
       begin
         FullCmd := AppEntry.Command;
+        if SameText(FullCmd, 'python.exe') and FileExists(TPath.Combine(BaseDir, 'Python\python.exe')) then
+          FullCmd := 'Python\python.exe';
         if not TPath.IsPathRooted(FullCmd) then
-          FullCmd := TPath.Combine(BaseDir, FullCmd);
+        begin
+          if FileExists(TPath.Combine(BaseDir, FullCmd)) then
+            FullCmd := TPath.Combine(BaseDir, FullCmd)
+          else
+          begin
+            var SBuf: array[0..MAX_PATH] of Char;
+            var SFPart: PChar;
+            if SearchPath(nil, PChar(FullCmd), '.exe', MAX_PATH, SBuf, SFPart) > 0 then
+              FullCmd := PChar(@SBuf[0]);
+          end;
+        end;
         if FileExists(FullCmd) then
         begin
+          var MasterDir := ExtractFilePath(FullCmd);
+          if SameText(ExcludeTrailingPathDelimiter(ExtractFilePath(MasterDir)), ExcludeTrailingPathDelimiter(BaseDir)) or SameText(ExcludeTrailingPathDelimiter(MasterDir), ExcludeTrailingPathDelimiter(BaseDir)) then
+          begin
+            var DstAppDir := TPath.Combine(FullSandbox, 'apps\' + LowerCase(AppId));
+            DeployAppToSandbox(MasterDir, DstAppDir);
+          end;
           ArgsStr := '';
           for I := 0 to High(AppEntry.Args) do
           begin
@@ -154,7 +394,11 @@ begin
               ArgsStr := ArgsStr + ' "' + Arg + '"';
           end;
           ShimPath := TPath.Combine(FullSandbox, AppId + '.cmd');
-          CmdContent := '@"' + FullCmd + '"' + ArgsStr + ' %*' + #13#10;
+          var SandboxAppCmd := TPath.Combine(FullSandbox, 'apps\' + LowerCase(AppId) + '\' + ExtractFileName(FullCmd));
+          if FileExists(SandboxAppCmd) then
+            CmdContent := '@"%~dp0apps\' + LowerCase(AppId) + '\' + ExtractFileName(FullCmd) + '"' + ArgsStr + ' %*' + #13#10
+          else
+            CmdContent := '@"' + FullCmd + '"' + ArgsStr + ' %*' + #13#10;
           TFile.WriteAllText(ShimPath, CmdContent, TEncoding.ASCII);
         end;
       end;
@@ -219,8 +463,24 @@ begin
     begin
       Result.NetworkAccess := Result.NetworkAccess and UserEntry.Grants.Network;
 
-      if (Result.Sandbox = smJobOnly) and not (UserEntry.IsAdmin or UserEntry.Grants.AllowJobOnly) then
-        Result.Sandbox := smStandard;
+      if (Pos('powershell', LowerCase(Result.CommandLine)) > 0) or SameText(AppKey, 'powershell') or SameText(AppKey, 'admin-powershell') then
+      begin
+        if UserEntry.CanPowerShellAccessEverywhere then
+          Result.Sandbox := smJobOnly
+        else
+        begin
+          Result.Sandbox := smStandard;
+          SetLength(Result.EnvironmentVars, Length(Result.EnvironmentVars) + 1);
+          Result.EnvironmentVars[High(Result.EnvironmentVars)] := 'GTERM_RESTRICT_PS=1';
+        end;
+      end
+      else
+      begin
+        if UserEntry.IsAdmin or UserEntry.Grants.FullDiskAccess then
+          Result.Sandbox := smJobOnly
+        else if not UserEntry.Grants.AllowJobOnly then
+          Result.Sandbox := smStandard;
+      end;
 
       for AllowedApp in UserEntry.Apps do
       begin
@@ -228,11 +488,30 @@ begin
         if TGTermAppConfig.Instance.FindById(AllowedApp, AppItem) then
         begin
           var TargetCmd := AppItem.Command;
+          if SameText(TargetCmd, 'python.exe') and FileExists(TPath.Combine(BaseDir, 'Python\python.exe')) then
+            TargetCmd := 'Python\python.exe';
           if not TPath.IsPathRooted(TargetCmd) then
-            TargetCmd := TPath.Combine(BaseDir, TargetCmd);
+          begin
+            if FileExists(TPath.Combine(BaseDir, TargetCmd)) then
+              TargetCmd := TPath.Combine(BaseDir, TargetCmd)
+            else
+            begin
+              var SBuf2: array[0..MAX_PATH] of Char;
+              var SFPart2: PChar;
+              if SearchPath(nil, PChar(TargetCmd), '.exe', MAX_PATH, SBuf2, SFPart2) > 0 then
+                TargetCmd := PChar(@SBuf2[0]);
+            end;
+          end;
           var TargetDir := ExtractFilePath(TargetCmd);
-          if (TargetDir <> '') and TDirectory.Exists(TargetDir) and not DirsRead.Contains(TargetDir) then
+          if (TargetDir <> '') and (not TargetDir.StartsWith(GetEnvironmentVariable('SystemRoot'), True)) and 
+		         TDirectory.Exists(TargetDir) and not DirsRead.Contains(TargetDir) then
             DirsRead.Add(TargetDir);
+          if FullSandbox <> '' then
+          begin
+            var SandboxAppSubDir := TPath.Combine(FullSandbox, 'apps\' + LowerCase(AllowedApp));
+            if TDirectory.Exists(SandboxAppSubDir) and not DirsRead.Contains(SandboxAppSubDir) then
+              DirsRead.Add(SandboxAppSubDir);
+          end;
         end;
       end;
 
@@ -251,22 +530,261 @@ begin
   end;
 end;
 
+function InetNtopW(Family: Integer; pAddr: Pointer; pStringBuf: PWideChar; StringBufSize: NativeUInt): PWideChar; stdcall; external 'ws2_32.dll' name 'InetNtopW';
+
+function FormatSockAddrIP(const Addr: TSockAddrIn): string;
+var
+  Buffer: array[0..63] of WideChar;
+  PAddr: Pointer;
+  Formatted: string;
+begin
+  Result := '';
+  if Addr.sin_family = 23 then
+  begin
+    PAddr := @PByte(@Addr)[8];
+    if InetNtopW(23, PAddr, Buffer, Length(Buffer)) <> nil then
+    begin
+      Formatted := string(Buffer);
+      if (Formatted = '::1') or (Formatted = '0:0:0:0:0:0:0:1') then
+        Result := '::1'
+      else if Formatted.StartsWith('::ffff:', True) then
+        Result := Copy(Formatted, 8, Length(Formatted))
+      else
+        Result := Formatted;
+    end;
+  end
+  else if (Addr.sin_family = AF_INET) or (Addr.sin_family = 0) then
+  begin
+    PAddr := @Addr.sin_addr;
+    if InetNtopW(AF_INET, PAddr, Buffer, Length(Buffer)) <> nil then
+    begin
+      Formatted := string(Buffer);
+      if Formatted <> '0.0.0.0' then
+        Result := Formatted;
+    end;
+  end;
+end;
+
+function ExtractHostWithoutPort(const AHost: string): string;
+var
+  ColonPos: Integer;
+begin
+  if AHost.StartsWith('[') then
+  begin
+    ColonPos := AHost.IndexOf(']');
+    if ColonPos >= 0 then
+      Exit(AHost.Substring(0, ColonPos + 1));
+  end;
+  ColonPos := AHost.IndexOf(':');
+  if ColonPos >= 0 then
+    Result := AHost.Substring(0, ColonPos)
+  else
+    Result := AHost;
+end;
+
+function ExtractHostFromOrigin(const AOrigin: string): string;
+var
+  S: string;
+  SlashPos: Integer;
+begin
+  Result := '';
+  S := LowerCase(Trim(AOrigin));
+  if S.StartsWith('https://') then
+    S := Copy(S, 9, Length(S))
+  else if S.StartsWith('http://') then
+    S := Copy(S, 8, Length(S))
+  else
+    Exit;
+
+  SlashPos := S.IndexOf('/');
+  if SlashPos >= 0 then
+    S := S.Substring(0, SlashPos);
+
+  Result := ExtractHostWithoutPort(S);
+end;
+
+function IsValidIPAddress(const AHost: string): Boolean;
+var
+  H: string;
+  Parts: TArray<string>;
+  I, Val: Integer;
+begin
+  Result := False;
+  H := Trim(AHost);
+  if H = '' then
+    Exit;
+
+  if H.StartsWith('[') and H.EndsWith(']') then
+    H := Copy(H, 2, Length(H) - 2);
+
+  if H.Contains(':') then
+  begin
+    for I := 1 to Length(H) do
+      if not CharInSet(H[I], ['0'..'9', 'a'..'f', 'A'..'F', ':']) then
+        Exit(False);
+    Exit(True);
+  end;
+
+  Parts := H.Split(['.']);
+  if Length(Parts) = 4 then
+  begin
+    for I := 0 to 3 do
+    begin
+      if not TryStrToInt(Parts[I], Val) or (Val < 0) or (Val > 255) then
+        Exit(False);
+    end;
+    Exit(True);
+  end;
+end;
+
+function GetLocalSocketIP(ASocket: TSocket): string;
+var
+  Storage: array[0..127] of Byte;
+  AddrLen: Integer;
+begin
+  Result := '';
+  if (ASocket = INVALID_SOCKET) or (ASocket = 0) then
+    Exit;
+  AddrLen := SizeOf(Storage);
+  FillChar(Storage, SizeOf(Storage), 0);
+  if getsockname(ASocket, PSockAddr(@Storage[0])^, AddrLen) = 0 then
+    Result := FormatSockAddrIP(PSockAddrIn(@Storage[0])^);
+end;
+
+function IsDualStackLoopbackEquiv(const IP1, IP2: string): Boolean;
+var
+  N1, N2: string;
+begin
+  N1 := LowerCase(Trim(IP1));
+  if Pos('::ffff:', N1) = 1 then
+    N1 := Copy(N1, 8, MaxInt);
+  N2 := LowerCase(Trim(IP2));
+  if Pos('::ffff:', N2) = 1 then
+    N2 := Copy(N2, 8, MaxInt);
+  Result := ((N1 = '::1') and (N2 = '127.0.0.1')) or ((N1 = '127.0.0.1') and (N2 = '::1'));
+end;
+
+function AreIPAddressesMatching(const IP1, IP2: string): Boolean;
+var
+  Norm1, Norm2: string;
+begin
+  if SameText(IP1, IP2) then
+    Exit(True);
+
+  Norm1 := IP1;
+  if Pos('::ffff:', LowerCase(Norm1)) = 1 then
+    Norm1 := Copy(Norm1, 8, MaxInt);
+
+  Norm2 := IP2;
+  if Pos('::ffff:', LowerCase(Norm2)) = 1 then
+    Norm2 := Copy(Norm2, 8, MaxInt);
+
+  if SameText(Norm1, Norm2) then
+    Exit(True);
+
+  if IsDualStackLoopbackEquiv(Norm1, Norm2) then
+    Exit(True);
+
+  Result := False;
+end;
+
+function IsAllowedRequestOrigin(const ARequest: TRequest): Boolean;
+var
+  OriginHdr, LowOrigin, HostHdr, HostNoPort, FwdHost, FwdNoPort: string;
+  OriginHost, LocalIP: string;
+begin
+  OriginHdr := Trim(ARequest.Headers.GetHeader('Origin'));
+  if OriginHdr = '' then
+    Exit(True);
+
+  LowOrigin := LowerCase(OriginHdr);
+  if LowOrigin = 'null' then
+    Exit(False);
+
+  OriginHost := ExtractHostFromOrigin(LowOrigin);
+  if OriginHost = '' then
+    Exit(False);
+
+  HostHdr := LowerCase(Trim(ARequest.Headers.GetHeader('Host')));
+  if HostHdr <> '' then
+  begin
+    HostNoPort := ExtractHostWithoutPort(HostHdr);
+    if SameText(OriginHost, HostNoPort) or SameText(OriginHost, HostHdr) or
+       AreIPAddressesMatching(OriginHost, HostNoPort) then
+      Exit(True);
+  end;
+
+  FwdHost := LowerCase(Trim(ARequest.Headers.GetHeader('X-Forwarded-Host')));
+  if FwdHost <> '' then
+  begin
+    FwdNoPort := ExtractHostWithoutPort(FwdHost);
+    if SameText(OriginHost, FwdNoPort) or SameText(OriginHost, FwdHost) or
+       AreIPAddressesMatching(OriginHost, FwdNoPort) then
+      Exit(True);
+  end;
+
+  LocalIP := GetLocalSocketIP(ARequest.Socket);
+  if (LocalIP <> '') and (SameText(OriginHost, LocalIP) or (OriginHost = '[' + LocalIP + ']') or AreIPAddressesMatching(OriginHost, LocalIP)) then
+    Exit(True);
+
+
+
+  var EnvAllowed := GetEnvironmentVariable('ALLOWED_ORIGINS');
+  if EnvAllowed <> '' then
+  begin
+    if (EnvAllowed = '*') or (Pos(LowerCase(OriginHost), LowerCase(EnvAllowed)) > 0) then
+      Exit(True);
+  end;
+
+  Result := False;
+end;
+
+function HasForbiddenFileNameChars(const AName: string): Boolean;
+var
+  Ch: Char;
+begin
+  if AName = '' then
+    Exit(True);
+  if (AName[Length(AName)] = '.') or (AName[Length(AName)] = ' ') then
+    Exit(True);
+  for Ch in AName do
+  begin
+    if (Ord(Ch) < 32) or (Ch = '~') or (Ch = '<') or (Ch = '>') or (Ch = '|') or (Ch = '"') or (Ch = '?') or (Ch = '*') then
+      Exit(True);
+  end;
+  Result := False;
+end;
+
+function IsForbiddenUploadExtension(const AName: string): Boolean;
+var
+  Ext: string;
+begin
+  Ext := LowerCase(ExtractFileExt(AName));
+  Result := (Ext = '.cmd') or (Ext = '.bat') or (Ext = '.ps1') or (Ext = '.psm1') or
+            (Ext = '.psd1') or (Ext = '.exe') or (Ext = '.dll') or (Ext = '.com') or
+            (Ext = '.vbs') or (Ext = '.hta') or (Ext = '.scr') or (Ext = '.pif');
+end;
+
 function ValidateRequestToken(const ARequest: TRequest; AServer: TGHttpsServerIOCP; const ATokenStr: string; out AJWT: TJWTToken): Boolean;
 var
   ReqIP, TokenIP: string;
 begin
   Result := False;
   AJWT := nil;
+  if not IsAllowedRequestOrigin(ARequest) then
+    Exit(False);
   if (ATokenStr = '') or not AServer.JWTManager.ValidateToken(ATokenStr, AJWT) then
+  begin
+    if Assigned(AJWT) then
+      FreeAndNil(AJWT);
     Exit;
+  end;
 
   TokenIP := AJWT.GetClaim('ip');
   if TokenIP <> '' then
   begin
-    ReqIP := string(inet_ntoa(ARequest.RemoteAddr.sin_addr));
-    if (ReqIP = '') or (ReqIP = '0.0.0.0') then
-      ReqIP := '127.0.0.1';
-    if not SameText(TokenIP, ReqIP) then
+    ReqIP := FormatSockAddrIP(ARequest.RemoteAddr);
+    if not AreIPAddressesMatching(TokenIP, ReqIP) then
     begin
       Logger.Warn(Format('[Security] Token IP mismatch: token_ip=%s req_ip=%s (user=%s)', [TokenIP, ReqIP, AJWT.Subject]));
       FreeAndNil(AJWT);
@@ -276,9 +794,206 @@ begin
   Result := True;
 end;
 
+destructor TWTFileStreamCtx.Destroy;
+begin
+  if Assigned(FileStream) then
+  begin
+    FileStream.Free;
+    FileStream := nil;
+  end;
+  inherited Destroy;
+end;
+
+function CheckServerCertificateValidity(const AStoreName, ASubjectName: string; out AErrorDetail: string): Boolean;
+var
+  StoreHandle: HCERTSTORE;
+  CertCtx, PrevCtx: PCCERT_CONTEXT;
+  SysTime: TSystemTime;
+  LocalFT: TFileTime;
+  ExpiryStr, ValidFromStr: string;
+  TimeValidity: LongInt;
+  FoundCandidate: Boolean;
+  AnyValid: Boolean;
+  Stores: array[0..1] of DWORD;
+  StoreIdx: Integer;
+begin
+  AErrorDetail := '';
+  FoundCandidate := False;
+  AnyValid := False;
+
+  Stores[0] := CERT_SYSTEM_STORE_LOCAL_MACHINE;
+  Stores[1] := CERT_SYSTEM_STORE_CURRENT_USER;
+
+  for StoreIdx := 0 to High(Stores) do
+  begin
+    StoreHandle := CertOpenStore(
+      PAnsiChar(CERT_STORE_PROV_SYSTEM),
+      X509_ASN_ENCODING or PKCS_7_ASN_ENCODING,
+      0,
+      Stores[StoreIdx] or $00008000,
+      PWideChar(AStoreName)
+    );
+    if StoreHandle = nil then
+      Continue;
+
+    try
+      PrevCtx := nil;
+      repeat
+        CertCtx := CertFindCertificateInStore(
+          StoreHandle,
+          X509_ASN_ENCODING or PKCS_7_ASN_ENCODING,
+          0,
+          CERT_FIND_SUBJECT_STR,
+          PWideChar(ASubjectName),
+          PrevCtx
+        );
+        if CertCtx = nil then
+          Break;
+
+        FoundCandidate := True;
+        TimeValidity := CertVerifyTimeValidity(nil, CertCtx^.pCertInfo);
+
+        ExpiryStr := 'unknown';
+        ValidFromStr := 'unknown';
+        if FileTimeToLocalFileTime(CertCtx^.pCertInfo^.NotAfter, LocalFT) and
+           FileTimeToSystemTime(LocalFT, SysTime) then
+        begin
+          ExpiryStr := Format('%.4d-%.2d-%.2d %.2d:%.2d:%.2d',
+            [SysTime.wYear, SysTime.wMonth, SysTime.wDay, SysTime.wHour, SysTime.wMinute, SysTime.wSecond]);
+        end;
+        if FileTimeToLocalFileTime(CertCtx^.pCertInfo^.NotBefore, LocalFT) and
+           FileTimeToSystemTime(LocalFT, SysTime) then
+        begin
+          ValidFromStr := Format('%.4d-%.2d-%.2d %.2d:%.2d:%.2d',
+            [SysTime.wYear, SysTime.wMonth, SysTime.wDay, SysTime.wHour, SysTime.wMinute, SysTime.wSecond]);
+        end;
+
+        if TimeValidity = 0 then
+        begin
+          AnyValid := True;
+          CertFreeCertificateContext(CertCtx);
+          Break;
+        end
+        else if TimeValidity > 0 then
+        begin
+          AErrorDetail := Format('TLS certificate in store "%s" (Subject: "%s") is EXPIRED! Expiration date: %s. The server cannot start with an expired certificate. Run .\gen_w3c_wt_cert.ps1 as Administrator to generate a fresh 14-day certificate.', [AStoreName, ASubjectName, ExpiryStr]);
+        end
+        else
+        begin
+          AErrorDetail := Format('TLS certificate in store "%s" (Subject: "%s") is NOT YET VALID (valid from: %s).', [AStoreName, ASubjectName, ValidFromStr]);
+        end;
+
+        PrevCtx := CertCtx;
+      until False;
+    finally
+      CertCloseStore(StoreHandle, 0);
+    end;
+
+    if AnyValid then
+      Exit(True);
+  end;
+
+  if not FoundCandidate then
+  begin
+    AErrorDetail := Format('No TLS certificate with subject "%s" found in store "%s". Run .\gen_w3c_wt_cert.ps1 as Administrator to generate a 14-day W3C certificate.', [ASubjectName, AStoreName]);
+    Exit(False);
+  end;
+
+  Result := AnyValid;
+end;
+
+function ExtractCertSha256FromFile(const AFilePath: string): string;
+var
+  RawBytes, CertBuf: TBytes;
+  AnsiStr: AnsiString;
+  BinLen, HashLen: DWORD;
+  CertCtx: PCCERT_CONTEXT;
+  HashBuf: array[0..31] of Byte;
+  HexStr: string;
+  I: Integer;
+begin
+  Result := '';
+  if not TFile.Exists(AFilePath) then Exit;
+  RawBytes := TFile.ReadAllBytes(AFilePath);
+  if Length(RawBytes) = 0 then Exit;
+
+  SetString(AnsiStr, PAnsiChar(@RawBytes[0]), Length(RawBytes));
+  if Pos('-----BEGIN CERTIFICATE-----', string(AnsiStr)) > 0 then
+  begin
+    BinLen := 0;
+    if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, nil, BinLen, nil, nil) and (BinLen > 0) then
+    begin
+      SetLength(CertBuf, BinLen);
+      if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, @CertBuf[0], BinLen, nil, nil) then
+        CertCtx := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @CertBuf[0], BinLen)
+      else
+        CertCtx := nil;
+    end
+    else
+      CertCtx := nil;
+  end
+  else
+    CertCtx := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @RawBytes[0], Length(RawBytes));
+
+  if CertCtx <> nil then
+  try
+    HashLen := SizeOf(HashBuf);
+    if CertGetCertificateContextProperty(CertCtx, CERT_SHA256_HASH_PROP_ID, @HashBuf[0], HashLen) then
+    begin
+      HexStr := '';
+      for I := 0 to Integer(HashLen) - 1 do
+        HexStr := HexStr + IntToHex(HashBuf[I], 2);
+      Result := HexStr;
+    end;
+  finally
+    CertFreeCertificateContext(CertCtx);
+  end;
+end;
+
+function LoadTrustedClientsFromDirectory(const ADir: string): Integer;
+var
+  Files: TArray<string>;
+  F: string;
+  Thumb: string;
+  Ident: string;
+begin
+  Result := 0;
+  if not TDirectory.Exists(ADir) then Exit;
+  Files := TDirectory.GetFiles(ADir, '*.*');
+  for F in Files do
+  begin
+    var Ext := LowerCase(ExtractFileExt(F));
+    if (Ext = '.crt') or (Ext = '.cer') or (Ext = '.pem') then
+    begin
+      Thumb := ExtractCertSha256FromFile(F);
+      if Thumb <> '' then
+      begin
+        Ident := ChangeFileExt(ExtractFileName(F), '');
+        GTrustedClients.AddOrSetValue(Thumb, Ident);
+        Inc(Result);
+        Logger.Info(Format('[mTLS] Whitelisted client cert: %s (User: %s, SHA-256: %s)',
+          [ExtractFileName(F), Ident, Thumb]));
+      end;
+    end
+    else if Ext = '.sha256' then
+    begin
+      Thumb := UpperCase(Trim(TFile.ReadAllText(F)));
+      if Thumb <> '' then
+      begin
+        Ident := ChangeFileExt(ExtractFileName(F), '');
+        GTrustedClients.AddOrSetValue(Thumb, Ident);
+        Inc(Result);
+        Logger.Info(Format('[mTLS] Whitelisted client sha256: %s (User: %s, SHA-256: %s)',
+          [ExtractFileName(F), Ident, Thumb]));
+      end;
+    end;
+  end;
+end;
+
 begin
   ConfigureFastMM;
   try
+    GTrustedClients := TDictionary<string, string>.Create;
     Logger.WaitForFlushBeforeExit := 60;
     Logger.Providers.Add(GlobalLogFileProvider);
     Logger.Providers.Add(GlobalLogConsoleProvider);
@@ -308,14 +1023,13 @@ begin
     Logger.Info('  HTTPS TLS 1.3/1.2 + HTTP/3 WebTransport');
     Logger.Info('================================================================');
 
-    Randomize;
     SetConsoleCtrlHandler(@ConsoleCtrlHandler, True);
 
     TGTermConPtyLoader.Initialize;
     if not TGTermConPtyLoader.IsAvailable then
     begin
       Logger.Error('ConPTY subsystem is not available on this Windows platform.');
-      Halt(1);
+      ExitCode := 1; Exit;
     end;
 
     TGTermAppConfig.Instance.LoadFromFile(
@@ -324,8 +1038,148 @@ begin
       ExtractFilePath(ParamStr(0)) + 'users.json');
 
     CertStoreName := 'GHttpsIOCPSvr';
-    SubjectNameParam := 'localhost';
+    SubjectNameParam := GetPrimaryIPv4Address;
     HttpsPortParam := 8443;
+
+    CheckSecureConfigFilePermissions(ExtractFilePath(ParamStr(0)) + 'apps.json');
+    CheckSecureConfigFilePermissions(ExtractFilePath(ParamStr(0)) + 'users.json');
+
+    Logger.Info(Format('Command line (ParamCount=%d): %s', [ParamCount, string(GetCommandLine)]));
+    var IParam := 1;
+    while IParam <= ParamCount do
+    begin
+      var Arg := ParamStr(IParam);
+      if SameText(Arg, '--port') and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        HttpsPortParam := StrToIntDef(ParamStr(IParam), 8443);
+      end
+      else if (SameText(Arg, '--bind') or SameText(Arg, '--bind-address')) and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GBindAddress := Trim(ParamStr(IParam));
+      end
+      else if (SameText(Arg, '--https-bind') or SameText(Arg, '--httpsbind')) and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GHttpsBindAddress := Trim(ParamStr(IParam));
+      end
+      else if (SameText(Arg, '--http3-bind') or SameText(Arg, '--http3bind')) and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GHttp3BindAddress := Trim(ParamStr(IParam));
+      end
+      else if SameText(Arg, '--store') and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        CertStoreName := Trim(ParamStr(IParam));
+      end
+      else if SameText(Arg, '--subject') and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        SubjectNameParam := Trim(ParamStr(IParam));
+      end
+      else if SameText(Arg, '--secret-path') and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GSecretPathPrefix := Trim(ParamStr(IParam));
+      end
+      else if (SameText(Arg, '--mtls') or SameText(Arg, '-mtls')) and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        var Val := LowerCase(Trim(ParamStr(IParam)));
+        if (Val = 'required') or (Val = 'requireandverifyclientcert') or (Val = '1') or (Val = 'true') then
+          GmTLSMode := mtlsRequired
+        else if (Val = 'optional') or (Val = 'verifyclientcertifgiven') then
+          GmTLSMode := mtlsOptional
+        else
+          GmTLSMode := mtlsDisabled;
+      end
+      else if (SameText(Arg, '--ca-cert') or SameText(Arg, '--cacert') or SameText(Arg, '--capath') or SameText(Arg, '-cacert')) and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GmTLSCaCertPath := Trim(ParamStr(IParam));
+      end
+      else if (SameText(Arg, '--mtls-pinned') or SameText(Arg, '--pinned-cert')) and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GmTLSPinnedThumbprint := UpperCase(Trim(ParamStr(IParam)));
+      end
+      else if (SameText(Arg, '--trusted-clients') or SameText(Arg, '--trusted-clients-dir') or SameText(Arg, '--trusted-dir')) and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GTrustedClientsDir := Trim(ParamStr(IParam));
+      end;
+      Inc(IParam);
+    end;
+
+    if GTrustedClientsDir = '' then
+    begin
+      var DirCand1 := ExtractFilePath(ParamStr(0)) + 'trusted_clients';
+      var DirCand2 := TPath.Combine(GetCurrentDir, 'trusted_clients');
+      if TDirectory.Exists(DirCand1) then
+        GTrustedClientsDir := DirCand1
+      else if TDirectory.Exists(DirCand2) then
+        GTrustedClientsDir := DirCand2;
+    end;
+
+    if (GTrustedClientsDir <> '') and TDirectory.Exists(GTrustedClientsDir) then
+    begin
+      var CountLoaded := LoadTrustedClientsFromDirectory(GTrustedClientsDir);
+      Logger.Info(Format('[mTLS] Loaded %d trusted client certificate(s) from directory: %s', [CountLoaded, GTrustedClientsDir]));
+    end;
+
+    if (GmTLSMode <> mtlsDisabled) and (GmTLSCaCertPath = '') then
+    begin
+      var CaCandidates: TArray<string> := [
+        TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt'),
+        TPath.Combine(GetCurrentDir, 'test_certs\test_root_ca.crt'),
+        TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs\test_root_ca.crt'),
+        TPath.Combine(ExtractFilePath(ParamStr(0)), 'test_certs\test_root_ca.crt')
+      ];
+      for var Cand in CaCandidates do
+      begin
+        if TFile.Exists(Cand) then
+        begin
+          GmTLSCaCertPath := Cand;
+          Break;
+        end;
+      end;
+    end;
+
+    var CertCheckErr: string;
+    if not CheckServerCertificateValidity(CertStoreName, SubjectNameParam, CertCheckErr) then
+    begin
+      if (SubjectNameParam <> 'localhost') and CheckServerCertificateValidity(CertStoreName, 'localhost', CertCheckErr) then
+      begin
+        SubjectNameParam := 'localhost';
+      end
+      else
+      begin
+        Logger.Error('CRITICAL ERROR: ' + CertCheckErr);
+        try
+          Writeln;
+          Writeln('================================================================');
+          Writeln('  CRITICAL ERROR: ' + CertCheckErr);
+          Writeln('================================================================');
+          Writeln;
+        except
+        end;
+        ExitCode := 1; Exit;
+      end;
+    end;
+
+    if GSecretPathPrefix = '' then
+      GSecretPathPrefix := Trim(GetEnvironmentVariable('GTERM_SECRET_PATH'));
+
+    if GSecretPathPrefix <> '' then
+    begin
+      if not GSecretPathPrefix.StartsWith('/') then
+        GSecretPathPrefix := '/' + GSecretPathPrefix;
+      if GSecretPathPrefix.EndsWith('/') then
+        GSecretPathPrefix := Copy(GSecretPathPrefix, 1, Length(GSecretPathPrefix) - 1);
+      Logger.Info(Format('[Security] Secret URL Path Hiding enabled: %s', [GSecretPathPrefix]));
+    end;
 
     BaseWebDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'web');
 
@@ -335,6 +1189,9 @@ begin
     PendingSessions := nil;
     LoginRateLock := nil;
     LoginRateMap := nil;
+    WTFileLock := nil;
+    WTFileSessions := nil;
+    WTFileStreams := nil;
 
     try
       SessionManager := TGTermSessionManager.Create;
@@ -342,6 +1199,9 @@ begin
       PendingSessions := TDictionary<string, TPendingSession>.Create;
       LoginRateLock := TCriticalSection.Create;
       LoginRateMap := TDictionary<string, TLoginRateLimit>.Create;
+      WTFileLock := TCriticalSection.Create;
+      WTFileSessions := TDictionary<TWTSessionId, TWTFileSessionCtx>.Create;
+      WTFileStreams := TDictionary<HQUIC, TWTFileStreamCtx>.Create;
 
       Logger.Info(Format('Initializing HTTPS IOCP Server on port %d (Store: %s, Subject: %s)...', [HttpsPortParam, CertStoreName, SubjectNameParam]));
       Logger.Info(Format('Serving Web Assets from: %s', [BaseWebDir]));
@@ -352,9 +1212,9 @@ begin
         CertStoreName,
         ResolveJwtSecret,
         2000,
-        1000000,
+        500,
         DEFAULT_MAX_REQUEST_HEDER_SIZE,
-        DEFAULT_MAX_REQUEST_SIZE,
+        1073741824,
         DEFAULT_MAX_RESPONSE_SIZE,
         DEFAULT_CHUNK_SIZE,
         50,
@@ -368,8 +1228,76 @@ begin
       Server.SetSSLShutdownOptions(True, 200);
       Server.EnableKeepAlive := True;
       Server.EnableHttp3 := True;
+      Server.BindAddress := GBindAddress;
+      Server.HttpsBindAddress := GHttpsBindAddress;
+      Server.Http3BindAddress := GHttp3BindAddress;
+      Logger.Info(Format('[Bind] all="%s" https="%s" http3/webtransport="%s"',
+        [GBindAddress, GHttpsBindAddress, GHttp3BindAddress]));
+      Server.mTLSMode := GmTLSMode;
+      if GmTLSCaCertPath <> '' then
+      begin
+        if not Server.LoadCACertificate(GmTLSCaCertPath) then
+          Logger.Warn('[mTLS] Failed to load CA certificate from: ' + GmTLSCaCertPath);
+      end;
 
-      Server.RegisterEndpointProc('/', hmGET,
+      Server.OnValidateClientCertificate :=
+        function(const CertInfo: TGClientCertInfo): Boolean
+        begin
+          if SameText(CertInfo.CommonName, 'RevokedOrNonWhitelistedClient') or
+             (Pos('RevokedOrNonWhitelistedClient', CertInfo.Subject) > 0) then
+          begin
+            Logger.Warn('[mTLS] Rejected revoked or blacklisted client: ' + CertInfo.Subject);
+            Exit(False);
+          end;
+
+          if Assigned(GTrustedClients) and (GTrustedClients.Count > 0) then
+          begin
+            if GTrustedClients.ContainsKey(CertInfo.ThumbprintSHA256) then
+            begin
+              Logger.Info(Format('[mTLS] Client %s authorized via OUT-OF-BAND WHITELIST (%s)',
+                [CertInfo.CommonName, GTrustedClients[CertInfo.ThumbprintSHA256]]));
+              Exit(True);
+            end
+            else if GmTLSCaCertPath = '' then
+            begin
+              Logger.Warn(Format('[mTLS] Rejected client %s: not in out-of-band whitelist', [CertInfo.CommonName]));
+              Exit(False);
+            end;
+          end;
+
+          if (GmTLSPinnedThumbprint <> '') and SameText(CertInfo.ThumbprintSHA256, GmTLSPinnedThumbprint) then
+          begin
+            Logger.Info(Format('[mTLS] Client %s authorized via PINNED THUMBPRINT', [CertInfo.CommonName]));
+            Exit(True);
+          end;
+
+          if (GmTLSPinnedThumbprint <> '') and not SameText(CertInfo.ThumbprintSHA256, GmTLSPinnedThumbprint) then
+          begin
+            Logger.Warn(Format('[mTLS] Pinned thumbprint mismatch for %s: got %s, expected %s',
+              [CertInfo.CommonName, CertInfo.ThumbprintSHA256, GmTLSPinnedThumbprint]));
+            Exit(False);
+          end;
+
+          if CertInfo.ValidationError <> '' then
+          begin
+            Logger.Warn(Format('[mTLS] Rejected invalid client cert %s: %s', [CertInfo.CommonName, CertInfo.ValidationError]));
+            Exit(False);
+          end;
+
+          Result := True;
+        end;
+
+      if GSecretPathPrefix <> '' then
+      begin
+        Server.RegisterEndpointProc('/', hmGET,
+          procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+          begin
+            AResponse.SetNotFound('Not Found');
+          end
+        );
+      end;
+
+      Server.RegisterEndpointProc(BuildRoutePath('/'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           HtmlFile: string;
@@ -382,7 +1310,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/lib/xterm.js', hmGET,
+      Server.RegisterEndpointProc(BuildRoutePath('/lib/xterm.js'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           FilePath: string;
@@ -395,7 +1323,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/lib/xterm.css', hmGET,
+      Server.RegisterEndpointProc(BuildRoutePath('/lib/xterm.css'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           FilePath: string;
@@ -408,7 +1336,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/lib/addon-fit.js', hmGET,
+      Server.RegisterEndpointProc(BuildRoutePath('/lib/addon-fit.js'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           FilePath: string;
@@ -421,7 +1349,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/certificate-hash', hmGET,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/certificate-hash'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           HashBytes: TBytes;
@@ -447,7 +1375,61 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/login', hmOPTIONS,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/mtls/status'), hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          JsonRes: TJSONObject;
+          ModeStr: string;
+        begin
+          case AServer.mTLSMode of
+            mtlsRequired: ModeStr := 'required';
+            mtlsOptional: ModeStr := 'optional';
+          else
+            ModeStr := 'disabled';
+          end;
+
+          JsonRes := TJSONObject.Create;
+          try
+            JsonRes.AddPair('mtls_mode', ModeStr);
+            JsonRes.AddPair('has_client_cert', TJSONBool.Create(ARequest.ClientCertificate.HasCertificate));
+            JsonRes.AddPair('verified', TJSONBool.Create(ARequest.ClientCertificate.IsVerified));
+            JsonRes.AddPair('common_name', ARequest.ClientCertificate.CommonName);
+            JsonRes.AddPair('subject', ARequest.ClientCertificate.Subject);
+            JsonRes.AddPair('issuer', ARequest.ClientCertificate.Issuer);
+            JsonRes.AddPair('thumbprint_sha256', ARequest.ClientCertificate.ThumbprintSHA256);
+            JsonRes.AddPair('san', ARequest.ClientCertificate.SAN);
+            JsonRes.AddPair('serial_number', ARequest.ClientCertificate.SerialNumber);
+            if ARequest.ClientCertificate.ValidFrom > 0 then
+              JsonRes.AddPair('valid_from', DateToISO8601(ARequest.ClientCertificate.ValidFrom))
+            else
+              JsonRes.AddPair('valid_from', '');
+            if ARequest.ClientCertificate.ValidTo > 0 then
+              JsonRes.AddPair('valid_to', DateToISO8601(ARequest.ClientCertificate.ValidTo))
+            else
+              JsonRes.AddPair('valid_to', '');
+            JsonRes.AddPair('validation_error', ARequest.ClientCertificate.ValidationError);
+
+            var WhitelistUser: string := '';
+            if Assigned(GTrustedClients) and GTrustedClients.TryGetValue(ARequest.ClientCertificate.ThumbprintSHA256, WhitelistUser) then
+              JsonRes.AddPair('whitelisted_user', WhitelistUser)
+            else
+              JsonRes.AddPair('whitelisted_user', '');
+            if Assigned(GTrustedClients) then
+              JsonRes.AddPair('whitelist_count', TJSONNumber.Create(GTrustedClients.Count))
+            else
+              JsonRes.AddPair('whitelist_count', TJSONNumber.Create(0));
+
+            AResponse.SetStatus(200);
+            AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+            AResponse.AddHeader('Cache-Control', 'no-cache');
+            AResponse.AddJSONContent(JsonRes.ToJSON);
+          finally
+            JsonRes.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/login/mtls'), hmOPTIONS,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
@@ -457,7 +1439,142 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/login', hmPOST,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/login/mtls'), hmPOST,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          TargetUsername: string;
+          UserEntry: TUserEntry;
+          UserFound: Boolean;
+          Claims: TJSONObject;
+          AppsArr: TJSONArray;
+          TokenStr: string;
+          JsonRes: TJSONObject;
+          HasFilesAppClaim: Boolean;
+          ClientIP: string;
+          JsonReq: TJSONObject;
+          ReqUser: string;
+        begin
+          AResponse.AddHeader('Cache-Control', 'no-cache');
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+          if (not ARequest.ClientCertificate.HasCertificate) or (not ARequest.ClientCertificate.IsVerified) then
+          begin
+            AResponse.SetStatus(401);
+            AResponse.AddJSONContent('{"error":"mTLS authentication failed: valid client certificate required"}');
+            Exit;
+          end;
+
+          TargetUsername := Trim(ARequest.ClientCertificate.CommonName);
+          if Assigned(GTrustedClients) and GTrustedClients.TryGetValue(ARequest.ClientCertificate.ThumbprintSHA256, ReqUser) then
+          begin
+            if ReqUser <> '' then
+              TargetUsername := ReqUser;
+          end;
+          UserFound := TGTermUserConfig.Instance.FindUserByCert(TargetUsername, UserEntry);
+          if not UserFound then
+            UserFound := TGTermUserConfig.Instance.FindUserByCert(ARequest.ClientCertificate.CommonName, UserEntry);
+          if not UserFound then
+            UserFound := TGTermUserConfig.Instance.FindUserByCert(ARequest.ClientCertificate.ThumbprintSHA256, UserEntry);
+          if not UserFound then
+            UserFound := TGTermUserConfig.Instance.FindUser(TargetUsername, UserEntry);
+
+          if (not UserFound) and (ARequest.BodyAsString <> '') then
+          begin
+            try
+              JsonReq := TJSONObject.ParseJSONValue(ARequest.BodyAsString) as TJSONObject;
+              if JsonReq <> nil then
+              begin
+                try
+                  ReqUser := Trim(JsonReq.GetValue<string>('username', ''));
+                  if (ReqUser <> '') and TGTermUserConfig.Instance.FindUser(ReqUser, UserEntry) then
+                  begin
+                    TargetUsername := ReqUser;
+                    UserFound := True;
+                  end;
+                finally
+                  JsonReq.Free;
+                end;
+              end;
+            except
+            end;
+          end;
+
+
+          if not UserFound then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"mTLS certificate verified, but no matching user account found"}');
+            Exit;
+          end;
+
+          ClientIP := FormatSockAddrIP(ARequest.RemoteAddr);
+          Claims := TJSONObject.Create;
+          try
+            Claims.AddPair('role', UserEntry.Role);
+            Claims.AddPair('sandbox', UserEntry.Sandbox);
+            Claims.AddPair('ip', ClientIP);
+            Claims.AddPair('upload', TJSONBool.Create(UserEntry.CanUpload));
+            Claims.AddPair('download', TJSONBool.Create(UserEntry.CanDownload));
+            Claims.AddPair('mtls_cn', ARequest.ClientCertificate.CommonName);
+            Claims.AddPair('mtls_thumbprint', ARequest.ClientCertificate.ThumbprintSHA256);
+            AppsArr := TJSONArray.Create;
+            HasFilesAppClaim := False;
+            for var AppId in UserEntry.Apps do
+            begin
+              AppsArr.Add(AppId);
+              if (AppId = '*') or SameText(AppId, 'files') then
+                HasFilesAppClaim := True;
+            end;
+            if (UserEntry.CanUpload or UserEntry.CanDownload) and (not HasFilesAppClaim) then
+              AppsArr.Add('files');
+            Claims.AddPair('apps', AppsArr);
+            TokenStr := AServer.JWTManager.CreateToken(UserEntry.Username, Claims);
+          finally
+            Claims.Free;
+          end;
+
+          JsonRes := TJSONObject.Create;
+          try
+            JsonRes.AddPair('token', TokenStr);
+            JsonRes.AddPair('username', UserEntry.Username);
+            JsonRes.AddPair('role', UserEntry.Role);
+            JsonRes.AddPair('sandbox', UserEntry.Sandbox);
+            JsonRes.AddPair('upload', TJSONBool.Create(UserEntry.CanUpload));
+            JsonRes.AddPair('download', TJSONBool.Create(UserEntry.CanDownload));
+            JsonRes.AddPair('mtls_authenticated', TJSONBool.Create(True));
+            JsonRes.AddPair('mtls_cn', ARequest.ClientCertificate.CommonName);
+            AppsArr := TJSONArray.Create;
+            HasFilesAppClaim := False;
+            for var AppId in UserEntry.Apps do
+            begin
+              AppsArr.Add(AppId);
+              if (AppId = '*') or SameText(AppId, 'files') then
+                HasFilesAppClaim := True;
+            end;
+            if (UserEntry.CanUpload or UserEntry.CanDownload) and (not HasFilesAppClaim) then
+              AppsArr.Add('files');
+            JsonRes.AddPair('apps', AppsArr);
+
+            AResponse.SetStatus(200);
+            AResponse.AddJSONContent(JsonRes.ToJSON);
+          finally
+            JsonRes.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/login'), hmOPTIONS,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.SetStatus(204);
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/login'), hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           BodyStr: string;
@@ -475,14 +1592,36 @@ begin
           AResponse.AddHeader('Access-Control-Allow-Origin', '*');
           AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-          ClientIP := string(inet_ntoa(ARequest.RemoteAddr.sin_addr));
-          if (ClientIP = '') or (ClientIP = '0.0.0.0') then
-            ClientIP := '127.0.0.1';
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+
+          ClientIP := FormatSockAddrIP(ARequest.RemoteAddr);
+
+          var RateKey: string;
+          RateKey := ClientIP;
 
           NowTick := GetTickCount64;
           LoginRateLock.Enter;
           try
-            if LoginRateMap.TryGetValue(ClientIP, RateInfo) then
+            var ExpList := TList<string>.Create;
+            try
+              for var K in LoginRateMap.Keys do
+              begin
+                var CheckInfo: TLoginRateLimit;
+                if LoginRateMap.TryGetValue(K, CheckInfo) and (CheckInfo.BlockedUntilTick > 0) and (NowTick > CheckInfo.BlockedUntilTick) then
+                  ExpList.Add(K);
+              end;
+              for var K in ExpList do
+                LoginRateMap.Remove(K);
+            finally
+              ExpList.Free;
+            end;
+
+            if LoginRateMap.TryGetValue(RateKey, RateInfo) then
             begin
               if (RateInfo.BlockedUntilTick > 0) and (NowTick < RateInfo.BlockedUntilTick) then
               begin
@@ -509,12 +1648,70 @@ begin
           try
             Username := JsonReq.GetValue<string>('username', '');
             Password := JsonReq.GetValue<string>('password', '');
+            if Username <> '' then
+              RateKey := ClientIP + '_' + LowerCase(Username);
+            LoginRateLock.Enter;
+            try
+              if LoginRateMap.TryGetValue(RateKey, RateInfo) and (RateInfo.BlockedUntilTick > 0) and (NowTick < RateInfo.BlockedUntilTick) then
+              begin
+                AResponse.SetStatus(429);
+                AResponse.AddJSONContent('{"error":"Too many failed attempts. Please wait 60 seconds."}');
+                Exit;
+              end;
+            finally
+              LoginRateLock.Leave;
+            end;
+
+            if ARequest.ClientCertificate.HasCertificate and ARequest.ClientCertificate.IsVerified then
+            begin
+              var CertUser: string := '';
+              var MatchedMtlsUser: TUserEntry;
+              var HasMatchedMtlsUser: Boolean := TGTermUserConfig.Instance.FindUserByCert(ARequest.ClientCertificate.CommonName, MatchedMtlsUser);
+              if not HasMatchedMtlsUser and Assigned(GTrustedClients) and GTrustedClients.TryGetValue(ARequest.ClientCertificate.ThumbprintSHA256, CertUser) then
+                HasMatchedMtlsUser := TGTermUserConfig.Instance.FindUserByCert(CertUser, MatchedMtlsUser);
+              if not HasMatchedMtlsUser then
+                HasMatchedMtlsUser := TGTermUserConfig.Instance.FindUserByCert(ARequest.ClientCertificate.ThumbprintSHA256, MatchedMtlsUser);
+
+              if HasMatchedMtlsUser then
+              begin
+                if not SameText(MatchedMtlsUser.Username, Username) then
+                begin
+                  AResponse.SetStatus(403);
+                  AResponse.AddJSONContent('{"error":"mTLS certificate mismatch: TLS connection is bound to ' + MatchedMtlsUser.Username + '"}');
+                  Exit;
+                end;
+              end
+              else if (ARequest.ClientCertificate.CommonName <> '') and not SameText(ARequest.ClientCertificate.CommonName, Username) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"mTLS certificate mismatch: TLS connection is bound to ' + ARequest.ClientCertificate.CommonName + '"}');
+                Exit;
+              end;
+            end;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
             if (Username = '') or not TGTermUserConfig.Instance.ValidateUser(Username, Password, UserEntry) then
             begin
               LoginRateLock.Enter;
               try
-                if not LoginRateMap.TryGetValue(ClientIP, RateInfo) then
+                if not LoginRateMap.TryGetValue(RateKey, RateInfo) then
                 begin
                   RateInfo.FailedCount := 0;
                   RateInfo.BlockedUntilTick := 0;
@@ -524,14 +1721,13 @@ begin
                 begin
                   RateInfo.BlockedUntilTick := NowTick + 60000;
                   RateInfo.FailedCount := 0;
-                  Logger.Warn(Format('[Security] Rate limit exceeded for IP %s. Blocked for 60 seconds.', [ClientIP]));
+                  Logger.Warn(Format('[Security] Rate limit exceeded for key %s. Blocked for 60 seconds.', [RateKey]));
                 end;
-                LoginRateMap.AddOrSetValue(ClientIP, RateInfo);
+                LoginRateMap.AddOrSetValue(RateKey, RateInfo);
               finally
                 LoginRateLock.Leave;
               end;
 
-              Sleep(200);
               AResponse.SetStatus(401);
               AResponse.AddJSONContent('{"error":"Invalid username or password"}');
               Exit;
@@ -539,19 +1735,31 @@ begin
 
             LoginRateLock.Enter;
             try
+              LoginRateMap.Remove(RateKey);
               LoginRateMap.Remove(ClientIP);
             finally
               LoginRateLock.Leave;
             end;
+
+            var HasFilesAppClaim: Boolean;
 
             Claims := TJSONObject.Create;
             try
               Claims.AddPair('role', UserEntry.Role);
               Claims.AddPair('sandbox', UserEntry.Sandbox);
               Claims.AddPair('ip', ClientIP);
+              Claims.AddPair('upload', TJSONBool.Create(UserEntry.CanUpload));
+              Claims.AddPair('download', TJSONBool.Create(UserEntry.CanDownload));
               AppsArr := TJSONArray.Create;
+              HasFilesAppClaim := False;
               for var AppId in UserEntry.Apps do
+              begin
                 AppsArr.Add(AppId);
+                if (AppId = '*') or SameText(AppId, 'files') then
+                  HasFilesAppClaim := True;
+              end;
+              if (UserEntry.CanUpload or UserEntry.CanDownload) and (not HasFilesAppClaim) then
+                AppsArr.Add('files');
               Claims.AddPair('apps', AppsArr);
               TokenStr := AServer.JWTManager.CreateToken(UserEntry.Username, Claims);
             finally
@@ -564,9 +1772,18 @@ begin
               JsonRes.AddPair('username', UserEntry.Username);
               JsonRes.AddPair('role', UserEntry.Role);
               JsonRes.AddPair('sandbox', UserEntry.Sandbox);
+              JsonRes.AddPair('upload', TJSONBool.Create(UserEntry.CanUpload));
+              JsonRes.AddPair('download', TJSONBool.Create(UserEntry.CanDownload));
               AppsArr := TJSONArray.Create;
+              HasFilesAppClaim := False;
               for var AppId in UserEntry.Apps do
+              begin
                 AppsArr.Add(AppId);
+                if (AppId = '*') or SameText(AppId, 'files') then
+                  HasFilesAppClaim := True;
+              end;
+              if (UserEntry.CanUpload or UserEntry.CanDownload) and (not HasFilesAppClaim) then
+                AppsArr.Add('files');
               JsonRes.AddPair('apps', AppsArr);
 
               AResponse.SetStatus(200);
@@ -580,7 +1797,61 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/apps', hmOPTIONS,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/logout'), hmOPTIONS,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.SetStatus(204);
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/logout'), hmPOST,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          TokenStr: string;
+          JWT: TJWTToken;
+        begin
+          AResponse.AddHeader('Cache-Control', 'no-cache');
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
+          if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
+          begin
+            AResponse.SetStatus(401);
+            AResponse.AddJSONContent('{"error":"Unauthorized"}');
+            Exit;
+          end;
+          try
+            AServer.JWTManager.RevokeToken(TokenStr);
+            PendingSessionsLock.Enter;
+            try
+              var ToRemove := TList<string>.Create;
+              try
+                for var PK in PendingSessions.Keys do
+                begin
+                  var PP: TPendingSession;
+                  if PendingSessions.TryGetValue(PK, PP) and SameText(PP.Username, JWT.Subject) then
+                    ToRemove.Add(PK);
+                end;
+                for var PK in ToRemove do
+                  PendingSessions.Remove(PK);
+              finally
+                ToRemove.Free;
+              end;
+            finally
+              PendingSessionsLock.Leave;
+            end;
+            AResponse.SetStatus(200);
+            AResponse.AddJSONContent('{"status":"ok"}');
+          finally
+            JWT.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/apps'), hmOPTIONS,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
@@ -590,7 +1861,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/apps', hmGET,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/apps'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           JsonRes: TJSONObject;
@@ -601,7 +1872,7 @@ begin
           SandboxStr: string;
           TokenStr: string;
           JWT: TJWTToken;
-          QueryVal: string;
+          //QueryVal: string;
           UserRole: string;
           FoundUser: TUserEntry;
         begin
@@ -610,8 +1881,6 @@ begin
           AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
-          if (TokenStr = '') and ARequest.RequestInfo.QueryParameters.TryGetValue('token', QueryVal) then
-            TokenStr := QueryVal;
 
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
           begin
@@ -652,9 +1921,44 @@ begin
                     AppObj.AddPair('name',    Entry.Name);
                     AppObj.AddPair('sandbox', SandboxStr);
                     AppObj.AddPair('network', TJSONBool.Create(Entry.Network));
+                    AppObj.AddPair('available', Entry.IsExecutableAvailable);
                     JsonArr.AddElement(AppObj);
                   end;
                 end;
+              end;
+
+              var CanAccessFilesApp: Boolean;
+              var ClaimUp: string := JWT.GetClaim('upload');
+              var ClaimDown: string := JWT.GetClaim('download');
+              var UserEntryFiles: TUserEntry;
+              var UserFoundFiles: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, UserEntryFiles);
+              var UserCanUp: Boolean;
+              var UserCanDown: Boolean;
+
+              if ClaimUp <> '' then
+                UserCanUp := SameText(ClaimUp, 'true')
+              else if UserFoundFiles then
+                UserCanUp := UserEntryFiles.CanUpload
+              else
+                UserCanUp := True;
+
+              if ClaimDown <> '' then
+                UserCanDown := SameText(ClaimDown, 'true')
+              else if UserFoundFiles then
+                UserCanDown := UserEntryFiles.CanDownload
+              else
+                UserCanDown := True;
+
+              CanAccessFilesApp := UserCanUp or UserCanDown;
+              if CanAccessFilesApp and TGTermUserConfig.Instance.CanAccessApp(JWT.Subject, 'files') then
+              begin
+                AppObj := TJSONObject.Create;
+                AppObj.AddPair('id', 'files');
+                AppObj.AddPair('name', 'File Manager');
+                AppObj.AddPair('sandbox', 'standard');
+                AppObj.AddPair('network', TJSONBool.Create(False));
+                AppObj.AddPair('available', TJSONBool.Create(True));
+                JsonArr.AddElement(AppObj);
               end;
               JsonRes.AddPair('apps', JsonArr);
               AResponse.AddJSONContent(JsonRes.ToJSON);
@@ -667,7 +1971,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/terminal/session', hmOPTIONS,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/terminal/session'), hmOPTIONS,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
@@ -677,7 +1981,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/terminal/session', hmPOST,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/terminal/session'), hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           BodyStr: string;
@@ -721,6 +2025,13 @@ begin
               AppKey := LowerCase(Trim(JsonReq.GetValue<string>('app', '')));
               if AppKey = '' then
                 AppKey := TGTermAppConfig.Instance.GetDefaultAppId;
+              var AppCheckEntry: TAppEntry;
+              if not TGTermAppConfig.Instance.FindById(AppKey, AppCheckEntry) then
+              begin
+                AResponse.SetStatus(400);
+                AResponse.AddJSONContent('{"error":"Invalid app specified"}');
+                Exit;
+              end;
               Cols := JsonReq.GetValue<Integer>('cols', 120);
               Rows := JsonReq.GetValue<Integer>('rows', 40);
 
@@ -734,6 +2045,42 @@ begin
                   UserRole := 'user';
               end;
 
+              var UserActiveCount: Integer := 0;
+              var UserPendingCount: Integer := 0;
+              PendingSessionsLock.Enter;
+              try
+                for var PP in PendingSessions.Values do
+                  if SameText(PP.Username, JWT.Subject) then
+                    Inc(UserPendingCount);
+              finally
+                PendingSessionsLock.Leave;
+              end;
+
+              var Snaps := SessionManager.GetSessionSnapshots;
+              for var SIdx := 0 to High(Snaps) do
+                if SameText(Snaps[SIdx].Username, JWT.Subject) then
+                  Inc(UserActiveCount);
+
+              if not SameText(UserRole, 'admin') then
+              begin
+                for var SIdx := 0 to High(Snaps) do
+                begin
+                  if (UserActiveCount + UserPendingCount < 5) then Break;
+                  if SameText(Snaps[SIdx].Username, JWT.Subject) then
+                  begin
+                    if SessionManager.TerminateSessionById(Snaps[SIdx].SessionId) then
+                      Dec(UserActiveCount);
+                  end;
+                end;
+              end;
+
+              if (UserActiveCount + UserPendingCount >= 5) and not SameText(UserRole, 'admin') then
+              begin
+                AResponse.SetStatus(429);
+                AResponse.AddJSONContent('{"error":"Session limit exceeded"}');
+                Exit;
+              end;
+
               if not TGTermAppConfig.Instance.CanRoleAccessApp(UserRole, AppKey) or
                  not TGTermUserConfig.Instance.CanAccessApp(JWT.Subject, AppKey) then
               begin
@@ -741,10 +2088,14 @@ begin
                 AResponse.AddJSONContent('{"error":"Forbidden app access"}');
                 Exit;
               end;
+              if not AppCheckEntry.IsExecutableAvailable then
+              begin
+                AResponse.SetStatus(422);
+                AResponse.AddJSONContent('{"error":"Application is not available on this server","app":"' + AppKey + '"}');
+                Exit;
+              end;
 
-              var ReqClientIP := string(inet_ntoa(ARequest.RemoteAddr.sin_addr));
-              if (ReqClientIP = '') or (ReqClientIP = '0.0.0.0') then
-                ReqClientIP := '127.0.0.1';
+              var ReqClientIP := FormatSockAddrIP(ARequest.RemoteAddr);
 
               SessionGuid := TGUID.NewGuid.ToString.Trim(['{', '}']);
 
@@ -758,6 +2109,20 @@ begin
 
               PendingSessionsLock.Enter;
               try
+                var NowTickPending := GetTickCount64;
+                var ExpKeys := TList<string>.Create;
+                try
+                  for var PK in PendingSessions.Keys do
+                  begin
+                    var PP: TPendingSession;
+                    if PendingSessions.TryGetValue(PK, PP) and ((NowTickPending - PP.CreatedTick) > 60000) then
+                      ExpKeys.Add(PK);
+                  end;
+                  for var PK in ExpKeys do
+                    PendingSessions.Remove(PK);
+                finally
+                  ExpKeys.Free;
+                end;
                 PendingSessions.AddOrSetValue(SessionGuid, Pending);
               finally
                 PendingSessionsLock.Leave;
@@ -782,17 +2147,17 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/sandbox/file', hmOPTIONS,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/file'), hmOPTIONS,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
           AResponse.AddHeader('Access-Control-Allow-Origin', '*');
           AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+          AResponse.AddHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
         end
       );
 
-      Server.RegisterEndpointProc('/api/sandbox/file', hmPOST,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/file'), hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           TokenStr: string;
@@ -806,9 +2171,6 @@ begin
           AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
-          if (TokenStr = '') and 
-		     ARequest.RequestInfo.QueryParameters.TryGetValue('token', QueryVal) then
-            TokenStr := QueryVal;
 
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
           begin
@@ -820,8 +2182,41 @@ begin
           try
             FileName := '';
             if ARequest.RequestInfo.QueryParameters.TryGetValue('name', QueryVal) then
-              FileName := QueryVal;
+              FileName := Trim(QueryVal);
+            if FileName = '' then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Missing file name"}');
+              Exit;
+            end;
+            if (Pos('..', FileName) > 0) or (Pos('/', FileName) > 0) or (Pos('\', FileName) > 0) or
+               (Pos(':', FileName) > 0) or (Pos(#0, FileName) > 0) or HasForbiddenFileNameChars(FileName) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid file name"}');
+              Exit;
+            end;
             FileName := TPath.GetFileName(FileName);
+            if HasForbiddenFileNameChars(FileName) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid file name"}');
+              Exit;
+            end;
+            if IsForbiddenUploadExtension(FileName) then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Executable or script upload forbidden"}');
+              Exit;
+            end;
+            var BaseNameOnly := UpperCase(ChangeFileExt(FileName, ''));
+            if (BaseNameOnly = 'CON') or (BaseNameOnly = 'PRN') or (BaseNameOnly = 'AUX') or (BaseNameOnly = 'NUL') or
+               ((Length(BaseNameOnly) = 4) and (BaseNameOnly.StartsWith('COM') or BaseNameOnly.StartsWith('LPT')) and CharInSet(BaseNameOnly[4], ['1'..'9'])) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Reserved device name"}');
+              Exit;
+            end;
             if FileName = '' then
             begin
               AResponse.SetStatus(400);
@@ -829,23 +2224,230 @@ begin
               Exit;
             end;
 
+            var UserRole := JWT.GetClaim('role');
+            var CheckUser: TUserEntry;
+            var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
+            if (UserRole = '') and HasUserEntry then
+              UserRole := CheckUser.Role;
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+
+            var CanUploadVal: Boolean := True;
+            var ClaimUpload: string := JWT.GetClaim('upload');
+            if ClaimUpload <> '' then
+              CanUploadVal := SameText(ClaimUpload, 'true')
+            else if HasUserEntry then
+              CanUploadVal := CheckUser.CanUpload;
+
+            if not IsAdmin and not CanUploadVal then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Upload permission denied"}');
+              Exit;
+            end;
+
             UserSandbox := JWT.GetClaim('sandbox');
+            if (UserSandbox = '') and HasUserEntry and (CheckUser.Sandbox <> '') then
+              UserSandbox := CheckUser.Sandbox;
             if UserSandbox = '' then
               UserSandbox := 'sandbox';
 
-            TargetDir := TPath.Combine(ExtractFilePath(ParamStr(0)), UserSandbox);
+            var ServerRoot: string := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+            var UserHome: string := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
+            if not TDirectory.Exists(UserHome) then
+              TDirectory.CreateDirectory(UserHome);
+
+            var Scope: string := 'home';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('scope', QueryVal) then
+              Scope := LowerCase(Trim(QueryVal));
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'server';
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'server';
+
+            if ((Scope = 'server') or (Scope = 'drives')) and not IsAdmin then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Forbidden: Server or drives scope requires admin role"}');
+              Exit;
+            end;
+
+            var BaseDir: string;
+            if (Scope = 'server') and IsAdmin then
+              BaseDir := ServerRoot
+            else
+              BaseDir := UserHome;
+
+            var SubPath: string := '';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('path', QueryVal) then
+              SubPath := Trim(QueryVal);
+            if (Pos(#0, SubPath) > 0) or ((not IsAdmin) and (Pos(':', SubPath) > 0)) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid path"}');
+              Exit;
+            end;
+            SubPath := SubPath.Replace('/', '\');
+            while SubPath.StartsWith('\') do
+              SubPath := Copy(SubPath, 2, Length(SubPath) - 1);
+
+            if IsAdmin and (TPath.IsPathRooted(SubPath) or ((Length(SubPath) >= 2) and (SubPath[2] = ':'))) then
+              TargetDir := TPath.GetFullPath(SubPath)
+            else if SubPath <> '' then
+              TargetDir := TPath.GetFullPath(TPath.Combine(BaseDir, SubPath))
+            else
+              TargetDir := BaseDir;
+
+            if not IsAdmin then
+            begin
+              if not IsPathInSandboxCanonical(TargetDir, UserHome) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Forbidden: Path traversal violation"}');
+                Exit;
+              end;
+            end;
+
             if not TDirectory.Exists(TargetDir) then
               TDirectory.CreateDirectory(TargetDir);
 
-            TargetPath := TPath.Combine(TargetDir, FileName);
+            TargetPath := TPath.GetFullPath(TPath.Combine(TargetDir, FileName));
+            if not IsAdmin then
+            begin
+              if not IsPathInSandboxCanonical(TargetPath, UserHome) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Forbidden: Path traversal or symlink violation"}');
+                Exit;
+              end;
+            end;
+
+            var IncomingSize: Int64;
+            if Assigned(ARequest.BodyParser) and Assigned(ARequest.BodyParser.MainPart) then
+              IncomingSize := ARequest.BodyParser.CurrentSize
+            else
+              IncomingSize := Length(ARequest.BodyAsBytes);
+
+            if IncomingSize > 1073741824 then
+            begin
+              AResponse.SetStatus(413);
+              AResponse.AddJSONContent('{"error":"File too large (max 1 GB)"}');
+              Exit;
+            end;
+
+            if not IsAdmin and HasUserEntry then
+            begin
+              var QuotaBytes: Int64 := CheckUser.GetStorageQuotaBytes;
+              if QuotaBytes > 0 then
+              begin
+                var CurrentUsed: Int64 := GetDirectoryTotalSize(UserHome);
+                if CurrentUsed + IncomingSize > QuotaBytes then
+                begin
+                  AResponse.SetStatus(507);
+                  AResponse.AddJSONContent(Format('{"error":"Storage quota exceeded: max %d MB allowed"}', [CheckUser.Grants.StorageQuotaMB]));
+                  Exit;
+                end;
+              end;
+            end;
+
             FileBytes := ARequest.BodyAsBytes;
-            TFile.WriteAllBytes(TargetPath, FileBytes);
+            if Length(FileBytes) > 0 then
+            begin
+              if IsExecutableBinaryHeader(@FileBytes[0], Length(FileBytes)) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Malicious payload detected: executable PE binary header (MZ) forbidden"}');
+                Exit;
+              end;
+              var ThreatMsg: string := '';
+              if not ScanBufferForThreats(@FileBytes[0], Length(FileBytes), FileName, ThreatMsg) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent(Format('{"error":"%s"}', [ThreatMsg]));
+                Exit;
+              end;
+            end;
+
+            var SavedOk: Boolean := False;
+            var UploadedSize: Int64 := 0;
+
+            if Assigned(ARequest.BodyParser) and Assigned(ARequest.BodyParser.MainPart) then
+            begin
+              UploadedSize := ARequest.BodyParser.CurrentSize;
+              SavedOk := ARequest.BodyParser.MainPart.SaveToFile(TargetPath);
+            end;
+
+            if not SavedOk then
+            begin
+              UploadedSize := Length(FileBytes);
+              try
+                TFile.WriteAllBytes(TargetPath, FileBytes);
+                SavedOk := True;
+              except
+                on E: Exception do
+                begin
+                  AResponse.SetStatus(500);
+                  AResponse.AddJSONContent('{"error":"Failed to write file"}');
+                  Exit;
+                end;
+              end;
+            end;
+
+            if not SavedOk then
+            begin
+              AResponse.SetStatus(500);
+              AResponse.AddJSONContent('{"error":"Failed to save file"}');
+              Exit;
+            end;
+
+            if FileExists(TargetPath) then
+            begin
+              var FStream: TFileStream := TFileStream.Create(TargetPath, fmOpenRead or fmShareDenyNone);
+              var ThreatFound: Boolean := False;
+              var ThreatMsg: string := '';
+              try
+                var HeaderBuf: array[0..511] of Byte;
+                var ReadBytes: Integer := FStream.Read(HeaderBuf, Length(HeaderBuf));
+                if (ReadBytes >= 2) and IsExecutableBinaryHeader(@HeaderBuf[0], ReadBytes) then
+                begin
+                  ThreatFound := True;
+                  ThreatMsg := 'Malicious payload detected: executable PE binary header (MZ) forbidden';
+                end
+                else if not ScanBufferForThreats(@HeaderBuf[0], ReadBytes, FileName, ThreatMsg) then
+                begin
+                  ThreatFound := True;
+                end;
+              finally
+                FStream.Free;
+              end;
+
+              if ThreatFound then
+              begin
+                TFile.Delete(TargetPath);
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent(Format('{"error":"%s"}', [ThreatMsg]));
+                Exit;
+              end;
+            end;
+
+            if FileExists(TargetPath) then
+            begin
+              var FInfo: TSearchRec;
+              if FindFirst(TargetPath, faAnyFile, FInfo) = 0 then
+              begin
+                UploadedSize := FInfo.Size;
+                System.SysUtils.FindClose(FInfo);
+              end;
+            end;
 
             JsonRes := TJSONObject.Create;
             try
               JsonRes.AddPair('status', 'ok');
               JsonRes.AddPair('filename', FileName);
-              JsonRes.AddPair('size', TJSONNumber.Create(Length(FileBytes)));
+              JsonRes.AddPair('size', TJSONNumber.Create(UploadedSize));
               AResponse.SetStatus(200);
               AResponse.AddJSONContent(JsonRes.ToJSON);
             finally
@@ -857,7 +2459,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/sandbox/file', hmGET,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/file'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           TokenStr: string;
@@ -868,8 +2470,6 @@ begin
           AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
-          if (TokenStr = '') and ARequest.RequestInfo.QueryParameters.TryGetValue('token', QueryVal) then
-            TokenStr := QueryVal;
 
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
           begin
@@ -881,8 +2481,35 @@ begin
           try
             FileName := '';
             if ARequest.RequestInfo.QueryParameters.TryGetValue('name', QueryVal) then
-              FileName := QueryVal;
+              FileName := Trim(QueryVal);
+            if FileName = '' then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Missing file name"}');
+              Exit;
+            end;
+            if (Pos('..', FileName) > 0) or (Pos('/', FileName) > 0) or (Pos('\', FileName) > 0) or
+               (Pos(':', FileName) > 0) or (Pos(#0, FileName) > 0) or HasForbiddenFileNameChars(FileName) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid file name"}');
+              Exit;
+            end;
             FileName := TPath.GetFileName(FileName);
+            if HasForbiddenFileNameChars(FileName) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid file name"}');
+              Exit;
+            end;
+            var BaseNameOnly := UpperCase(ChangeFileExt(FileName, ''));
+            if (BaseNameOnly = 'CON') or (BaseNameOnly = 'PRN') or (BaseNameOnly = 'AUX') or (BaseNameOnly = 'NUL') or
+               ((Length(BaseNameOnly) = 4) and (BaseNameOnly.StartsWith('COM') or BaseNameOnly.StartsWith('LPT')) and CharInSet(BaseNameOnly[4], ['1'..'9'])) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Reserved device name"}');
+              Exit;
+            end;
             if FileName = '' then
             begin
               AResponse.SetStatus(400);
@@ -890,12 +2517,102 @@ begin
               Exit;
             end;
 
+            var UserRole := JWT.GetClaim('role');
+            var CheckUser: TUserEntry;
+            var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
+            if (UserRole = '') and HasUserEntry then
+              UserRole := CheckUser.Role;
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+
+            var CanDownloadVal: Boolean := True;
+            var ClaimDownload: string := JWT.GetClaim('download');
+            if ClaimDownload <> '' then
+              CanDownloadVal := SameText(ClaimDownload, 'true')
+            else if HasUserEntry then
+              CanDownloadVal := CheckUser.CanDownload;
+
+            if not IsAdmin and not CanDownloadVal then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Download permission denied"}');
+              Exit;
+            end;
+
             UserSandbox := JWT.GetClaim('sandbox');
+            if (UserSandbox = '') and HasUserEntry and (CheckUser.Sandbox <> '') then
+              UserSandbox := CheckUser.Sandbox;
             if UserSandbox = '' then
               UserSandbox := 'sandbox';
 
-            TargetDir := TPath.Combine(ExtractFilePath(ParamStr(0)), UserSandbox);
-            TargetPath := TPath.Combine(TargetDir, FileName);
+            var ServerRoot: string := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+            var UserHome: string := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
+
+            var Scope: string := 'home';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('scope', QueryVal) then
+              Scope := LowerCase(Trim(QueryVal));
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'server';
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'server';
+
+            if (Scope = 'server') and not IsAdmin then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Forbidden: Server scope requires admin role"}');
+              Exit;
+            end;
+
+            var BaseDir: string;
+            if (Scope = 'server') and IsAdmin then
+              BaseDir := ServerRoot
+            else
+              BaseDir := UserHome;
+
+            var SubPath: string := '';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('path', QueryVal) then
+              SubPath := Trim(QueryVal);
+            if (Pos(#0, SubPath) > 0) or ((not IsAdmin) and (Pos(':', SubPath) > 0)) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid path"}');
+              Exit;
+            end;
+            SubPath := SubPath.Replace('/', '\');
+            while SubPath.StartsWith('\') do
+              SubPath := Copy(SubPath, 2, Length(SubPath) - 1);
+
+            if IsAdmin and (TPath.IsPathRooted(SubPath) or ((Length(SubPath) >= 2) and (SubPath[2] = ':'))) then
+              TargetDir := TPath.GetFullPath(SubPath)
+            else if SubPath <> '' then
+              TargetDir := TPath.GetFullPath(TPath.Combine(BaseDir, SubPath))
+            else
+              TargetDir := BaseDir;
+
+            if not IsAdmin then
+            begin
+              if not IsPathInSandboxCanonical(TargetDir, UserHome) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Forbidden: Path traversal violation"}');
+                Exit;
+              end;
+            end;
+
+            TargetPath := TPath.GetFullPath(TPath.Combine(TargetDir, FileName));
+
+            if not IsAdmin then
+            begin
+              if not IsPathInSandboxCanonical(TargetPath, UserHome) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Forbidden: Path traversal or symlink violation"}');
+                Exit;
+              end;
+            end;
 
             if not FileExists(TargetPath) then
             begin
@@ -904,8 +2621,12 @@ begin
               Exit;
             end;
 
+            var CleanHeaderName: string;
+            CleanHeaderName := FileName.Replace(#13, '').Replace(#10, '').Replace('"', '');
             AResponse.SetStatus(200);
-            AResponse.AddHeader('Content-Disposition', 'attachment; filename="' + FileName + '"');
+            AResponse.AddHeader('Content-Disposition', 'attachment; filename="' + CleanHeaderName + '"');
+            AResponse.AddHeader('X-Content-Type-Options', 'nosniff');
+            AResponse.AddHeader('Content-Security-Policy', 'sandbox');
             AResponse.AddFileContent('application/octet-stream', TargetPath);
           finally
             JWT.Free;
@@ -913,7 +2634,190 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/admin/sessions', hmOPTIONS,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/file'), hmDELETE,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          TokenStr: string;
+          JWT: TJWTToken;
+          SubPath, FileName, UserSandbox, TargetDir, TargetPath: string;
+          QueryVal: string;
+        begin
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+          TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
+          if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
+          begin
+            AResponse.SetStatus(401);
+            AResponse.AddJSONContent('{"error":"Unauthorized"}');
+            Exit;
+          end;
+
+          try
+            var UserRole := JWT.GetClaim('role');
+            var CheckUser: TUserEntry;
+            var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
+            if (UserRole = '') and HasUserEntry then
+              UserRole := CheckUser.Role;
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+
+            var CanUploadVal: Boolean := True;
+            var ClaimUpload: string := JWT.GetClaim('upload');
+            if ClaimUpload <> '' then
+              CanUploadVal := SameText(ClaimUpload, 'true')
+            else if HasUserEntry then
+              CanUploadVal := CheckUser.CanUpload;
+
+            if not IsAdmin and not CanUploadVal then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Delete permission denied: write access required"}');
+              Exit;
+            end;
+
+            SubPath := '';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('path', QueryVal) then
+              SubPath := Trim(QueryVal);
+
+            FileName := '';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('name', QueryVal) then
+              FileName := Trim(QueryVal);
+            if FileName = '' then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Missing file name"}');
+              Exit;
+            end;
+
+            if (Pos(#0, SubPath) > 0) or (Pos(#0, FileName) > 0) or
+               ((not IsAdmin) and ((Pos(':', SubPath) > 0) or (Pos(':', FileName) > 0))) or
+               (Pos('..', FileName) > 0) or (Pos('/', FileName) > 0) or (Pos('\', FileName) > 0) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid path or filename"}');
+              Exit;
+            end;
+
+            SubPath := SubPath.Replace('/', '\');
+            while SubPath.StartsWith('\') do
+              SubPath := Copy(SubPath, 2, Length(SubPath) - 1);
+
+            UserSandbox := JWT.GetClaim('sandbox');
+            if (UserSandbox = '') and HasUserEntry and (CheckUser.Sandbox <> '') then
+              UserSandbox := CheckUser.Sandbox;
+            if UserSandbox = '' then
+              UserSandbox := 'sandbox';
+
+            var ServerRoot: string := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+            var UserHome: string := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
+
+            var Scope: string := 'home';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('scope', QueryVal) then
+              Scope := LowerCase(Trim(QueryVal));
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'server';
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'server';
+
+            if (Scope = 'server') and not IsAdmin then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Forbidden: Server scope requires admin role"}');
+              Exit;
+            end;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            var BaseDir: string;
+            if (Scope = 'server') and IsAdmin then
+              BaseDir := ServerRoot
+            else
+              BaseDir := UserHome;
+
+            if IsAdmin and (TPath.IsPathRooted(SubPath) or ((Length(SubPath) >= 2) and (SubPath[2] = ':'))) then
+              TargetDir := TPath.GetFullPath(SubPath)
+            else if SubPath <> '' then
+              TargetDir := TPath.GetFullPath(TPath.Combine(BaseDir, SubPath))
+            else
+              TargetDir := BaseDir;
+
+            if FileName <> '' then
+              TargetPath := TPath.GetFullPath(TPath.Combine(TargetDir, FileName))
+            else
+              TargetPath := TargetDir;
+
+            if not IsAdmin then
+            begin
+              if not IsPathInSandboxCanonical(TargetPath, UserHome) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Forbidden: Path traversal violation"}');
+                Exit;
+              end;
+            end;
+
+            if (TargetPath = UserHome) or (TargetPath = ServerRoot) or (TargetPath = ExtractFilePath(ParamStr(0))) then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Cannot delete sandbox root"}');
+              Exit;
+            end;
+
+            if FileExists(TargetPath) then
+            begin
+              TFile.Delete(TargetPath);
+              AResponse.SetStatus(200);
+              AResponse.AddJSONContent('{"status":"ok","deleted":"file"}');
+            end
+            else if TDirectory.Exists(TargetPath) then
+            begin
+              TDirectory.Delete(TargetPath, True);
+              AResponse.SetStatus(200);
+              AResponse.AddJSONContent('{"status":"ok","deleted":"directory"}');
+            end
+            else
+            begin
+              AResponse.SetStatus(404);
+              AResponse.AddJSONContent('{"error":"Item not found"}');
+            end;
+          finally
+            JWT.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/files'), hmOPTIONS,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
@@ -923,12 +2827,538 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/admin/sessions', hmGET,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/files'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           TokenStr: string;
           JWT: TJWTToken;
+          SubPath, UserSandbox, TargetDir{, SandboxRoot}: string;
           QueryVal: string;
+          JsonRes: TJSONObject;
+          JsonArr: TJSONArray;
+          ItemObj: TJSONObject;
+          SubDirs, Files: TArray<string>;
+          I: Integer;
+          ItemName: string;
+          ItemSize: Int64;
+          ItemTime: string;
+        begin
+          AResponse.AddHeader('Cache-Control', 'no-cache');
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+          TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
+          if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
+          begin
+            AResponse.SetStatus(401);
+            AResponse.AddJSONContent('{"error":"Unauthorized"}');
+            Exit;
+          end;
+
+          try
+            var UserRole := JWT.GetClaim('role');
+            var CheckUser: TUserEntry;
+            var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
+            if (UserRole = '') and HasUserEntry then
+              UserRole := CheckUser.Role;
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+
+            var CanAccessFiles: Boolean;
+            var ClaimUp: string := JWT.GetClaim('upload');
+            var ClaimDown: string := JWT.GetClaim('download');
+            var UserCanUp: Boolean;
+            var UserCanDown: Boolean;
+
+            if ClaimUp <> '' then
+              UserCanUp := SameText(ClaimUp, 'true')
+            else if HasUserEntry then
+              UserCanUp := CheckUser.CanUpload
+            else
+              UserCanUp := True;
+
+            if ClaimDown <> '' then
+              UserCanDown := SameText(ClaimDown, 'true')
+            else if HasUserEntry then
+              UserCanDown := CheckUser.CanDownload
+            else
+              UserCanDown := True;
+
+            CanAccessFiles := IsAdmin or UserCanUp or UserCanDown;
+            if not CanAccessFiles then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"File access denied: no upload or download permissions"}');
+              Exit;
+            end;
+
+            SubPath := '';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('path', QueryVal) then
+              SubPath := Trim(QueryVal);
+
+            if (Pos(#0, SubPath) > 0) or ((not IsAdmin) and (Pos(':', SubPath) > 0)) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid path"}');
+              Exit;
+            end;
+
+            SubPath := SubPath.Replace('/', '\');
+            while SubPath.StartsWith('\') do
+              SubPath := Copy(SubPath, 2, Length(SubPath) - 1);
+
+            UserSandbox := JWT.GetClaim('sandbox');
+            if (UserSandbox = '') and HasUserEntry and (CheckUser.Sandbox <> '') then
+              UserSandbox := CheckUser.Sandbox;
+            if UserSandbox = '' then
+              UserSandbox := 'sandbox';
+
+            var ServerRoot: string := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+            var UserHome: string := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
+            if not TDirectory.Exists(UserHome) then
+              TDirectory.CreateDirectory(UserHome);
+
+            var Scope: string := 'home';
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('scope', QueryVal) then
+              Scope := LowerCase(Trim(QueryVal));
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.QueryString)) > 0) then
+              Scope := 'server';
+            if (Scope = 'home') and (Pos('scope=drives', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'drives'
+            else if (Scope = 'home') and (Pos('scope=server', LowerCase(ARequest.RequestInfo.RawUri)) > 0) then
+              Scope := 'server';
+
+            if ((Scope = 'server') or (Scope = 'drives')) and not IsAdmin then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Forbidden: Server or drives scope requires admin role"}');
+              Exit;
+            end;
+
+            Logger.Info(Format('[DEBUG_FILES] IsAdmin=%s Scope=%s SubPath=%s RawUri=%s UserRole=%s Subject=%s', [BoolToStr(IsAdmin, True), Scope, SubPath, ARequest.RequestInfo.RawUri, UserRole, JWT.Subject]));
+            if IsAdmin and ((Scope = 'drives') or SameText(SubPath, 'drives')) then
+            begin
+              JsonRes := TJSONObject.Create;
+              try
+                JsonRes.AddPair('path', 'drives');
+                JsonRes.AddPair('fullPath', 'drives');
+                JsonRes.AddPair('parentPath', '');
+                JsonRes.AddPair('isDrivesRoot', TJSONBool.Create(True));
+                JsonArr := TJSONArray.Create;
+                var DriveList: TArray<string> := TDirectory.GetLogicalDrives;
+                for var DriveName in DriveList do
+                begin
+                  ItemObj := TJSONObject.Create;
+                  ItemObj.AddPair('name', DriveName);
+                  ItemObj.AddPair('isDir', TJSONBool.Create(True));
+                  ItemObj.AddPair('isDrive', TJSONBool.Create(True));
+                  ItemObj.AddPair('size', TJSONNumber.Create(0));
+                  ItemObj.AddPair('modified', '');
+                  JsonArr.AddElement(ItemObj);
+                end;
+                JsonRes.AddPair('items', JsonArr);
+                AResponse.SetStatus(200);
+                AResponse.AddJSONContent(JsonRes.ToJSON);
+                Exit;
+              finally
+                JsonRes.Free;
+              end;
+            end;
+
+            var BaseDir: string;
+            if (Scope = 'server') and IsAdmin then
+              BaseDir := ServerRoot
+            else
+              BaseDir := UserHome;
+
+            if IsAdmin and (TPath.IsPathRooted(SubPath) or ((Length(SubPath) >= 2) and (SubPath[2] = ':'))) then
+              TargetDir := TPath.GetFullPath(SubPath)
+            else if SubPath <> '' then
+              TargetDir := TPath.GetFullPath(TPath.Combine(BaseDir, SubPath))
+            else
+              TargetDir := BaseDir;
+
+            if not IsAdmin then
+            begin
+              if not IsPathInSandboxCanonical(TargetDir, UserHome) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Forbidden: Path traversal violation"}');
+                Exit;
+              end;
+            end;
+
+            if not TDirectory.Exists(TargetDir) then
+            begin
+              AResponse.SetStatus(404);
+              AResponse.AddJSONContent('{"error":"Directory not found"}');
+              Exit;
+            end;
+
+            var ParentPath: string := '';
+            if IsAdmin then
+            begin
+              ParentPath := TPath.GetDirectoryName(TargetDir);
+              if (ParentPath = '') or (Length(TargetDir) <= 3) then
+                ParentPath := 'drives';
+            end;
+
+            JsonRes := TJSONObject.Create;
+            try
+              JsonRes.AddPair('path', SubPath.Replace('\', '/'));
+              JsonRes.AddPair('fullPath', TargetDir);
+                                          if IsAdmin then
+                JsonRes.AddPair('parentPath', ParentPath);
+              JsonArr := TJSONArray.Create;
+
+              SubDirs := TDirectory.GetDirectories(TargetDir);
+              TArray.Sort<string>(SubDirs);
+              for I := 0 to High(SubDirs) do
+              begin
+                ItemName := TPath.GetFileName(SubDirs[I]);
+                try
+                  ItemTime := DateToISO8601(TDirectory.GetLastWriteTime(SubDirs[I]));
+                except
+                  ItemTime := '';
+                end;
+                ItemObj := TJSONObject.Create;
+                ItemObj.AddPair('name', ItemName);
+                ItemObj.AddPair('isDir', TJSONBool.Create(True));
+                ItemObj.AddPair('size', TJSONNumber.Create(0));
+                ItemObj.AddPair('modified', ItemTime);
+                JsonArr.AddElement(ItemObj);
+              end;
+
+              Files := TDirectory.GetFiles(TargetDir);
+              TArray.Sort<string>(Files);
+              for I := 0 to High(Files) do
+              begin
+                ItemName := TPath.GetFileName(Files[I]);
+                ItemSize := 0;
+                try
+                  ItemSize := TFile.GetSize(Files[I]);
+                  ItemTime := DateToISO8601(TFile.GetLastWriteTime(Files[I]));
+                except
+                  ItemTime := '';
+                end;
+                ItemObj := TJSONObject.Create;
+                ItemObj.AddPair('name', ItemName);
+                ItemObj.AddPair('isDir', TJSONBool.Create(False));
+                ItemObj.AddPair('size', TJSONNumber.Create(ItemSize));
+                ItemObj.AddPair('modified', ItemTime);
+                JsonArr.AddElement(ItemObj);
+              end;
+
+              JsonRes.AddPair('items', JsonArr);
+              AResponse.SetStatus(200);
+              AResponse.AddJSONContent(JsonRes.ToJSON);
+            finally
+              JsonRes.Free;
+            end;
+          finally
+            JWT.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/copy'), hmOPTIONS,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.SetStatus(204);
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/copy'), hmPOST,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          TokenStr: string;
+          JWT: TJWTToken;
+          FromPath, FromName, ToPath, ToName: string;
+          QueryVal: string;
+          UserSandbox, ServerRoot, UserHome: string;
+          SourceDir, SourceFile, DestDir, DestFile: string;
+          JsonBody: TJSONObject;
+          JsonRes: TJSONObject;
+        begin
+          AResponse.AddHeader('Cache-Control', 'no-cache');
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+          TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
+          if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
+          begin
+            AResponse.SetStatus(401);
+            AResponse.AddJSONContent('{"error":"Unauthorized"}');
+            Exit;
+          end;
+
+          try
+            var UserRole := JWT.GetClaim('role');
+            var CheckUser: TUserEntry;
+            var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
+            if (UserRole = '') and HasUserEntry then
+              UserRole := CheckUser.Role;
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+
+            var CanDownloadVal: Boolean := True;
+            var ClaimDownload: string := JWT.GetClaim('download');
+            if ClaimDownload <> '' then
+              CanDownloadVal := SameText(ClaimDownload, 'true')
+            else if HasUserEntry then
+              CanDownloadVal := CheckUser.CanDownload;
+
+            var CanUploadVal: Boolean := True;
+            var ClaimUpload: string := JWT.GetClaim('upload');
+            if ClaimUpload <> '' then
+              CanUploadVal := SameText(ClaimUpload, 'true')
+            else if HasUserEntry then
+              CanUploadVal := CheckUser.CanUpload;
+
+            if not IsAdmin and (not CanDownloadVal or not CanUploadVal) then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Copy permission denied: read and write access required"}');
+              Exit;
+            end;
+
+            FromPath := '';
+            FromName := '';
+            ToPath := '';
+            ToName := '';
+            var FromScope: string := 'home';
+            var ToScope: string := 'home';
+
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('fromScope', QueryVal) then
+              FromScope := LowerCase(Trim(QueryVal));
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('toScope', QueryVal) then
+              ToScope := LowerCase(Trim(QueryVal));
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('fromPath', QueryVal) then
+              FromPath := Trim(QueryVal);
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('fromName', QueryVal) then
+              FromName := Trim(QueryVal);
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('toPath', QueryVal) then
+              ToPath := Trim(QueryVal);
+            if ARequest.RequestInfo.QueryParameters.TryGetValue('toName', QueryVal) then
+              ToName := Trim(QueryVal);
+
+            if (FromName = '') and (ARequest.BodyAsString <> '') then
+            begin
+              try
+                JsonBody := TJSONObject.ParseJSONValue(ARequest.BodyAsString) as TJSONObject;
+                if JsonBody <> nil then
+                begin
+                  try
+                    if JsonBody.TryGetValue<string>('fromScope', QueryVal) then FromScope := LowerCase(Trim(QueryVal));
+                    if JsonBody.TryGetValue<string>('toScope', QueryVal) then ToScope := LowerCase(Trim(QueryVal));
+                    if FromPath = '' then FromPath := JsonBody.GetValue<string>('fromPath', '');
+                    if FromName = '' then FromName := JsonBody.GetValue<string>('fromName', '');
+                    if ToPath = '' then ToPath := JsonBody.GetValue<string>('toPath', '');
+                    if ToName = '' then ToName := JsonBody.GetValue<string>('toName', '');
+                  finally
+                    JsonBody.Free;
+                  end;
+                end;
+              except
+              end;
+            end;
+
+            if ToName = '' then
+              ToName := FromName;
+
+            if (FromName = '') or (ToName = '') then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Missing fromName or toName"}');
+              Exit;
+            end;
+
+            if (Pos('..', FromName) > 0) or (Pos('/', FromName) > 0) or (Pos('\', FromName) > 0) or
+               (Pos(':', FromName) > 0) or (Pos(#0, FromName) > 0) or HasForbiddenFileNameChars(FromName) or
+               (Pos('..', ToName) > 0) or (Pos('/', ToName) > 0) or (Pos('\', ToName) > 0) or
+               (Pos(':', ToName) > 0) or (Pos(#0, ToName) > 0) or HasForbiddenFileNameChars(ToName) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid file name"}');
+              Exit;
+            end;
+
+            if IsForbiddenUploadExtension(ToName) then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Executable or script copy target forbidden"}');
+              Exit;
+            end;
+
+            var BaseToName := UpperCase(ChangeFileExt(ToName, ''));
+            if (BaseToName = 'CON') or (BaseToName = 'PRN') or (BaseToName = 'AUX') or (BaseToName = 'NUL') or
+               ((Length(BaseToName) = 4) and (BaseToName.StartsWith('COM') or BaseToName.StartsWith('LPT')) and CharInSet(BaseToName[4], ['1'..'9'])) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Reserved device name"}');
+              Exit;
+            end;
+
+            if (Pos(#0, FromPath) > 0) or (Pos(#0, ToPath) > 0) or
+               ((not IsAdmin) and ((Pos(':', FromPath) > 0) or (Pos(':', ToPath) > 0))) then
+            begin
+              AResponse.SetStatus(400);
+              AResponse.AddJSONContent('{"error":"Invalid path"}');
+              Exit;
+            end;
+
+            FromPath := FromPath.Replace('/', '\');
+            while FromPath.StartsWith('\') do
+              FromPath := Copy(FromPath, 2, Length(FromPath) - 1);
+
+            ToPath := ToPath.Replace('/', '\');
+            while ToPath.StartsWith('\') do
+              ToPath := Copy(ToPath, 2, Length(ToPath) - 1);
+
+            UserSandbox := JWT.GetClaim('sandbox');
+            if (UserSandbox = '') and HasUserEntry and (CheckUser.Sandbox <> '') then
+              UserSandbox := CheckUser.Sandbox;
+            if UserSandbox = '' then
+              UserSandbox := 'sandbox';
+
+            ServerRoot := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+            UserHome := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
+
+            if not IsAdmin and ((FromScope = 'server') or (ToScope = 'server')) then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Forbidden: Server scope requires admin role"}');
+              Exit;
+            end;
+
+            var BaseDirFrom: string;
+            if (FromScope = 'server') and IsAdmin then
+              BaseDirFrom := ServerRoot
+            else
+              BaseDirFrom := UserHome;
+
+            var BaseDirTo: string;
+            if (ToScope = 'server') and IsAdmin then
+              BaseDirTo := ServerRoot
+            else
+              BaseDirTo := UserHome;
+
+            if FromPath <> '' then
+              SourceDir := TPath.GetFullPath(TPath.Combine(BaseDirFrom, FromPath))
+            else
+              SourceDir := BaseDirFrom;
+            SourceFile := TPath.GetFullPath(TPath.Combine(SourceDir, FromName));
+
+            if ToPath <> '' then
+              DestDir := TPath.GetFullPath(TPath.Combine(BaseDirTo, ToPath))
+            else
+              DestDir := BaseDirTo;
+            DestFile := TPath.GetFullPath(TPath.Combine(DestDir, ToName));
+
+            if not IsAdmin then
+            begin
+              if not IsPathInSandboxCanonical(SourceFile, UserHome) or
+                 not IsPathInSandboxCanonical(DestFile, UserHome) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Forbidden: Cross-user or sandbox escape copy violation"}');
+                Exit;
+              end;
+            end;
+
+            if not FileExists(SourceFile) then
+            begin
+              AResponse.SetStatus(404);
+              AResponse.AddJSONContent('{"error":"Source file not found"}');
+              Exit;
+            end;
+
+            if not IsAdmin and HasUserEntry then
+            begin
+              var QuotaBytes: Int64 := CheckUser.GetStorageQuotaBytes;
+              if QuotaBytes > 0 then
+              begin
+                var SourceSize: Int64 := TFile.GetSize(SourceFile);
+                var CurrentUsed: Int64 := GetDirectoryTotalSize(UserHome);
+                if CurrentUsed + SourceSize > QuotaBytes then
+                begin
+                  AResponse.SetStatus(507);
+                  AResponse.AddJSONContent(Format('{"error":"Storage quota exceeded: max %d MB allowed"}', [CheckUser.Grants.StorageQuotaMB]));
+                  Exit;
+                end;
+              end;
+            end;
+
+            var CopyStream: TFileStream := TFileStream.Create(SourceFile, fmOpenRead or fmShareDenyNone);
+            try
+              var HeaderBuf: array[0..511] of Byte;
+              var ReadBytes: Integer := CopyStream.Read(HeaderBuf, Length(HeaderBuf));
+              if (ReadBytes >= 2) and IsExecutableBinaryHeader(@HeaderBuf[0], ReadBytes) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Malicious payload detected: executable PE binary header (MZ) forbidden"}');
+                Exit;
+              end;
+              var ThreatMsg: string := '';
+              if not ScanBufferForThreats(@HeaderBuf[0], ReadBytes, ToName, ThreatMsg) then
+              begin
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent(Format('{"error":"%s"}', [ThreatMsg]));
+                Exit;
+              end;
+            finally
+              CopyStream.Free;
+            end;
+
+            if not TDirectory.Exists(DestDir) then
+              TDirectory.CreateDirectory(DestDir);
+
+            try
+              TFile.Copy(SourceFile, DestFile, True);
+            except
+              on E: Exception do
+              begin
+                AResponse.SetStatus(500);
+                AResponse.AddJSONContent('{"error":"Failed to copy file"}');
+                Exit;
+              end;
+            end;
+
+            JsonRes := TJSONObject.Create;
+            try
+              JsonRes.AddPair('status', 'ok');
+              JsonRes.AddPair('from', FromName);
+              JsonRes.AddPair('to', ToName);
+              AResponse.SetStatus(200);
+              AResponse.AddJSONContent(JsonRes.ToJSON);
+            finally
+              JsonRes.Free;
+            end;
+          finally
+            JWT.Free;
+          end;
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/admin/sessions'), hmOPTIONS,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.SetStatus(204);
+          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          AResponse.AddHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/admin/sessions'), hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          TokenStr: string;
+          JWT: TJWTToken;
+          //QueryVal: string;
           Snapshots: TArray<TGTermSessionInfo>;
           JsonRes: TJSONObject;
           JsonArr: TJSONArray;
@@ -940,8 +3370,6 @@ begin
           AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
-          if (TokenStr = '') and ARequest.RequestInfo.QueryParameters.TryGetValue('token', QueryVal) then
-            TokenStr := QueryVal;
 
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
           begin
@@ -972,6 +3400,7 @@ begin
               begin
                 SessObj := TJSONObject.Create;
                 SessObj.AddPair('sessionId', UIntToStr(Snapshots[I].SessionId));
+                SessObj.AddPair('username', Snapshots[I].Username);
                 SessObj.AddPair('app', Snapshots[I].AppKey);
                 SessObj.AddPair('profile', Snapshots[I].ProfileName);
                 SessObj.AddPair('pid', TJSONNumber.Create(Snapshots[I].ProcessId));
@@ -994,7 +3423,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/admin/sessions/kill', hmOPTIONS,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/admin/sessions/kill'), hmOPTIONS,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
@@ -1004,7 +3433,7 @@ begin
         end
       );
 
-      Server.RegisterEndpointProc('/api/admin/sessions/kill', hmPOST,
+      Server.RegisterEndpointProc(BuildRoutePath('/api/admin/sessions/kill'), hmPOST,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           TokenStr, BodyStr, SessIdStr: string;
@@ -1054,16 +3483,31 @@ begin
                 end;
               end;
 
-              SessIdStr := JsonReq.GetValue<string>('sessionId', '');
-              SessionId := StrToUInt64Def(SessIdStr, 0);
-              if SessionId = 0 then
+              SessIdStr := Trim(JsonReq.GetValue<string>('sessionId', ''));
+              if SessIdStr = '' then
               begin
                 AResponse.SetStatus(400);
                 AResponse.AddJSONContent('{"error":"Invalid sessionId"}');
                 Exit;
               end;
 
-              Success := SessionManager.TerminateSessionById(SessionId);
+              SessionId := StrToUInt64Def(SessIdStr, 0);
+              Success := False;
+              if SessionId <> 0 then
+                Success := SessionManager.TerminateSessionById(SessionId);
+
+              if not Success then
+              begin
+                PendingSessionsLock.Enter;
+                try
+                  Success := PendingSessions.ContainsKey(SessIdStr);
+                  if Success then
+                    PendingSessions.Remove(SessIdStr);
+                finally
+                  PendingSessionsLock.Leave;
+                end;
+              end;
+
               if Success then
               begin
                 AResponse.SetStatus(200);
@@ -1083,7 +3527,7 @@ begin
         end
       );
 
-      Server.RegisterWebTransportRoute('/wt/terminal',
+      Server.RegisterWebTransportRoute(BuildRoutePath('/wt/terminal'),
         procedure(Session: PWTSessionContext)
         var
           Profile: TGTermAppProfile;
@@ -1098,7 +3542,10 @@ begin
           HasPending: Boolean;
           Pending: TPendingSession;
         begin
-          Logger.Info(Format('[WT] Client connected (SessionId: %d, Path: %s)', [Session^.SessionId, Session^.Path]));
+          var CleanLogPath := Session^.Path;
+          var QPos := Pos('?', CleanLogPath);
+          if QPos > 0 then CleanLogPath := Copy(CleanLogPath, 1, QPos - 1);
+          Logger.Info(Format('[WT] Client connected (SessionId: %d, Path: %s)', [Session^.SessionId, CleanLogPath]));
           LowerPath := LowerCase(Session^.Path);
 
           TokenStr := '';
@@ -1142,7 +3589,18 @@ begin
           begin
             if (TokenStr = '') or not Server.JWTManager.ValidateToken(TokenStr, JWT) then
             begin
+              if Assigned(JWT) then
+                FreeAndNil(JWT);
               Logger.Warn(Format('[WT] Rejecting connection: invalid or missing token (SessionId: %d)', [Session^.SessionId]));
+              Exit;
+            end;
+
+            var TokenIP := JWT.GetClaim('ip');
+            if (Pending.ClientIP <> '') and (TokenIP <> '') and not AreIPAddressesMatching(Pending.ClientIP, TokenIP) then
+            begin
+              Logger.Warn(Format('[WT] Rejecting connection: Token IP does not match session IP (token=%s, pending=%s, SessionId=%d)',
+                [TokenIP, Pending.ClientIP, Session^.SessionId]));
+              JWT.Free;
               Exit;
             end;
 
@@ -1158,7 +3616,7 @@ begin
               Profile := ResolveAppProfile(Pending.AppKey, UserSandbox, Pending.Username);
               if Pending.Cols > 0 then Profile.DefaultCols := Pending.Cols;
               if Pending.Rows > 0 then Profile.DefaultRows := Pending.Rows;
-              TermSession := TGTermSession.Create(Session, Profile);
+              TermSession := TGTermSession.Create(Session, Profile, Pending.Username, JWT.GetClaim('role'));
               SessionManager.RegisterSession(Pointer(Session^.SessionId), TermSession);
             finally
               JWT.Free;
@@ -1182,6 +3640,8 @@ begin
 
             if (TokenStr = '') or not Server.JWTManager.ValidateToken(TokenStr, JWT) then
             begin
+              if Assigned(JWT) then
+                FreeAndNil(JWT);
               Logger.Warn(Format('[WT] Rejecting connection: invalid or missing token (SessionId: %d)', [Session^.SessionId]));
               Exit;
             end;
@@ -1203,10 +3663,16 @@ begin
                 Logger.Warn(Format('[WT] Forbidden app access for user "%s" to app "%s"', [JWT.Subject, AppKey]));
                 Exit;
               end;
+              var WtCheckApp: TAppEntry;
+              if TGTermAppConfig.Instance.FindById(AppKey, WtCheckApp) and not WtCheckApp.IsExecutableAvailable then
+              begin
+                Logger.Warn(Format('[WT] Rejected connection for unavailable app "%s" for user "%s"', [AppKey, JWT.Subject]));
+                Exit;
+              end;
 
               UserSandbox := JWT.GetClaim('sandbox');
               Profile := ResolveAppProfile(Session^.Path, UserSandbox, JWT.Subject);
-              TermSession := TGTermSession.Create(Session, Profile);
+              TermSession := TGTermSession.Create(Session, Profile, JWT.Subject, UserRole);
               SessionManager.RegisterSession(Pointer(Session^.SessionId), TermSession);
             finally
               JWT.Free;
@@ -1217,20 +3683,30 @@ begin
         var
           TermSession: TGTermSession;
         begin
-          TermSession := SessionManager.FindSession(Pointer(Session^.SessionId));
+          TermSession := SessionManager.AcquireSession(Pointer(Session^.SessionId));
           if Assigned(TermSession) then
           begin
-            TermSession.SetWTStream(Session, Stream);
-            TermSession.ProcessClientMessage(TEncoding.UTF8.GetString(Data));
+            try
+              TermSession.SetWTStream(Session, Stream);
+              TermSession.ProcessClientMessage(TEncoding.UTF8.GetString(Data));
+            finally
+              TermSession.Release;
+            end;
           end;
         end,
         procedure(Session: PWTSessionContext; const Data: TBytes)
         var
           TermSession: TGTermSession;
         begin
-          TermSession := SessionManager.FindSession(Pointer(Session^.SessionId));
+          TermSession := SessionManager.AcquireSession(Pointer(Session^.SessionId));
           if Assigned(TermSession) then
-            TermSession.ProcessClientMessage(TEncoding.UTF8.GetString(Data));
+          begin
+            try
+              TermSession.ProcessClientMessage(TEncoding.UTF8.GetString(Data));
+            finally
+              TermSession.Release;
+            end;
+          end;
         end,
         procedure(SessionId: TWTSessionId)
         begin
@@ -1240,15 +3716,805 @@ begin
         end
       );
 
+      Server.RegisterWebTransportRoute(BuildRoutePath('/wt/files'),
+        procedure(Session: PWTSessionContext)
+        var
+          TokenStr: string;
+          JWT: TJWTToken;
+          LowerPath: string;
+          P: Integer;
+          SessCtx: TWTFileSessionCtx;
+          UserEntry: TUserEntry;
+          HasUserEntry: Boolean;
+          ClaimUp, ClaimDown: string;
+          UserCanUp, UserCanDown: Boolean;
+        begin
+          LowerPath := LowerCase(Session^.Path);
+          TokenStr := '';
+          P := Pos('token=', LowerPath);
+          if P > 0 then
+          begin
+            TokenStr := Copy(Session^.Path, P + 6, MaxInt);
+            P := Pos('&', TokenStr);
+            if P > 0 then SetLength(TokenStr, P - 1);
+            P := Pos('#', TokenStr);
+            if P > 0 then SetLength(TokenStr, P - 1);
+            TokenStr := Trim(TokenStr);
+          end;
+
+          if (TokenStr = '') or not Server.JWTManager.ValidateToken(TokenStr, JWT) then
+          begin
+            if Assigned(JWT) then FreeAndNil(JWT);
+            Logger.Warn(Format('[WT-Files] Rejecting connection: invalid or missing token (SessionId: %d)', [Session^.SessionId]));
+            Exit;
+          end;
+
+          try
+            SessCtx := TWTFileSessionCtx.Create;
+            SessCtx.SessionId := Session^.SessionId;
+            SessCtx.Username := JWT.Subject;
+            SessCtx.Role := JWT.GetClaim('role');
+            if SessCtx.Role = '' then SessCtx.Role := 'user';
+            SessCtx.Sandbox := JWT.GetClaim('sandbox');
+
+            HasUserEntry := TGTermUserConfig.Instance.FindUser(JWT.Subject, UserEntry);
+            if (SessCtx.Sandbox = '') and HasUserEntry and (UserEntry.Sandbox <> '') then
+              SessCtx.Sandbox := UserEntry.Sandbox;
+            if SessCtx.Sandbox = '' then
+              SessCtx.Sandbox := 'sandbox';
+
+            UserCanUp := False;
+            UserCanDown := False;
+            ClaimUp := JWT.GetClaim('upload');
+            ClaimDown := JWT.GetClaim('download');
+            if ClaimUp <> '' then
+              UserCanUp := SameText(ClaimUp, 'true')
+            else if HasUserEntry then
+              UserCanUp := UserEntry.CanUpload;
+
+            if ClaimDown <> '' then
+              UserCanDown := SameText(ClaimDown, 'true')
+            else if HasUserEntry then
+              UserCanDown := UserEntry.CanDownload;
+
+            if SameText(SessCtx.Role, 'admin') then
+            begin
+              UserCanUp := True;
+              UserCanDown := True;
+            end;
+
+            SessCtx.CanUpload := UserCanUp;
+            SessCtx.CanDownload := UserCanDown;
+            if HasUserEntry then
+              SessCtx.StorageQuotaMB := UserEntry.Grants.StorageQuotaMB
+            else
+              SessCtx.StorageQuotaMB := 500;
+            if SameText(SessCtx.Role, 'admin') then
+              SessCtx.StorageQuotaMB := 0;
+
+            WTFileLock.Enter;
+            try
+              WTFileSessions.AddOrSetValue(Session^.SessionId, SessCtx);
+            finally
+              WTFileLock.Leave;
+            end;
+            Logger.Info(Format('[WT-Files] Client connected (SessionId: %d, User: %s, Up: %s, Down: %s)',
+              [Session^.SessionId, SessCtx.Username, BoolToStr(UserCanUp, True), BoolToStr(UserCanDown, True)]));
+          finally
+            JWT.Free;
+          end;
+        end,
+        procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+        var
+          SessCtx: TWTFileSessionCtx;
+          StreamCtx: TWTFileStreamCtx;
+          HasSess, HasStream: Boolean;
+          I, NewlinePos: Integer;
+          HdrStr: string;
+          HdrJson: TJSONObject;
+          ActionVal, PathVal, ScopeVal: string;
+          SizeVal: Int64;
+          ServerRoot, UserHome, BaseDir, TargetPath: string;
+          IsAdmin: Boolean;
+          BytesToWrite, Offset: Integer;
+          RespJson: TJSONObject;
+          RespLine: UTF8String;
+          RespBytes: TBytes;
+          HashStr: string;
+          FileBuf: TBytes;
+          ReadChunk: Integer;
+          SrcFileStream: TFileStream;
+        begin
+          if (Session = nil) or (Stream = nil) or (Length(Data) = 0) then Exit;
+
+          WTFileLock.Enter;
+          try
+            HasSess := WTFileSessions.TryGetValue(Session^.SessionId, SessCtx);
+            HasStream := WTFileStreams.TryGetValue(Stream, StreamCtx);
+            if not HasStream and HasSess then
+            begin
+              StreamCtx := TWTFileStreamCtx.Create;
+              StreamCtx.Stream := Stream;
+              StreamCtx.SessionId := Session^.SessionId;
+              StreamCtx.Mode := wtmNone;
+              StreamCtx.HeaderParsed := False;
+              WTFileStreams.Add(Stream, StreamCtx);
+              HasStream := True;
+            end;
+          finally
+            WTFileLock.Leave;
+          end;
+
+          if not HasSess or not HasStream then Exit;
+
+          if not StreamCtx.HeaderParsed then
+          begin
+            var OldLen := Length(StreamCtx.HeaderBuf);
+            SetLength(StreamCtx.HeaderBuf, OldLen + Length(Data));
+            Move(Data[0], StreamCtx.HeaderBuf[OldLen], Length(Data));
+
+            NewlinePos := -1;
+            for I := 0 to Length(StreamCtx.HeaderBuf) - 1 do
+            begin
+              if StreamCtx.HeaderBuf[I] = Ord(#10) then
+              begin
+                NewlinePos := I;
+                Break;
+              end;
+            end;
+
+            if NewlinePos < 0 then
+            begin
+              if Length(StreamCtx.HeaderBuf) > 65536 then
+              begin
+                RespLine := '{"status":"error","message":"Header too large"}'#10;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, True);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+              end;
+              Exit;
+            end;
+
+            HdrStr := TEncoding.UTF8.GetString(StreamCtx.HeaderBuf, 0, NewlinePos).Trim;
+            StreamCtx.HeaderParsed := True;
+
+            HdrJson := nil;
+            try
+              try
+                HdrJson := TJSONObject.ParseJSONValue(HdrStr) as TJSONObject;
+              except
+                HdrJson := nil;
+              end;
+
+              if HdrJson = nil then
+              begin
+                RespLine := '{"status":"error","message":"Invalid JSON header"}'#10;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, True);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end;
+
+              ActionVal := LowerCase(HdrJson.GetValue<string>('action', ''));
+              PathVal := HdrJson.GetValue<string>('path', '');
+              ScopeVal := LowerCase(HdrJson.GetValue<string>('scope', 'home'));
+              SizeVal := HdrJson.GetValue<Int64>('size', 0);
+              IsAdmin := SameText(SessCtx.Role, 'admin');
+
+              ServerRoot := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+              UserHome := TPath.GetFullPath(TPath.Combine(ServerRoot, SessCtx.Sandbox));
+              if not TDirectory.Exists(UserHome) then
+                TDirectory.CreateDirectory(UserHome);
+
+              if (ScopeVal = 'server') and not IsAdmin then
+              begin
+                RespLine := '{"status":"error","message":"Server scope requires admin role"}'#10;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, True);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end;
+
+              if (ScopeVal = 'server') and IsAdmin then
+                BaseDir := ServerRoot
+              else
+                BaseDir := UserHome;
+
+              PathVal := PathVal.Replace('/', '\');
+              while PathVal.StartsWith('\') do
+                PathVal := Copy(PathVal, 2, Length(PathVal) - 1);
+
+              if (Pos(#0, PathVal) > 0) or ((not IsAdmin) and (Pos(':', PathVal) > 0)) then
+              begin
+                RespLine := '{"status":"error","message":"Invalid path format or drive specifier"}'#10;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, True);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end;
+
+              TargetPath := TPath.GetFullPath(TPath.Combine(BaseDir, PathVal));
+              if not IsAdmin and not IsPathInSandboxCanonical(TargetPath, UserHome) then
+              begin
+                RespLine := '{"status":"error","message":"Path traversal detected outside sandbox"}'#10;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, True);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end;
+
+              StreamCtx.FullPath := TargetPath;
+              StreamCtx.Filename := TPath.GetFileName(TargetPath);
+
+              if ActionVal = 'upload' then
+              begin
+                if not SessCtx.CanUpload then
+                begin
+                  RespLine := '{"status":"error","message":"Upload forbidden: missing upload grant"}'#10;
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+
+                if not IsAdmin and (SessCtx.StorageQuotaMB > 0) then
+                begin
+                  var QuotaBytes: Int64 := Int64(SessCtx.StorageQuotaMB) * 1024 * 1024;
+                  var CurrentUsed: Int64 := GetDirectoryTotalSize(UserHome);
+                  if CurrentUsed + SizeVal > QuotaBytes then
+                  begin
+                    RespLine := '{"status":"error","message":"Storage quota exceeded"}'#10;
+                    SetLength(RespBytes, Length(RespLine));
+                    Move(RespLine[1], RespBytes[0], Length(RespLine));
+                    Session.SendOnStream(Stream, RespBytes, True);
+                    WTFileLock.Enter;
+                    try
+                      WTFileStreams.Remove(Stream);
+                    finally
+                      WTFileLock.Leave;
+                    end;
+                    StreamCtx.Free;
+                    Exit;
+                  end;
+                end;
+
+                if HasForbiddenFileNameChars(StreamCtx.Filename) or IsForbiddenUploadExtension(StreamCtx.Filename) then
+                begin
+                  RespLine := '{"status":"error","message":"Upload forbidden: invalid file name or extension"}'#10;
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+
+                var ParentDir := ExtractFilePath(TargetPath);
+                if (ParentDir <> '') and not TDirectory.Exists(ParentDir) then
+                  TDirectory.CreateDirectory(ParentDir);
+
+                StreamCtx.Mode := wtmUpload;
+                StreamCtx.ExpectedSize := SizeVal;
+                StreamCtx.BytesProcessed := 0;
+
+                Offset := NewlinePos + 1;
+                BytesToWrite := Length(StreamCtx.HeaderBuf) - Offset;
+                if BytesToWrite > 0 then
+                begin
+                  var ThreatReason: string := '';
+                  if (BytesToWrite >= 2) and IsExecutableBinaryHeader(@StreamCtx.HeaderBuf[Offset], BytesToWrite) then
+                  begin
+                    RespLine := UTF8String('{"status":"error","message":"Malicious payload detected: executable PE binary header (MZ) forbidden"}'#10);
+                    SetLength(RespBytes, Length(RespLine));
+                    Move(RespLine[1], RespBytes[0], Length(RespLine));
+                    Session.SendOnStream(Stream, RespBytes, True);
+                    WTFileLock.Enter;
+                    try
+                      WTFileStreams.Remove(Stream);
+                    finally
+                      WTFileLock.Leave;
+                    end;
+                    StreamCtx.Free;
+                    Exit;
+                  end;
+
+                  if not ScanBufferForThreats(@StreamCtx.HeaderBuf[Offset], BytesToWrite, StreamCtx.Filename, ThreatReason) then
+                  begin
+                    RespLine := UTF8String(Format('{"status":"error","message":"%s"}'#10, [ThreatReason]));
+                    SetLength(RespBytes, Length(RespLine));
+                    Move(RespLine[1], RespBytes[0], Length(RespLine));
+                    Session.SendOnStream(Stream, RespBytes, True);
+                    WTFileLock.Enter;
+                    try
+                      WTFileStreams.Remove(Stream);
+                    finally
+                      WTFileLock.Leave;
+                    end;
+                    StreamCtx.Free;
+                    Exit;
+                  end;
+                end;
+
+                StreamCtx.FileStream := TFileStream.Create(TargetPath, fmCreate or fmShareDenyNone);
+                if BytesToWrite > 0 then
+                begin
+                  StreamCtx.FileStream.WriteBuffer(StreamCtx.HeaderBuf[Offset], BytesToWrite);
+                  Inc(StreamCtx.BytesProcessed, BytesToWrite);
+                end;
+                SetLength(StreamCtx.HeaderBuf, 0);
+
+                if StreamCtx.BytesProcessed >= StreamCtx.ExpectedSize then
+                begin
+                  FreeAndNil(StreamCtx.FileStream);
+
+                  var ThreatDetected: Boolean := False;
+                  var ThreatReason: string := '';
+                  try
+                    if FileExists(StreamCtx.FullPath) then
+                    begin
+                      var CheckStream: TFileStream := TFileStream.Create(StreamCtx.FullPath, fmOpenRead or fmShareDenyNone);
+                      try
+                        var HeadBuf: array[0..511] of Byte;
+                        var ReadHead: Integer := CheckStream.Read(HeadBuf, Length(HeadBuf));
+                        if (ReadHead >= 2) and IsExecutableBinaryHeader(@HeadBuf[0], ReadHead) then
+                        begin
+                          ThreatDetected := True;
+                          ThreatReason := 'Malicious payload detected: executable PE binary header (MZ) forbidden';
+                        end
+                        else if not ScanBufferForThreats(@HeadBuf[0], ReadHead, StreamCtx.Filename, ThreatReason) then
+                        begin
+                          ThreatDetected := True;
+                        end;
+                      finally
+                        CheckStream.Free;
+                      end;
+                    end;
+                  except
+                    on E: Exception do
+                    begin
+                      ThreatDetected := True;
+                      ThreatReason := 'Antivirus threat detected: ' + E.Message;
+                    end;
+                  end;
+
+                  if ThreatDetected then
+                  begin
+                    try
+                      if FileExists(StreamCtx.FullPath) then
+                        TFile.Delete(StreamCtx.FullPath);
+                    except
+                    end;
+                    RespLine := UTF8String(Format('{"status":"error","message":"%s"}'#10, [ThreatReason]));
+                    SetLength(RespBytes, Length(RespLine));
+                    Move(RespLine[1], RespBytes[0], Length(RespLine));
+                    Session.SendOnStream(Stream, RespBytes, True);
+                    WTFileLock.Enter;
+                    try
+                      WTFileStreams.Remove(Stream);
+                    finally
+                      WTFileLock.Leave;
+                    end;
+                    StreamCtx.Free;
+                    Exit;
+                  end;
+
+                  try
+                    HashStr := THashSHA2.GetHashStringFromFile(StreamCtx.FullPath, THashSHA2.TSHA2Version.SHA256).ToLower;
+                  except
+                    on E: Exception do
+                    begin
+                      RespLine := UTF8String(Format('{"status":"error","message":"Antivirus threat detected: %s"}'#10, [E.Message]));
+                      SetLength(RespBytes, Length(RespLine));
+                      Move(RespLine[1], RespBytes[0], Length(RespLine));
+                      Session.SendOnStream(Stream, RespBytes, True);
+                      WTFileLock.Enter;
+                      try
+                        WTFileStreams.Remove(Stream);
+                      finally
+                        WTFileLock.Leave;
+                      end;
+                      StreamCtx.Free;
+                      Exit;
+                    end;
+                  end;
+                  RespJson := TJSONObject.Create;
+                  try
+                    RespJson.AddPair('status', 'ok');
+                    RespJson.AddPair('action', 'upload');
+                    RespJson.AddPair('path', StreamCtx.Filename);
+                    RespJson.AddPair('bytes', TJSONNumber.Create(StreamCtx.BytesProcessed));
+                    RespJson.AddPair('sha256', HashStr);
+                    RespLine := UTF8String(RespJson.ToJSON + #10);
+                  finally
+                    RespJson.Free;
+                  end;
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, False);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+              end
+              else if ActionVal = 'download' then
+              begin
+                if not SessCtx.CanDownload then
+                begin
+                  RespLine := '{"status":"error","message":"Download forbidden: missing download grant"}'#10;
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+
+                if HasForbiddenFileNameChars(StreamCtx.Filename) then
+                begin
+                  RespLine := '{"status":"error","message":"Download forbidden: invalid file name"}'#10;
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+
+                if not FileExists(TargetPath) then
+                begin
+                  RespLine := '{"status":"error","message":"File not found"}'#10;
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+
+                StreamCtx.Mode := wtmDownload;
+                var FileSize := TFile.GetSize(TargetPath);
+                HashStr := THashSHA2.GetHashStringFromFile(TargetPath, THashSHA2.TSHA2Version.SHA256).ToLower;
+
+                RespJson := TJSONObject.Create;
+                try
+                  RespJson.AddPair('status', 'ok');
+                  RespJson.AddPair('action', 'download');
+                  RespJson.AddPair('path', StreamCtx.Filename);
+                  RespJson.AddPair('size', TJSONNumber.Create(FileSize));
+                  RespJson.AddPair('sha256', HashStr);
+                  RespLine := UTF8String(RespJson.ToJSON + #10);
+                finally
+                  RespJson.Free;
+                end;
+
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, False);
+
+                SrcFileStream := TFileStream.Create(TargetPath, fmOpenRead or fmShareDenyNone);
+                try
+                  SetLength(FileBuf, 65536);
+                  while SrcFileStream.Position < SrcFileStream.Size do
+                  begin
+                    ReadChunk := SrcFileStream.Read(FileBuf[0], Length(FileBuf));
+                    if ReadChunk <= 0 then Break;
+                    if ReadChunk < Length(FileBuf) then
+                      SetLength(FileBuf, ReadChunk);
+                    var IsLast := (SrcFileStream.Position >= SrcFileStream.Size);
+                    Session.SendOnStream(Stream, FileBuf, IsLast);
+                    if not IsLast and (Length(FileBuf) < 65536) then
+                      SetLength(FileBuf, 65536);
+                  end;
+                finally
+                  SrcFileStream.Free;
+                end;
+
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end
+              else
+              begin
+                RespLine := '{"status":"error","message":"Unknown action"}'#10;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, True);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end;
+            finally
+              if Assigned(HdrJson) then HdrJson.Free;
+            end;
+          end
+          else if StreamCtx.Mode = wtmUpload then
+          begin
+            if Assigned(StreamCtx.FileStream) then
+            begin
+              if StreamCtx.BytesProcessed = 0 then
+              begin
+                var ThreatReason: string := '';
+                if (Length(Data) >= 2) and IsExecutableBinaryHeader(@Data[0], Length(Data)) then
+                begin
+                  FreeAndNil(StreamCtx.FileStream);
+                  try
+                    if FileExists(StreamCtx.FullPath) then
+                      TFile.Delete(StreamCtx.FullPath);
+                  except
+                  end;
+                  RespLine := UTF8String('{"status":"error","message":"Malicious payload detected: executable PE binary header (MZ) forbidden"}'#10);
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+
+                if not ScanBufferForThreats(@Data[0], Length(Data), StreamCtx.Filename, ThreatReason) then
+                begin
+                  FreeAndNil(StreamCtx.FileStream);
+                  try
+                    if FileExists(StreamCtx.FullPath) then
+                      TFile.Delete(StreamCtx.FullPath);
+                  except
+                  end;
+                  RespLine := UTF8String(Format('{"status":"error","message":"%s"}'#10, [ThreatReason]));
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+              end;
+
+              StreamCtx.FileStream.WriteBuffer(Data[0], Length(Data));
+              Inc(StreamCtx.BytesProcessed, Length(Data));
+
+              if StreamCtx.BytesProcessed >= StreamCtx.ExpectedSize then
+              begin
+                FreeAndNil(StreamCtx.FileStream);
+
+                var ThreatDetected: Boolean := False;
+                var ThreatReason: string := '';
+                try
+                  if FileExists(StreamCtx.FullPath) then
+                  begin
+                    var CheckStream: TFileStream := TFileStream.Create(StreamCtx.FullPath, fmOpenRead or fmShareDenyNone);
+                    try
+                      var HeadBuf: array[0..511] of Byte;
+                      var ReadHead: Integer := CheckStream.Read(HeadBuf, Length(HeadBuf));
+                      if (ReadHead >= 2) and IsExecutableBinaryHeader(@HeadBuf[0], ReadHead) then
+                      begin
+                        ThreatDetected := True;
+                        ThreatReason := 'Malicious payload detected: executable PE binary header (MZ) forbidden';
+                      end
+                      else if not ScanBufferForThreats(@HeadBuf[0], ReadHead, StreamCtx.Filename, ThreatReason) then
+                      begin
+                        ThreatDetected := True;
+                      end;
+                    finally
+                      CheckStream.Free;
+                    end;
+                  end;
+                except
+                  on E: Exception do
+                  begin
+                    ThreatDetected := True;
+                    ThreatReason := 'Antivirus threat detected: ' + E.Message;
+                  end;
+                end;
+
+                if ThreatDetected then
+                begin
+                  try
+                    if FileExists(StreamCtx.FullPath) then
+                      TFile.Delete(StreamCtx.FullPath);
+                  except
+                  end;
+                  RespLine := UTF8String(Format('{"status":"error","message":"%s"}'#10, [ThreatReason]));
+                  SetLength(RespBytes, Length(RespLine));
+                  Move(RespLine[1], RespBytes[0], Length(RespLine));
+                  Session.SendOnStream(Stream, RespBytes, True);
+                  WTFileLock.Enter;
+                  try
+                    WTFileStreams.Remove(Stream);
+                  finally
+                    WTFileLock.Leave;
+                  end;
+                  StreamCtx.Free;
+                  Exit;
+                end;
+
+                try
+                  HashStr := THashSHA2.GetHashStringFromFile(StreamCtx.FullPath, THashSHA2.TSHA2Version.SHA256).ToLower;
+                except
+                  on E: Exception do
+                  begin
+                    RespLine := UTF8String(Format('{"status":"error","message":"Antivirus threat detected: %s"}'#10, [E.Message]));
+                    SetLength(RespBytes, Length(RespLine));
+                    Move(RespLine[1], RespBytes[0], Length(RespLine));
+                    Session.SendOnStream(Stream, RespBytes, True);
+                    WTFileLock.Enter;
+                    try
+                      WTFileStreams.Remove(Stream);
+                    finally
+                      WTFileLock.Leave;
+                    end;
+                    StreamCtx.Free;
+                    Exit;
+                  end;
+                end;
+                RespJson := TJSONObject.Create;
+                try
+                  RespJson.AddPair('status', 'ok');
+                  RespJson.AddPair('action', 'upload');
+                  RespJson.AddPair('path', StreamCtx.Filename);
+                  RespJson.AddPair('bytes', TJSONNumber.Create(StreamCtx.BytesProcessed));
+                  RespJson.AddPair('sha256', HashStr);
+                  RespLine := UTF8String(RespJson.ToJSON + #10);
+                finally
+                  RespJson.Free;
+                end;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, False);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end;
+            end;
+          end;
+        end,
+        procedure(Session: PWTSessionContext; const Data: TBytes)
+        begin
+        end,
+        procedure(SessionId: TWTSessionId)
+        var
+          StreamKeys: TList<HQUIC>;
+          Pair: TPair<HQUIC, TWTFileStreamCtx>;
+        begin
+          Logger.Info(Format('[WT-Files] Client disconnected (SessionId: %d)', [SessionId]));
+          WTFileLock.Enter;
+          try
+            WTFileSessions.Remove(SessionId);
+            StreamKeys := TList<HQUIC>.Create;
+            try
+              for Pair in WTFileStreams do
+              begin
+                if Pair.Value.SessionId = SessionId then
+                  StreamKeys.Add(Pair.Key);
+              end;
+              for var K in StreamKeys do
+              begin
+                var StrmCtx := WTFileStreams[K];
+                WTFileStreams.Remove(K);
+                StrmCtx.Free;
+              end;
+            finally
+              StreamKeys.Free;
+            end;
+          finally
+            WTFileLock.Leave;
+          end;
+        end
+      );
+
       if not Server.Start then
       begin
         Logger.Error(Format('Failed to start HTTPS IOCP server on port %d.', [HttpsPortParam]));
-        Halt(1);
+        ExitCode := 1; Exit;
       end;
 
       Logger.Info('================================================================');
-      Logger.Info(Format('  Server listening on HTTPS:        https://localhost:%d', [HttpsPortParam]));
-      Logger.Info(Format('  Server listening on WebTransport: https://localhost:%d/wt/terminal', [HttpsPortParam]));
+      Logger.Info(Format('  Server listening on HTTPS:        https://%s:%d', [SubjectNameParam, HttpsPortParam]));
+      Logger.Info(Format('  Server listening on WebTransport: https://%s:%d/wt/terminal', [SubjectNameParam, HttpsPortParam]));
+      Logger.Info(Format('  Server listening on WebTransport Files: https://%s:%d/wt/files', [SubjectNameParam, HttpsPortParam]));
+      case GmTLSMode of
+        mtlsRequired: Logger.Info('  mTLS Client Authentication:       REQUIRED (Strict Mutual TLS)');
+        mtlsOptional: Logger.Info('  mTLS Client Authentication:       OPTIONAL (Verify Client Cert If Given)');
+      else
+        Logger.Info('  mTLS Client Authentication:       DISABLED (Standard TLS)');
+      end;
+      if GmTLSCaCertPath <> '' then
+        Logger.Info('  mTLS CA Certificate:              ' + GmTLSCaCertPath);
+      if GmTLSPinnedThumbprint <> '' then
+        Logger.Info('  mTLS Pinned Direct Trust:         ' + GmTLSPinnedThumbprint);
+      if Assigned(GTrustedClients) and (GTrustedClients.Count > 0) then
+        Logger.Info(Format('  mTLS Trusted Clients Whitelist:   %d certs loaded (%s)', [GTrustedClients.Count, GTrustedClientsDir]));
       Logger.Info('  Press Enter to stop the server.');
       Logger.Info('================================================================');
 
@@ -1294,6 +4560,21 @@ begin
       FreeAndNil(PendingSessionsLock);
       FreeAndNil(LoginRateMap);
       FreeAndNil(LoginRateLock);
+      if Assigned(WTFileStreams) then
+      begin
+        for var Strm in WTFileStreams.Values do
+          Strm.Free;
+        FreeAndNil(WTFileStreams);
+      end;
+      if Assigned(WTFileSessions) then
+      begin
+        for var Sess in WTFileSessions.Values do
+          Sess.Free;
+        FreeAndNil(WTFileSessions);
+      end;
+      FreeAndNil(WTFileLock);
+      if Assigned(GTrustedClients) then
+        FreeAndNil(GTrustedClients);
       Logger.Info('Server stopped cleanly.');
     end;
   except
@@ -1301,3 +4582,4 @@ begin
       Logger.Critical(Format('Fatal Error [%s]: %s', [E.ClassName, E.Message]));
   end;
 end.
+

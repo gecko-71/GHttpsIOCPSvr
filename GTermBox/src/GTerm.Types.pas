@@ -26,7 +26,7 @@ unit GTerm.Types;
 interface
 
 type
-  TSandboxMode = (smNone, smStandard, smJobOnly);
+  TSandboxMode = (smInvalid, smNone, smStandard, smJobOnly);
 
   TGTermAppProfile = record
     ProfileName: string;

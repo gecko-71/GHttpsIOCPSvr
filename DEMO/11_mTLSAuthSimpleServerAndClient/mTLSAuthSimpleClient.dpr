@@ -32,10 +32,11 @@ uses
   System.IOUtils,
   Winapi.Windows,
   Winapi.WinHTTP,
+  WinApiAdditions in '..\..\src\WinApiAdditions.pas',
   MtlsClientUtils in '..\10_mTLSAuthServerAndClient\MtlsClientUtils.pas';
 
 var
-  ServerHost: string = 'localhost';
+  ServerHost: string = '';
   ServerPort: Word = 8454;
   EndpointPath: string = '/api/secret-data';
   PfxPath: string;

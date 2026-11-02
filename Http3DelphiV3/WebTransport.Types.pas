@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) 2026 GECKO-71
@@ -91,6 +91,7 @@ type
     SessionId: TWTSessionId;
     Path:      string;
     Origin:    string;
+    Authority: string;
   end;
 
   TOnWTSessionRequest = function(Sender: TObject; const Info: TWTSessionInfo): Boolean of object;
