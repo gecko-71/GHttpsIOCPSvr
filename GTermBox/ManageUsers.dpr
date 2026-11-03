@@ -1893,15 +1893,20 @@ begin
   EnsureDefaultAppsJson(TPath.Combine(BaseDir, 'apps.json'));
   EnsureDefaultUsersJson(TPath.Combine(BaseDir, 'users.json'));
 
-  RunIcaclsGrant(TPath.Combine(BaseDir, 'web'), '*S-1-15-2-1:(OI)(CI)RX');
+  if not RunIcaclsGrant(TPath.Combine(BaseDir, 'web'), '*S-1-15-2-1:(OI)(CI)RX') then
+    Writeln('[WARN] Failed to set permissions on web assets.');
   if TDirectory.Exists(TPath.Combine(BaseDir, 'Python')) then
-    RunIcaclsGrant(TPath.Combine(BaseDir, 'Python'), '*S-1-15-2-1:(OI)(CI)RX');
+    if not RunIcaclsGrant(TPath.Combine(BaseDir, 'Python'), '*S-1-15-2-1:(OI)(CI)RX') then
+      Writeln('[WARN] Failed to set permissions on Python folder.');
   if TDirectory.Exists(TPath.Combine(BaseDir, 'PyTui')) then
-    RunIcaclsGrant(TPath.Combine(BaseDir, 'PyTui'), '*S-1-15-2-1:(OI)(CI)RX');
+    if not RunIcaclsGrant(TPath.Combine(BaseDir, 'PyTui'), '*S-1-15-2-1:(OI)(CI)RX') then
+      Writeln('[WARN] Failed to set permissions on PyTui folder.');
   if TDirectory.Exists(TPath.Combine(BaseDir, 'Far')) then
-    RunIcaclsGrant(TPath.Combine(BaseDir, 'Far'), '*S-1-15-2-1:(OI)(CI)RX');
+    if not RunIcaclsGrant(TPath.Combine(BaseDir, 'Far'), '*S-1-15-2-1:(OI)(CI)RX') then
+      Writeln('[WARN] Failed to set permissions on Far folder.');
   if TDirectory.Exists(TPath.Combine(BaseDir, 'Edit')) then
-    RunIcaclsGrant(TPath.Combine(BaseDir, 'Edit'), '*S-1-15-2-1:(OI)(CI)RX');
+    if not RunIcaclsGrant(TPath.Combine(BaseDir, 'Edit'), '*S-1-15-2-1:(OI)(CI)RX') then
+      Writeln('[WARN] Failed to set permissions on Edit folder.');
 
   Writeln('=== GTermBox environment initialization complete! ===');
   Writeln;
