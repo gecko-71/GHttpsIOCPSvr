@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -741,7 +741,6 @@ begin
   except
     on E: Exception do
     begin
-      Result := 0;
       raise Exception.CreateFmt('Failed to read from storage: %s', [E.Message]);
     end;
   end;
@@ -1443,7 +1442,6 @@ var
   BytesToCopy: Int64 ;
   RemainingHeaderBytes: Integer;
 begin
-  Result := 0;
   try
     if not FHeadersSent then
     begin

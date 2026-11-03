@@ -381,11 +381,11 @@ begin
     if TrustedClientsDirParam = '' then
     begin
       var DirCand1 := ExtractFilePath(ParamStr(0)) + 'trusted_clients';
-      var DirCand2 := TPath.Combine(GetCurrentDir, 'trusted_clients');
+
       if TDirectory.Exists(DirCand1) then
         TrustedClientsDirParam := DirCand1
-      else if TDirectory.Exists(DirCand2) then
-        TrustedClientsDirParam := DirCand2;
+
+
     end;
 
     if (TrustedClientsDirParam <> '') and TDirectory.Exists(TrustedClientsDirParam) then
@@ -415,24 +415,6 @@ begin
             Logger.Info(Format('[mTLS] Whitelisted client sha256: %s (User: %s, SHA-256: %s)',
               [ExtractFileName(F), Ident, Thumb]));
           end;
-        end;
-      end;
-    end;
-
-    if (mTLSModeParam <> mtlsDisabled) and (CaCertParam = '') then
-    begin
-      var CaCandidates: TArray<string> := [
-        TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt'),
-        TPath.Combine(GetCurrentDir, 'test_certs\test_root_ca.crt'),
-        TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs\test_root_ca.crt'),
-        TPath.Combine(ExtractFilePath(ParamStr(0)), 'test_certs\test_root_ca.crt')
-      ];
-      for var Cand in CaCandidates do
-      begin
-        if TFile.Exists(Cand) then
-        begin
-          CaCertParam := Cand;
-          Break;
         end;
       end;
     end;

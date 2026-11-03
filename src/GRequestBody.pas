@@ -178,8 +178,8 @@ type
     function DetectEncodingFromBOM(const Data: TBytes): TEncoding;
     procedure InitializeDiskStorage;
     procedure FinalizeDiskStorage;
-    function ReadContentFromDisk: string;
   protected
+    function ReadContentFromDisk: string;
     function GetContentLength: Int64; override;
     function GetIsComplete: Boolean; override;
     function GetAsString: string; override;
@@ -218,6 +218,7 @@ type
     procedure InitializeDiskStorage;
     procedure FinalizeDiskStorage;
   protected
+    FParsingHeaders: Boolean;
     function GetContentLength: Int64; override;
     function GetIsComplete: Boolean; override;
     function GetAsString: string; override;
@@ -256,11 +257,11 @@ type
     FParts: TObjectList<TBodyPart>;
     FCurrentPart: TBodyPart;
     FBuffer: TMemoryStream;
-    FParsingHeaders: Boolean;
     FHeaderBuffer: TStringList;
     FSecuritySettings: TSecuritySettings;
     FOnPartComplete: TPartCompleteEvent;
   protected
+    FParsingHeaders: Boolean;
     function GetContentLength: Int64; override;
     function GetIsComplete: Boolean; override;
     function GetAsString: string; override;
@@ -338,19 +339,19 @@ type
     FCurrentChunkReceived: Integer;
     FContentEncoding: TContentEncoding;
     FSecuritySettings: TSecuritySettings;
-    function ValidateFilename(const Filename: string): Boolean;
     function ValidateMimeType(const MimeType: string): Boolean;
-    function SanitizeFieldName(const FieldName: string): string;
     function DetectContentEncoding(const EncodingHeader: string): TContentEncoding;
-    function DecompressData(const Data: TBytes; Encoding: TContentEncoding): TBytes;
     procedure DetermineBodyType;
     procedure ParseContentType;
     function ExtractBoundary(const ContentTypeHeader: string): string;
     function GetBodyContentType(const ContentTypeStr: string): TBodyContentType;
     procedure SetError(const ErrorMsg: string);
-    function ProcessChunkedData(const Data: array of Byte; Size: Integer): TBytes;
     function ExtractChunkSize(const ChunkHeader: string): Integer;
   protected
+    function ValidateFilename(const Filename: string): Boolean;
+    function SanitizeFieldName(const FieldName: string): string;
+    function DecompressData(const Data: TBytes; Encoding: TContentEncoding): TBytes;
+    function ProcessChunkedData(const Data: array of Byte; Size: Integer): TBytes;
     procedure DoProgress(BytesReceived, TotalBytes: Int64; const PartName: string);
     procedure DoPartComplete(Part: TBodyPart);
     procedure DoError(const ErrorMessage: string);
@@ -622,12 +623,9 @@ var
   I: Integer;
   FilePath: string;
   FilesToDelete: TArray<string>;
-  SuccessCount, ErrorCount: Integer;
 begin
   if not Assigned(FCreatedFiles) then
      Exit;
-  SuccessCount := 0;
-  ErrorCount := 0;
   try
     SetLength(FilesToDelete, FCreatedFiles.Count);
     for I := 0 to FCreatedFiles.Count - 1 do
@@ -642,11 +640,11 @@ begin
           if TFile.Exists(FilePath) then
           begin
             TFile.Delete(FilePath);
-            Inc(SuccessCount);
           end;
         except
           on E: Exception do
-            Inc(ErrorCount);
+          begin
+          end;
         end;
       end;
     end;
@@ -799,7 +797,6 @@ end;
 
 function TTextBodyPart.SaveToFile(const FileName: string): Boolean;
 begin
-  Result := False;
   try
     if FUseDiskStorage and (FTempFilePath <> '') and TFile.Exists(FTempFilePath) then
     begin
@@ -840,7 +837,6 @@ end;
 
 function TTextBodyPart.ReadContentFromDiskFixed: TBytes;
 var
-  FileStream: TFileStream;
   FileSize: Int64;
 begin
   SetLength(Result, 0);
@@ -2010,7 +2006,6 @@ end;
 
 function TMultipartBodyPart.AppendData(const Data: array of Byte; Size: Integer): Boolean;
 begin
-  Result := False;
   try
     if FParseState in [bpsComplete, bpsError] then
        Exit(True);
@@ -2284,7 +2279,6 @@ function TMultipartBodyPart.CreatePartFromHeaders: TBodyPart;
 var
   ContentType, Disposition: string;
 begin
-  Result := nil;
   try
     ContentType := FHeaderBuffer.Values['content-type'];
     Disposition := FHeaderBuffer.Values['content-disposition'];
@@ -2652,7 +2646,6 @@ var
   LineEndPos: Integer;
   P: PByte;
   EndPtr: PByte;
-  TempStream: TMemoryStream;
 begin
   Result := False;
   if FHasError or FIsComplete then Exit(True);
@@ -2838,7 +2831,6 @@ function THttpBodyParser.ProcessChunkedData(const Data: array of Byte; Size: Int
 var
   I: Integer;
   ChunkHeader: string;
-  ChunkSize: Integer;
   DataToProcess: TBytes;
   ResultSize: Integer;
 begin
@@ -2936,7 +2928,7 @@ begin
     for I := 1 to Length(HexSize) do
     begin
       C := UpCase(HexSize[I]);
-      if not (C in ['0'..'9', 'A'..'F']) then
+      if not CharInSet(C, ['0'..'9', 'A'..'F']) then
         Exit;
     end;
 

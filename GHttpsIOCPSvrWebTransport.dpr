@@ -453,15 +453,11 @@ begin
       if GetCmdLineOption('cacert', CaCertPath) or
          GetCmdLineOption('capath', CaCertPath) or
          FindCmdLineSwitch('cacert', CaCertPath, True) then
-              Server.LoadCACertificate(CaCertPath)
-      else if Server.mTLSMode <> mtlsDisabled then
       begin
-        var DefaultCa1 := TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt');
-        var DefaultCa2 := TPath.Combine(GetCurrentDir, 'test_certs\test_root_ca.crt');
-        if TFile.Exists(DefaultCa1) then
-          Server.LoadCACertificate(DefaultCa1)
-        else if TFile.Exists(DefaultCa2) then
-          Server.LoadCACertificate(DefaultCa2);
+        if TFile.Exists(CaCertPath) then
+          Server.LoadCACertificate(CaCertPath)
+        else
+          Logger.Warn('[mTLS] Specified CA certificate file not found: ' + CaCertPath);
       end;
 
       Server.OnValidateClientCertificate :=

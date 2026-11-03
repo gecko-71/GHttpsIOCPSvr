@@ -1,4 +1,4 @@
-{
+﻿{
 
   MIT License
 
@@ -796,8 +796,6 @@ var
 begin
 
   if ConnectStreamOrDataStream = nil then Exit;
-
-  IsConnectStream := False;
 
   FLock.Enter;
 

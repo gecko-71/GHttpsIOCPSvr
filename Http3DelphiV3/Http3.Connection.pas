@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) 2026 GECKO-71
@@ -175,7 +175,6 @@ function THttp3RequestData.AddHeader(const AName, AValue: string): Boolean;
 var
   LowerName: string;
 begin
-  Result := False;
   if (Length(AName) > 256) or (Length(AValue) > 4096) or (Length(AName) + Length(AValue) > 8192) then
   begin
     FHasInvalidHeader := True;

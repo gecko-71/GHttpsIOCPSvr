@@ -39,7 +39,9 @@ function GetExeDir: string;
 begin
   Result := ExtractFilePath(ParamStr(0));
   if Result = '' then
-    Result := GetCurrentDir;
+    Result := ExtractFilePath(GetModuleName(HInstance));
+  if (Result <> '') and (Result[Length(Result)] <> '\') then
+    Result := Result + '\';
 end;
 
 function GetUsersPath: string;
@@ -54,17 +56,87 @@ begin
   Result := TPath.Combine(GetExeDir, 'apps.json');
 end;
 
-function ComputeHash(const ASalt, APassword: string): string;
-begin
-  Result := LowerCase(THashSHA2.GetHashString(ASalt + ':' + APassword, THashSHA2.TSHA2Version.SHA256));
-end;
+const
+  BCRYPT_USE_SYSTEM_PREFERRED_RNG = $00000002;
+  BCRYPT_ALG_HANDLE_HMAC_FLAG = $00000008;
+  BCRYPT_SHA256_ALGORITHM = 'SHA256';
+
+function DeleteAppContainerProfile(pszAppContainerName: PWideChar): HRESULT; stdcall; external 'userenv.dll' name 'DeleteAppContainerProfile';
+
+function BCryptOpenAlgorithmProvider(
+  out phAlgorithm: THandle;
+  pszAlgId: LPCWSTR;
+  pszImplementation: LPCWSTR;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
+
+function BCryptCloseAlgorithmProvider(
+  hAlgorithm: THandle;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
+
+function BCryptGenRandom(
+  hAlgorithm: THandle;
+  pbBuffer: PByte;
+  cbBuffer: ULONG;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
+
+function BCryptDeriveKeyPBKDF2(
+  hPrf: THandle;
+  pbPassword: PByte;
+  cbPassword: ULONG;
+  pbSalt: PByte;
+  cbSalt: ULONG;
+  cIterations: UInt64;
+  pbDerivedKey: PByte;
+  cbDerivedKey: ULONG;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
 
 function GenerateSalt(const AUsername: string): string;
 var
-  G: string;
+  SaltBytes: array[0..15] of Byte;
+  I: Integer;
 begin
-  G := TGUID.NewGuid.ToString.Trim(['{', '}']).Replace('-', '').ToLower;
-  Result := Format('salt_%s_%s', [LowerCase(AUsername), Copy(G, 1, 10)]);
+  if BCryptGenRandom(0, @SaltBytes[0], Length(SaltBytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) <> 0 then
+  begin
+    for I := 0 to High(SaltBytes) do
+      SaltBytes[I] := Random(256);
+  end;
+  Result := '';
+  for I := 0 to High(SaltBytes) do
+    Result := Result + IntToHex(SaltBytes[I], 2).ToLower;
+end;
+
+function ComputeHash(const ASalt, APassword: string): string;
+var
+  hAlg: THandle;
+  PassBytes, SaltBytes: TBytes;
+  DerivedBytes: array[0..31] of Byte;
+  I: Integer;
+  pPass, pSalt: PByte;
+begin
+  Result := '';
+  PassBytes := TEncoding.UTF8.GetBytes(APassword);
+  SaltBytes := TEncoding.UTF8.GetBytes(ASalt);
+  FillChar(DerivedBytes[0], Length(DerivedBytes), 0);
+  if BCryptOpenAlgorithmProvider(hAlg, BCRYPT_SHA256_ALGORITHM, nil, BCRYPT_ALG_HANDLE_HMAC_FLAG) = 0 then
+  begin
+    try
+      pPass := nil;
+      if Length(PassBytes) > 0 then
+        pPass := @PassBytes[0];
+      pSalt := nil;
+      if Length(SaltBytes) > 0 then
+        pSalt := @SaltBytes[0];
+      if BCryptDeriveKeyPBKDF2(hAlg, pPass, Length(PassBytes), pSalt, Length(SaltBytes), 100000, @DerivedBytes[0], Length(DerivedBytes), 0) = 0 then
+      begin
+        for I := 0 to High(DerivedBytes) do
+          Result := Result + IntToHex(DerivedBytes[I], 2).ToLower;
+      end;
+    finally
+      BCryptCloseAlgorithmProvider(hAlg, 0);
+    end;
+  end;
+  if Result <> '' then
+    Result := Format('PBKDF2$100000$%s', [Result]);
 end;
 
 procedure BackupFile(const AFilePath: string);
@@ -118,6 +190,53 @@ begin
     end;
   end;
   SetLength(Result, Count);
+end;
+
+function IsValidIdentifier(const AId: string): Boolean;
+var
+  I: Integer;
+  Ch: Char;
+begin
+  Result := False;
+  if Trim(AId) = '' then
+    Exit;
+  for I := 1 to Length(AId) do
+  begin
+    Ch := AId[I];
+    if not (CharInSet(Ch, ['a'..'z', 'A'..'Z', '0'..'9', '_', '-'])) then
+      Exit;
+  end;
+  Result := True;
+end;
+
+function IsSafeSandboxDirectory(const ASandboxDir, ABaseDir: string): Boolean;
+var
+  NormSandbox, NormBase, ParentOfBase: string;
+  Leaf: string;
+begin
+  if Trim(ASandboxDir) = '' then
+    Exit(False);
+
+  if Pos('..', ASandboxDir) > 0 then
+    Exit(False);
+
+  Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(Trim(ASandboxDir)));
+  if not StartsText('sandbox_', Leaf) then
+    Exit(False);
+
+  NormSandbox := LowerCase(ExcludeTrailingPathDelimiter(TPath.GetFullPath(TPath.Combine(ABaseDir, ASandboxDir))));
+  NormBase := LowerCase(ExcludeTrailingPathDelimiter(TPath.GetFullPath(ABaseDir)));
+  ParentOfBase := LowerCase(ExcludeTrailingPathDelimiter(TPath.GetFullPath(ExtractFilePath(NormBase))));
+
+  if (NormSandbox = NormBase) or (NormSandbox = ParentOfBase) or (Length(NormSandbox) <= Length(NormBase)) then
+    Exit(False);
+
+  if SameText(Leaf, 'web') or SameText(Leaf, 'apps') or SameText(Leaf, 'python') or
+     SameText(Leaf, 'trusted_clients') or SameText(Leaf, 'certs') or SameText(Leaf, 'bin') or
+     SameText(Leaf, 'conf') or SameText(Leaf, 'config') or SameText(Leaf, 'log') or SameText(Leaf, 'logs') then
+    Exit(False);
+
+  Result := True;
 end;
 
 function ArrayToJsonArray(const AArr: TArray<string>): TJSONArray;
@@ -612,6 +731,7 @@ begin
       Writeln;
       Writeln(Format('[ERROR] User ''%s'' not found.', [AUsername]));
       Writeln;
+      ExitCode := 1;
     end;
   finally
     Root.Free;
@@ -637,6 +757,12 @@ begin
       if SameText(GetStr(UserObj, 'username'), AUsername) then
       begin
         SandboxDir := GetStr(UserObj, 'sandbox');
+        if (SandboxDir <> '') and not IsSafeSandboxDirectory(SandboxDir, GetExeDir) then
+        begin
+          Writeln(Format('[ERROR] Refusing to delete protected or non-sandbox directory: %s', [SandboxDir]));
+          ExitCode := 1;
+          Exit;
+        end;
         UsersArr.Remove(I).Free;
         Found := True;
         Break;
@@ -650,7 +776,15 @@ begin
       Writeln(Format('User ''%s'' deleted from configuration.', [AUsername]));
       if SandboxDir <> '' then
       begin
+        var Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(SandboxDir));
+        var SafeLeaf := '';
+        for var Ch in Leaf do
+          if CharInSet(Ch, ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) then
+            SafeLeaf := SafeLeaf + Ch;
         FullSandbox := TPath.Combine(GetExeDir, SandboxDir);
+        var PathHash := Copy(THashSHA2.GetHashString(TPath.GetFullPath(FullSandbox)), 1, 12);
+        DeleteAppContainerProfile(PWideChar('GTermBox.' + SafeLeaf + '.' + PathHash));
+        DeleteAppContainerProfile(PWideChar('GTermBox.' + SafeLeaf));
         if TDirectory.Exists(FullSandbox) then
         begin
           CanonicalSandbox := TPath.GetFullPath(FullSandbox);
@@ -688,6 +822,7 @@ begin
       Writeln;
       Writeln(Format('[ERROR] User ''%s'' not found.', [AUsername]));
       Writeln;
+      ExitCode := 1;
     end;
   finally
     Root.Free;
@@ -895,6 +1030,13 @@ var
   UserObj: TJSONObject;
   UsersModified: Boolean;
 begin
+  if not IsValidIdentifier(AId) then
+  begin
+    Writeln(Format('[ERROR] Invalid application identifier: %s', [AId]));
+    ExitCode := 1;
+    Exit;
+  end;
+
   LowerId := LowerCase(AId);
   AppsArr := LoadAppsArray(GetAppsPath, Root);
   try
@@ -988,6 +1130,7 @@ begin
       Writeln;
       Writeln(Format('[ERROR] App ''%s'' not found.', [AId]));
       Writeln;
+      ExitCode := 1;
     end;
   finally
     Root.Free;
@@ -1657,8 +1800,7 @@ end;
 
 procedure InitializeEnvironment(const ATargetDir: string = '');
 var
-  BaseDir, SDir, Candidate: string;
-  Candidates: TArray<string>;
+  BaseDir, SDir: string;
 begin
   if ATargetDir <> '' then
     BaseDir := TPath.GetFullPath(ATargetDir)
@@ -1699,68 +1841,31 @@ begin
 
   if not TFile.Exists(TPath.Combine(BaseDir, 'web\index.html')) then
   begin
-    Candidates := [
-      TPath.Combine(BaseDir, '..\web'),
-      TPath.Combine(BaseDir, '..\..\web'),
-      TPath.Combine(BaseDir, '..\..\GTermBox\web'),
-      TPath.Combine(GetCurrentDir, 'GTermBox\web'),
-      TPath.Combine(GetCurrentDir, 'web')
-    ];
-    for Candidate in Candidates do
+    var SourceWeb := TPath.Combine(GetExeDir, 'web');
+    if TFile.Exists(TPath.Combine(SourceWeb, 'index.html')) and not SameText(SourceWeb, TPath.Combine(BaseDir, 'web')) then
     begin
-      if TFile.Exists(TPath.Combine(Candidate, 'index.html')) then
-      begin
-        CopyDirTree(Candidate, TPath.Combine(BaseDir, 'web'));
-        Writeln('[OK] Deployed web assets from: ', Candidate);
-        Break;
-      end;
+      CopyDirTree(SourceWeb, TPath.Combine(BaseDir, 'web'));
+      Writeln('[OK] Deployed web assets from: ', SourceWeb);
     end;
   end;
 
-
-
-
-
-
-
-
-
-
   if not TFile.Exists(TPath.Combine(BaseDir, 'msquic.dll')) then
   begin
-    Candidates := [
-      TPath.Combine(BaseDir, '..\msquic.dll'),
-      TPath.Combine(BaseDir, '..\..\msquic.dll'),
-      TPath.Combine(GetCurrentDir, 'msquic.dll'),
-      TPath.Combine(GetCurrentDir, 'GTermBox\Win64\Debug\msquic.dll')
-    ];
-    for Candidate in Candidates do
+    var SourceDll := TPath.Combine(GetExeDir, 'msquic.dll');
+    if TFile.Exists(SourceDll) and not SameText(SourceDll, TPath.Combine(BaseDir, 'msquic.dll')) then
     begin
-      if TFile.Exists(Candidate) then
-      begin
-        TFile.Copy(Candidate, TPath.Combine(BaseDir, 'msquic.dll'), True);
-        Writeln('[OK] Copied msquic.dll');
-        Break;
-      end;
+      TFile.Copy(SourceDll, TPath.Combine(BaseDir, 'msquic.dll'), True);
+      Writeln('[OK] Copied msquic.dll');
     end;
   end;
 
   if not TFile.Exists(TPath.Combine(BaseDir, 'ls-qpack.dll')) then
   begin
-    Candidates := [
-      TPath.Combine(BaseDir, '..\ls-qpack.dll'),
-      TPath.Combine(BaseDir, '..\..\ls-qpack.dll'),
-      TPath.Combine(GetCurrentDir, 'ls-qpack.dll'),
-      TPath.Combine(GetCurrentDir, 'GTermBox\Win64\Debug\ls-qpack.dll')
-    ];
-    for Candidate in Candidates do
+    var SourceDll := TPath.Combine(GetExeDir, 'ls-qpack.dll');
+    if TFile.Exists(SourceDll) and not SameText(SourceDll, TPath.Combine(BaseDir, 'ls-qpack.dll')) then
     begin
-      if TFile.Exists(Candidate) then
-      begin
-        TFile.Copy(Candidate, TPath.Combine(BaseDir, 'ls-qpack.dll'), True);
-        Writeln('[OK] Copied ls-qpack.dll');
-        Break;
-      end;
+      TFile.Copy(SourceDll, TPath.Combine(BaseDir, 'ls-qpack.dll'), True);
+      Writeln('[OK] Copied ls-qpack.dll');
     end;
   end;
 
@@ -2316,12 +2421,13 @@ begin
       end;
       ChangePassword(UName, Pwd);
     end
-    else if Cmd = 'delete' then
+    else if (Cmd = 'delete') or (Cmd = 'delete-user') then
     begin
       UName := GetPositionalArg(1);
       if UName = '' then
       begin
         Writeln('[ERROR] Usage: ManageUsers delete <username>');
+        ExitCode := 1;
         Exit;
       end;
       DeleteUser(UName);
@@ -2360,6 +2466,7 @@ begin
       if AppId = '' then
       begin
         Writeln('[ERROR] Usage: ManageUsers delete-app <id>');
+        ExitCode := 1;
         Exit;
       end;
       DeleteApp(AppId);

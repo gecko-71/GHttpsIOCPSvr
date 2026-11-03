@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -357,7 +357,6 @@ var
   LocalLock: TCriticalSection;
   Chunk: TBytes;
 begin
-  LocalQueue := nil;
   LocalLock := FLock;
   if Assigned(LocalLock) then
   begin

@@ -172,6 +172,7 @@ begin
   Status := Api.StreamSend(Stream, @SendCtx.QuicBuffer, 1, SendFlags, SendCtx);
   if QuicFailed(Status) then
   begin
+    Logger.Error(Format('[WT] WTSendOnStream StreamSend failed: 0x%x (Stream=%p)', [Status, Pointer(Stream)]));
     FreeWTSendContextOnError(SendCtx);
   end;
 end;

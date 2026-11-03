@@ -52,8 +52,8 @@ type
 
   TCaseInsensitiveStringComparer = class(TInterfacedObject, IEqualityComparer<string>)
   public
-    function Equals(const Left, Right: string): Boolean;
-    function GetHashCode(const Value: string): Integer;
+    function Equals(const Left, Right: string): Boolean; reintroduce; overload;
+    function GetHashCode(const Value: string): Integer; reintroduce; overload;
   end;
 
   THttpMethod = (hmUnknown, hmGET, hmPOST, hmPUT, hmDELETE, hmHEAD, hmOPTIONS, hmPATCH, hmTRACE, hmCONNECT);
@@ -67,7 +67,7 @@ type
   TValidationLevel = (vlStrict, vlModerate, vlPermissive);
 
   TUriValidator = class
-  private
+  protected
     class function IsUnreserved(C: Char): Boolean;
     class function IsReserved(C: Char): Boolean;
     class function IsGenDelim(C: Char): Boolean;
@@ -87,7 +87,7 @@ type
   end;
 
   THeaderValidator = class
-  private
+  protected
     class function IsValidTokenChar(C: Char): Boolean;
     class function IsValidFieldVChar(C: Char): Boolean;
     class function IsObsText(C: Char): Boolean;
@@ -140,8 +140,9 @@ type
     FValidationLevel: TValidationLevel;
     FContentEncodingHandler: TContentEncodingHandler;
     function NormalizeHeaderName(const HeaderName: string): string;
-    function ParseFoldedHeader(const Lines: TStringList; StartIndex: Integer; out EndIndex: Integer): string;
     function ProcessInternationalHeader(const Value: string): string;
+  protected
+    function ParseFoldedHeader(const Lines: TStringList; StartIndex: Integer; out EndIndex: Integer): string;
     procedure ValidateAndAdd(const Name, Value: string);
     function GetContentLength: string;
     function GetContentType: string;
@@ -285,14 +286,11 @@ type
     FClientCertInfo: TGClientCertInfo;
     procedure ConfigureBodyParserSecurity;
     function GetHeadersSize: Integer;
-    function StartsWithHTTPMethod(const Data: string): Boolean;
-    function IsValidHTTPRequestLine(const RequestLine: string): Boolean;
     function HasExistingThreat(ThreatType: TSecurityThreat): Boolean;
     procedure InitializeBuffers;
     procedure ClearBuffers;
     function FindHeadersEnd(const Buffer: TBytes; Size: Integer): Integer;
     procedure ParseRequestLine(const FirstLine: string);
-    procedure ProcessHeaderLines(const HeaderLines: TStringList);
     procedure ProcessRemainingDataAfterHeaders;
     procedure DetermineBodySize;
     procedure ProcessBodyData(const Data: array of Byte; Size: Integer);
@@ -300,20 +298,24 @@ type
     procedure ProcessRegularBody(const Data: array of Byte; Size: Integer);
     procedure AnalyzeSecurity;
     procedure ApplySecurityMeasures;
-    function AttemptRecovery(const Error: string; const Context: string): Boolean;
-    function RecoverFromMalformedHeader(const HeaderLine: string): string;
-    function RecoverFromOversizeData(var Data: TBytes): Boolean;
-    procedure SkipToNextValidHeader(var HeaderLines: TStringList; var Index: Integer);
     procedure DecompressBodyIfNeeded;
     function GetFinalBodyStream: TMemoryStream;
     procedure SetError(const ErrorMsg: string; Threat: TSecurityThreat = stNone);
     function IsValidHttpMethod(const Method: string): Boolean;
     function IsValidHttpVersion(const Version: string): Boolean;
     function ExtractChunkSize(const ChunkHeader: string): Integer;
-    function SanitizeHeaderLine(const HeaderLine: string): string;
-    function ProcessInternationalContent(const Content: string): string;
     function DetectSlowlorisAttack: Boolean;
     function DetectSlowlorisInCompleteHeaders: Boolean;
+  protected
+    function StartsWithHTTPMethod(const Data: string): Boolean;
+    function IsValidHTTPRequestLine(const RequestLine: string): Boolean;
+    procedure ProcessHeaderLines(const HeaderLines: TStringList);
+    function AttemptRecovery(const Error: string; const Context: string): Boolean;
+    function RecoverFromMalformedHeader(const HeaderLine: string): string;
+    function RecoverFromOversizeData(var Data: TBytes): Boolean;
+    procedure SkipToNextValidHeader(var HeaderLines: TStringList; var Index: Integer);
+    function SanitizeHeaderLine(const HeaderLine: string): string;
+    function ProcessInternationalContent(const Content: string): string;
   public
     constructor Create(ASocket: TSocket; const ARemoteAddr: TSockAddrIn;
                       AMaxHeaderSize: Integer = 32768; AMaxBodySize: Int64 = 8147484123;
@@ -409,7 +411,7 @@ end;
 
 class function TUriValidator.IsUnreserved(C: Char): Boolean;
 begin
-  Result := TCharacter.IsLetterOrDigit(C) or (C = '-') or (C = '.') or (C = '_') or (C = '~');
+  Result := C.IsLetterOrDigit or (C = '-') or (C = '.') or (C = '_') or (C = '~');
 end;
 
 class function TUriValidator.IsReserved(C: Char): Boolean;
@@ -419,12 +421,12 @@ end;
 
 class function TUriValidator.IsGenDelim(C: Char): Boolean;
 begin
-  Result := C in [':', '/', '?', '#', '[', ']', '@'];
+  Result := CharInSet(C, [':', '/', '?', '#', '[', ']', '@']);
 end;
 
 class function TUriValidator.IsSubDelim(C: Char): Boolean;
 begin
-  Result := C in ['!', '$', '&', '''', '(', ')', '*', '+', ',', ';', '='];
+  Result := CharInSet(C, ['!', '$', '&', '''', '(', ')', '*', '+', ',', ';', '=']);
 end;
 
 class function TUriValidator.IsValidScheme(const Scheme: string): Boolean;
@@ -434,11 +436,11 @@ begin
   Result := False;
   if Length(Scheme) = 0 then
     Exit;
-  if not TCharacter.IsLetter(Scheme[1]) then
+  if not Scheme[1].IsLetter then
     Exit;
   for I := 2 to Length(Scheme) do
   begin
-    if not (TCharacter.IsLetterOrDigit(Scheme[I]) or (Scheme[I] in ['+', '-', '.'])) then
+    if not (Scheme[I].IsLetterOrDigit or CharInSet(Scheme[I], ['+', '-', '.'])) then
       Exit;
   end;
   Result := True;
@@ -543,8 +545,7 @@ begin
     Exit(False);
 
   DecodedQuery := TNetEncoding.URL.Decode(Query);
-  if (Pos('..', DecodedQuery) > 0) or
-      THeaderValidator.HasSuspiciousPatterns(DecodedQuery) then
+  if THeaderValidator.HasSuspiciousPatterns(DecodedQuery) then
     Exit(False);
 
   for I := 1 to Length(Query) do
@@ -670,7 +671,6 @@ begin
         Exit;
       end;
     end;
-    AuthorityStart := 0;
     AuthorityEnd := 0;
     if (SchemeEnd > 0) and (SchemeEnd < Length(URI) - 1) and
        (Copy(URI, SchemeEnd + 1, 2) = '//') then
@@ -679,7 +679,7 @@ begin
       AuthorityEnd := AuthorityStart;
 
       while (AuthorityEnd <= Length(URI)) and
-            not (URI[AuthorityEnd] in ['/', '?', '#']) do
+            not CharInSet(URI[AuthorityEnd], ['/', '?', '#']) do
         Inc(AuthorityEnd);
       Dec(AuthorityEnd);
       if AuthorityEnd >= AuthorityStart then
@@ -893,8 +893,8 @@ end;
 
 class function THeaderValidator.IsValidTokenChar(C: Char): Boolean;
 begin
-  Result := TCharacter.IsLetterOrDigit(C) or
-           (C in ['-', '.', '_', '~', '^', '`', '|']);
+  Result := C.IsLetterOrDigit or
+           CharInSet(C, ['-', '.', '_', '~', '^', '`', '|']);
 end;
 
 class function THeaderValidator.IsValidFieldVChar(C: Char): Boolean;
@@ -936,7 +936,7 @@ begin
   begin
     if (Ord(C) < 32) and (C <> #9) then
     begin
-      if not (C in [#10, #13]) then
+      if not CharInSet(C, [#10, #13]) then
       begin
         Result := True;
         Exit;
@@ -1133,7 +1133,7 @@ begin
     C := Value[I];
     if (Ord(C) < 32) and (C <> ' ') and (C <> #9) then
       Continue;
-    if C in [#13, #10, #0] then
+    if CharInSet(C, [#13, #10, #0]) then
       Continue;
     Result := Result + C;
   end;
@@ -1190,7 +1190,7 @@ begin
     Result := (Length(Name) <= 64);
     Exit;
   end;
-  Result := (Length(Name) <= 64) and TCharacter.IsLetter(Name[1]);
+  Result := (Length(Name) <= 64) and Name[1].IsLetter;
 end;
 
 class function THeaderValidator.DetectRequestSmuggling(const Headers: TStringList): TSecurityThreat;
@@ -1635,7 +1635,7 @@ begin
     for I := StartIndex to Lines.Count - 1 do
     begin
       Line := Lines[I];
-      if (Length(Line) > 0) and (Line[1] in [' ', #9]) then
+      if (Length(Line) > 0) and CharInSet(Line[1], [' ', #9]) then
       begin
         if not FirstLine then
           Result := Result + ' ';
@@ -1708,7 +1708,6 @@ var
   IsContentTypeHeader: Boolean;
   IsKnownSafeHeader: Boolean;
   IsAcceptHeader: Boolean;
-  IsFormBoundary: Boolean;
 begin
   try
     IsContentTypeHeader := (LowerCase(Name) = 'content-type');
@@ -2382,8 +2381,8 @@ begin
        FUriValidationErrors.Add('Query string too long (>4096 characters)');
     if Length(FFragment) > 1024 then
        FUriValidationErrors.Add('Fragment too long (>1024 characters)');
-    if (Pos('..', FPath) > 0) or (Pos('..', FRawUri) > 0) or (Pos('%2e%2e', LowerCase(FRawUri)) > 0) or
-       (Pos('%252e', LowerCase(FRawUri)) > 0) or (Pos('%c0%af', LowerCase(FRawUri)) > 0) then
+    if (Pos('..', FPath) > 0) or (Pos('%2e%2e', LowerCase(FPath)) > 0) or
+       (Pos('%252e', LowerCase(FPath)) > 0) or (Pos('%c0%af', LowerCase(FPath)) > 0) then
        FUriValidationErrors.Add('Path traversal attempt detected');
     if (Pos('%00', FRawUri) > 0) or (Pos(#0, FRawUri) > 0) then
        FUriValidationErrors.Add('Null byte injection attempt detected');
@@ -3231,7 +3230,7 @@ begin
     for I := 1 to Length(HexSize) do
     begin
       C := UpCase(HexSize[I]);
-      if not (C in ['0'..'9', 'A'..'F']) then
+      if not CharInSet(C, ['0'..'9', 'A'..'F']) then
         Exit;
     end;
     if Length(HexSize) > 8 then
@@ -3381,15 +3380,14 @@ begin
         FState := rsWaitingHeaders;
       Exit;
     end;
-    var HeadersBlockSize := FHeadersEndPos - 4;
-    var HeadersStr: AnsiString;
-    SetString(HeadersStr, PAnsiChar(FRawBuffer), HeadersBlockSize);
+    var HeadersBlockSize: Integer := FHeadersEndPos - 4;
+    var HeadersStr: string := TEncoding.UTF8.GetString(FRawBuffer, 0, HeadersBlockSize);
     if Pos(#0, HeadersStr) > 0 then
     begin
         SetError('Null byte detected in header block.', stHeaderInjection);
         Exit;
     end;
-    HeaderLines.Text := string(HeadersStr);
+    HeaderLines.Text := HeadersStr;
     SetLength(FHeadersBuffer, HeadersBlockSize);
     if HeadersBlockSize > 0 then
        Move(FRawBuffer[0], FHeadersBuffer[0], HeadersBlockSize);
@@ -3419,7 +3417,7 @@ begin
       begin
         Inc(I); Continue;
       end;
-      if (Length(Line) > 0) and (Line[1] in [' ', #9]) then
+      if (Length(Line) > 0) and CharInSet(Line[1], [' ', #9]) then
       begin
         SetError('Obsolete line folding (obs-fold) is not permitted: ' + Line, stRequestSmuggling);
         Exit;
@@ -3460,9 +3458,6 @@ begin
 end;
 
 class function THeaderValidator.ValidateHeaderValue(const AHeaderName, Value: string; out ErrorMsg: string): Boolean;
-var
-  I: Integer;
-  C: Char;
 begin
   ErrorMsg := '';
   if (Pos(#13, Value) > 0) or (Pos(#10, Value) > 0) then
@@ -3704,7 +3699,6 @@ begin
         ActualDataToProcess := RemainingSpace;
       end;
     end;
-    ProcessedSuccessfully := False;
     if not Assigned(FBodyParser) then
     begin
       if FIsChunkedTransfer then
@@ -3753,7 +3747,7 @@ begin
     if ProcessedSuccessfully then
     begin
       FTotalBytesReceived := FTotalBytesReceived + ActualDataToProcess;
-      var IsBodyComplete := False;
+      var IsBodyComplete: Boolean;
       if Assigned(FBodyParser) then
          IsBodyComplete := FBodyParser.IsComplete
       else if FExpectedBodySize > 0 then
@@ -4151,7 +4145,6 @@ function TRequest.DetectSlowlorisInCompleteHeaders: Boolean;
 var
   HeadersStr: string;
   Lines: TStringList;
-  LastLine: string;
   LineCount: Integer;
   I: Integer;
   HeaderCount: Integer;

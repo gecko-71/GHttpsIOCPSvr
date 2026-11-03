@@ -27,10 +27,16 @@ interface
 
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.StrUtils, System.IOUtils,
-  System.SyncObjs, Quick.Logger, GTerm.ConPty.Loader, GTerm.Types;
+  System.SyncObjs, System.Hash, Quick.Logger, GTerm.ConPty.Loader, GTerm.Types;
 
 const
-  PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE         = $00020016;
+  PROC_THREAD_ATTRIBUTE_HANDLE_LIST          = $00020002;
+  PIPE_ACCESS_INBOUND                         = $00000001;
+  PIPE_ACCESS_OUTBOUND                        = $00000002;
+  PIPE_TYPE_BYTE                              = $00000000;
+  PIPE_READMODE_BYTE                          = $00000000;
+  PIPE_WAIT                                   = $00000000;
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE         = $00020016;
   PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = $00020009;
   EXTENDED_STARTUPINFO_PRESENT                = $00080000;
   ACCESS_ALLOWED_ACE_HEADER_SIZE              = 12;
@@ -67,12 +73,13 @@ type
   TPtyReaderThread = class(TThread)
   private
     FReadPipe: THandle;
+    FStopEvent: THandle;
     FOnData: TDataReceivedEvent;
     FLock: TCriticalSection;
   protected
     procedure Execute; override;
   public
-    constructor Create(AReadPipe: THandle; AOnData: TDataReceivedEvent);
+    constructor Create(AReadPipe: THandle; AStopEvent: THandle; AOnData: TDataReceivedEvent);
     destructor Destroy; override;
     procedure ClearHandler;
   end;
@@ -110,6 +117,7 @@ type
     FAppContainerSid: PSID;
     FAppContainerName: string;
     FStopping: Integer;
+    FStopEvent: THandle;
     FGrantedDirs: TArray<string>;
     procedure CreatePipes;
     procedure ClosePipes;
@@ -158,6 +166,12 @@ function UpdateProcThreadAttribute(
 procedure DeleteProcThreadAttributeList(
   lpAttributeList: PPROC_THREAD_ATTRIBUTE_LIST
 ); stdcall; external kernel32 name 'DeleteProcThreadAttributeList';
+
+function CreateNamedPipeW(lpName: PWideChar; dwOpenMode, dwPipeMode, nMaxInstances, nOutBufferSize, nInBufferSize, nDefaultTimeOut: DWORD; lpSecurityAttributes: PSecurityAttributes): THandle; stdcall; external kernel32 name 'CreateNamedPipeW';
+function CancelIoEx(hFile: THandle; lpOverlapped: POverlapped): BOOL; stdcall; external kernel32 name 'CancelIoEx';
+function ConvertStringSecurityDescriptorToSecurityDescriptorW(StringSecurityDescriptor: PWideChar;
+  StringSDRevision: DWORD; var SecurityDescriptor: Pointer; SecurityDescriptorSize: PULONG): BOOL; stdcall;
+  external advapi32 name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
 
 function CreateProcessExW(
   lpApplicationName: LPCWSTR;
@@ -348,12 +362,13 @@ begin
   Result := Length(ACaps) > 0;
 end;  
 
-constructor TPtyReaderThread.Create(AReadPipe: THandle; AOnData: TDataReceivedEvent);
+constructor TPtyReaderThread.Create(AReadPipe: THandle; AStopEvent: THandle; AOnData: TDataReceivedEvent);
 begin
   inherited Create(False);
   FreeOnTerminate := False;
   FLock := TCriticalSection.Create;
   FReadPipe := AReadPipe;
+  FStopEvent := AStopEvent;
   FOnData := AOnData;
 end;
 
@@ -383,12 +398,43 @@ var
   BytesRead: DWORD;
   DataBytes: TBytes;
   Handler: TDataReceivedEvent;
+  Overlapped: TOverlapped;
+  Events: array[0..1] of THandle;
+  WaitRes: DWORD;
 begin
-  while not Terminated do
-  begin
-    BytesRead := 0;
-    if ReadFile(FReadPipe, Buffer[0], SizeOf(Buffer), BytesRead, nil) then
+  FillChar(Overlapped, SizeOf(Overlapped), 0);
+  Overlapped.hEvent := CreateEvent(nil, True, False, nil);
+  try
+    Events[0] := FStopEvent;
+    Events[1] := Overlapped.hEvent;
+    while not Terminated do
     begin
+      BytesRead := 0;
+      ResetEvent(Overlapped.hEvent);
+      if not ReadFile(FReadPipe, Buffer[0], SizeOf(Buffer), BytesRead, @Overlapped) then
+      begin
+        if GetLastError = ERROR_IO_PENDING then
+        begin
+          WaitRes := WaitForMultipleObjects(2, @Events[0], False, INFINITE);
+          if (WaitRes <> WAIT_OBJECT_0 + 1) or Terminated then
+          begin
+            CancelIoEx(FReadPipe, @Overlapped);
+            Break;
+          end;
+          if not GetOverlappedResult(FReadPipe, Overlapped, BytesRead, False) then
+          begin
+            Logger.Warn(Format('[ConPTY] GetOverlappedResult failed: %d', [GetLastError]));
+            Break;
+          end;
+        end
+        else
+        begin
+          Logger.Warn(Format('[ConPTY] ReadFile failed immediately: %d', [GetLastError]));
+          Break;
+        end;
+      end;
+      
+
       if Terminated then Break;
       if BytesRead > 0 then
       begin
@@ -413,9 +459,10 @@ begin
           end;
         end;
       end;
-    end
-    else
-      Break;
+    end;
+  finally
+    if Overlapped.hEvent <> 0 then
+      CloseHandle(Overlapped.hEvent);
   end;
 end;
 
@@ -499,6 +546,7 @@ begin
   FillChar(FProcessInfo, SizeOf(FProcessInfo), 0);
   FRunning := False;
   FStopping := 0;
+  FStopEvent := CreateEvent(nil, True, False, nil);
   FSandboxMode := smNone;
   FJobHandle := 0;
   FAppContainerSid := nil;
@@ -510,21 +558,93 @@ begin
   FOnDataReceived := nil;
   FOnProcessTerminated := nil;
   StopProcess;
+  if FStopEvent <> 0 then
+  begin
+    CloseHandle(FStopEvent);
+    FStopEvent := 0;
+  end;
   inherited Destroy;
 end;
 
+var
+  GPipeCounter: Integer = 0;
+
 procedure TGTermConPty.CreatePipes;
+var
+  Sa: TSecurityAttributes;
+  PipeInName, PipeOutName: string;
+  UniqueId: Integer;
+  PipeSd: Pointer;
 begin
-  CreatePipe(FInputRead, FInputWrite, nil, 0);
-  CreatePipe(FOutputRead, FOutputWrite, nil, 0);
+  PipeSd := nil;
+  FillChar(Sa, SizeOf(Sa), 0);
+  Sa.nLength := SizeOf(Sa);
+  Sa.bInheritHandle := True;
+  if ConvertStringSecurityDescriptorToSecurityDescriptorW(PWideChar('D:(A;;GA;;;WD)(A;;GA;;;AC)'), 1, PipeSd, nil) then
+    Sa.lpSecurityDescriptor := PipeSd;
+  try
+    UniqueId := TInterlocked.Increment(GPipeCounter);
+    PipeInName := Format('\\.\pipe\GTermBox_PTY_In_%d_%d_%d', [GetCurrentProcessId, GetTickCount, UniqueId]);
+    PipeOutName := Format('\\.\pipe\GTermBox_PTY_Out_%d_%d_%d', [GetCurrentProcessId, GetTickCount, UniqueId]);
+
+    FInputRead := CreateNamedPipeW(
+      PWideChar(PipeInName),
+      PIPE_ACCESS_INBOUND,
+      PIPE_TYPE_BYTE or PIPE_READMODE_BYTE or PIPE_WAIT,
+      1,
+      1024 * 1024,
+      1024 * 1024,
+      0,
+      @Sa
+    );
+    FInputWrite := CreateFileW(
+      PWideChar(PipeInName),
+      GENERIC_WRITE,
+      0,
+      @Sa,
+      OPEN_EXISTING,
+      0,
+      0
+    );
+
+    FOutputRead := CreateNamedPipeW(
+      PWideChar(PipeOutName),
+      PIPE_ACCESS_INBOUND or FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_BYTE or PIPE_READMODE_BYTE or PIPE_WAIT,
+      1,
+      1024 * 1024,
+      1024 * 1024,
+      0,
+      @Sa
+    );
+    FOutputWrite := CreateFileW(
+      PWideChar(PipeOutName),
+      GENERIC_WRITE,
+      0,
+      @Sa,
+      OPEN_EXISTING,
+      0,
+      0
+    );
+
+    SetHandleInformation(FInputRead, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(FOutputWrite, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+  finally
+    if PipeSd <> nil then
+      LocalFree(HLOCAL(PipeSd));
+  end;
 end;
 
 procedure TGTermConPty.ClosePipes;
 begin
+  if FStopEvent <> 0 then
+    SetEvent(FStopEvent);
+  if FOutputRead <> 0 then
+    CancelIoEx(FOutputRead, nil);
   if FInputRead <> 0 then begin CloseHandle(FInputRead); FInputRead := 0; end;
   if FInputWrite <> 0 then begin CloseHandle(FInputWrite); FInputWrite := 0; end;
-  if FOutputRead <> 0 then begin CloseHandle(FOutputRead); FOutputRead := 0; end;
   if FOutputWrite <> 0 then begin CloseHandle(FOutputWrite); FOutputWrite := 0; end;
+  if FOutputRead <> 0 then begin CloseHandle(FOutputRead); FOutputRead := 0; end;
 end;
 
 procedure TGTermConPty.SetupJobSandbox;
@@ -560,10 +680,6 @@ begin
   CpuInfo.CpuRate := 5000;
   SetInformationJobObject(FJobHandle, 6, @CpuInfo, SizeOf(CpuInfo));
 end;
-
-function ConvertStringSecurityDescriptorToSecurityDescriptorW(StringSecurityDescriptor: PWideChar;
-  StringSDRevision: DWORD; var SecurityDescriptor: Pointer; SecurityDescriptorSize: PULONG): BOOL; stdcall;
-  external advapi32 name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
 
 const
   SANDBOX_DESKTOP_NAME = 'GTermBoxSandbox';
@@ -663,7 +779,17 @@ begin
 
         if SetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT,
              DACL_SECURITY_INFORMATION, nil, nil, NewDacl, nil) = 0 then
-          Logger.Info(Format('[ConPTY] Granted AppContainer access to: %s', [ADir]))
+        begin
+          Logger.Info(Format('[ConPTY] Granted AppContainer access to: %s', [ADir]));
+          var FoundDir := False;
+          for var G in FGrantedDirs do
+            if SameText(G, ADir) then begin FoundDir := True; Break; end;
+          if not FoundDir then
+          begin
+            SetLength(FGrantedDirs, Length(FGrantedDirs) + 1);
+            FGrantedDirs[High(FGrantedDirs)] := ADir;
+          end;
+        end
         else
           Logger.Warn(Format('[ConPTY] SetNamedSecurityInfo failed for: %s', [ADir]));
       finally
@@ -751,8 +877,8 @@ var
   ExtraDir: string;
   CapsPtr: Pointer;
   CapsCount: DWORD;
+  PathHash: string;
 begin
-  Result := False;
   var Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(AWorkingDir));
   var SafeLeaf := '';
   for var Ch in Leaf do
@@ -760,7 +886,9 @@ begin
       SafeLeaf := SafeLeaf + Ch;
   if SafeLeaf = '' then
     SafeLeaf := Copy(TGUID.NewGuid.ToString, 2, 36);
-  ContainerName := 'GTermBox.' + SafeLeaf;
+
+  PathHash := Copy(THashSHA2.GetHashString(TPath.GetFullPath(AWorkingDir)), 1, 12);
+  ContainerName := 'GTermBox.' + SafeLeaf + '.' + PathHash;
   FAppContainerName := ContainerName;
 
   CapsPtr := nil;
@@ -786,15 +914,15 @@ begin
     begin
       Logger.Error(Format('[ConPTY] DeriveAppContainerSid failed: 0x%x', [Hr]));
       FAppContainerName := '';
-      Exit;
+      Exit(False);
     end;
     Logger.Info(Format('[ConPTY] AppContainer profile reused: %s', [ContainerName]));
   end
   else if FAILED(Hr) then
   begin
-    Logger.Error(Format('[ConPTY] CreateAppContainerProfile failed: 0x%x — falling back to no sandbox', [Hr]));
+    Logger.Error(Format('[ConPTY] CreateAppContainerProfile failed: 0x%x', [Hr]));
     FAppContainerName := '';
-    Exit;
+    Exit(False);
   end
   else
     Logger.Info(Format('[ConPTY] AppContainer profile created: %s', [ContainerName]));
@@ -860,6 +988,8 @@ begin
 end;
 
 procedure TGTermConPty.CleanupSandbox;
+var
+  D: string;
 begin
   if FJobHandle <> 0 then
   begin
@@ -869,7 +999,10 @@ begin
 
   if FAppContainerSid <> nil then
   begin
+    for D in FGrantedDirs do
+      RevokeDirAccessFromAppContainer(D);
     SetLength(FGrantedDirs, 0);
+
     FreeSid(FAppContainerSid);
     FAppContainerSid := nil;
   end;
@@ -1206,29 +1339,28 @@ function TGTermConPty.StartProcess(const ACommandLine: string; const AWorkingDir
 var
   Size: COORD;
   Hr: HRESULT;
-  AttrCount: DWORD;
   AttrSize: SIZE_T;
   AttrList: PPROC_THREAD_ATTRIBUTE_LIST;
   SiEx: TStartupInfoExW;
   CmdLineBuf: array[0..32767] of WideChar;
   WorkingDirPtr: PWideChar;
+  ExeDir: string;
+  CleanCmd: string;
+  PQuote, PSpace: Integer;
+  NetCaps: TArray<SID_AND_ATTRIBUTES>;
   SecCap: SECURITY_CAPABILITIES;
   UseAppContainer: Boolean;
-  CreationFlags: DWORD;
-  CleanCmd: string;
-  ExeDir: string;
-  PQuote, PSpace: Integer;
-  EnvBlock: string;
-  EnvPtr: PWideChar;
-  NetCaps: TArray<SID_AND_ATTRIBUTES>;
   DesktopPath: string;
+  CreationFlags: DWORD;
+  EnvBlock: string;
+  EnvPtr: Pointer;
+  AttrCount: DWORD;
+  InheritedHandles: array[0..1] of THandle;
 begin
   Result := False;
-  if FSandboxMode = smInvalid then Exit(False);
-  StopProcess;
-  FStopping := 0;
+  if FRunning then Exit;
 
-  Logger.Info(Format('[ConPTY] Starting: %s (size: %dx%d) sandbox=%d',
+  Logger.Info(Format('[ConPTY] Starting process: "%s" (Cols=%d, Rows=%d, Sandbox=%d)',
     [ACommandLine, FCols, FRows, Ord(FSandboxMode)]));
 
   CreatePipes;
@@ -1241,7 +1373,7 @@ begin
   begin
     Logger.Error(Format('[ConPTY] CreatePseudoConsole failed: 0x%x', [Hr]));
     ClosePipes;
-    Exit;
+    Exit(False);
   end;
 
   SetLength(NetCaps, 0);
@@ -1265,12 +1397,25 @@ begin
     end;
     ExeDir := ExtractFilePath(CleanCmd);
 
-    UseAppContainer := (FSandboxMode = smStandard) and
-                       SetupAppContainer(AWorkingDir, ExeDir, AAllowedDirsRead, AAllowedDirsWrite, NetCaps);
+    if FSandboxMode = smStandard then
+    begin
+      if not SetupAppContainer(AWorkingDir, ExeDir, AAllowedDirsRead, AAllowedDirsWrite, NetCaps) then
+      begin
+        Logger.Error('[ConPTY] AppContainer setup failed. Aborting process creation (Fail-Closed).');
+        ClosePipes;
+        Exit(False);
+      end;
+      UseAppContainer := True;
+    end
+    else
+      UseAppContainer := False;
 
-    AttrCount := 1;
+    InheritedHandles[0] := FInputRead;
+    InheritedHandles[1] := FOutputWrite;
+
+    AttrCount := 2;
     if UseAppContainer then
-      AttrCount := 2;
+      Inc(AttrCount);
 
     AttrSize := 0;
     InitializeProcThreadAttributeList(nil, AttrCount, 0, AttrSize);
@@ -1279,14 +1424,24 @@ begin
       if not InitializeProcThreadAttributeList(AttrList, AttrCount, 0, AttrSize) then
       begin
         Logger.Error(Format('[ConPTY] InitializeProcThreadAttributeList failed: %d', [GetLastError]));
-        Exit;
+        ClosePipes;
+        Exit(False);
       end;
 
       if not UpdateProcThreadAttribute(AttrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
            Pointer(FHPty), SizeOf(HPCON), nil, nil) then
       begin
         Logger.Error(Format('[ConPTY] UpdateProcThreadAttribute (ConPTY) failed: %d', [GetLastError]));
-        Exit;
+        ClosePipes;
+        Exit(False);
+      end;
+
+      if not UpdateProcThreadAttribute(AttrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+           @InheritedHandles[0], Length(InheritedHandles) * SizeOf(THandle), nil, nil) then
+      begin
+        Logger.Error(Format('[ConPTY] UpdateProcThreadAttribute (HandleList) failed: %d', [GetLastError]));
+        ClosePipes;
+        Exit(False);
       end;
 
       if UseAppContainer then
@@ -1307,16 +1462,20 @@ begin
         if not UpdateProcThreadAttribute(AttrList, 0,
              PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
              @SecCap, SizeOf(SecCap), nil, nil) then
-          Logger.Warn(Format('[ConPTY] UpdateProcThreadAttribute (AppContainer) failed: %d — running without AppContainer', [GetLastError]));
+        begin
+          Logger.Error(Format('[ConPTY] UpdateProcThreadAttribute (AppContainer) failed: %d', [GetLastError]));
+          ClosePipes;
+          Exit(False);
+        end;
       end;
 
       FillChar(SiEx, SizeOf(SiEx), 0);
       SiEx.StartupInfo.cb := SizeOf(TStartupInfoExW);
-      SiEx.lpAttributeList := AttrList;
       SiEx.StartupInfo.dwFlags := STARTF_USESTDHANDLES;
       SiEx.StartupInfo.hStdInput := 0;
       SiEx.StartupInfo.hStdOutput := 0;
       SiEx.StartupInfo.hStdError := 0;
+      SiEx.lpAttributeList := AttrList;
 
       DesktopPath := '';
       if UseAppContainer then
@@ -1334,12 +1493,9 @@ begin
         WorkingDirPtr := nil;
 
       SetErrorMode(SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or SEM_NOOPENFILEERRORBOX);
-      CreationFlags := EXTENDED_STARTUPINFO_PRESENT;
+      CreationFlags := EXTENDED_STARTUPINFO_PRESENT or CREATE_SUSPENDED or CREATE_UNICODE_ENVIRONMENT;
 
-      EnvBlock := '';
-      EnvPtr := nil;
       EnvBlock := BuildSandboxEnvironment(AWorkingDir, AEnvironmentVars);
-      CreationFlags := CreationFlags or CREATE_UNICODE_ENVIRONMENT;
       EnvPtr := PWideChar(EnvBlock);
 
       SetConsoleCtrlHandler(nil, False);
@@ -1349,7 +1505,7 @@ begin
           CmdLineBuf,
           nil,
           nil,
-          False,
+          True,
           CreationFlags,
           EnvPtr,
           WorkingDirPtr,
@@ -1384,15 +1540,27 @@ begin
     FRunning := True;
 
     if (FSandboxMode = smStandard) or (FSandboxMode = smJobOnly) then
+    begin
       SetupJobSandbox;
+      if (FJobHandle = 0) or not AssignProcessToJobObject(FJobHandle, FProcessInfo.hProcess) then
+      begin
+        Logger.Error(Format('[ConPTY] Failed to assign process to Job Object (LastError: %d). Terminating.', [GetLastError]));
+        TerminateProcess(FProcessInfo.hProcess, 1);
+        CloseHandle(FProcessInfo.hProcess);
+        CloseHandle(FProcessInfo.hThread);
+        FillChar(FProcessInfo, SizeOf(FProcessInfo), 0);
+        CleanupSandbox;
+        StopProcess;
+        Exit(False);
+      end;
+    end;
 
-    if FJobHandle <> 0 then
-      AssignProcessToJobObject(FJobHandle, FProcessInfo.hProcess);
+    ResumeThread(FProcessInfo.hThread);
 
     if FInputRead <> 0 then begin CloseHandle(FInputRead); FInputRead := 0; end;
     if FOutputWrite <> 0 then begin CloseHandle(FOutputWrite); FOutputWrite := 0; end;
 
-    FReaderThread := TPtyReaderThread.Create(FOutputRead, FOnDataReceived);
+    FReaderThread := TPtyReaderThread.Create(FOutputRead, FStopEvent, FOnDataReceived);
     FWatcherThread := TProcessWatcherThread.Create(FProcessInfo.hProcess, FOnProcessTerminated);
   end
   else
@@ -1411,6 +1579,11 @@ begin
   if TInterlocked.CompareExchange(FStopping, 1, 0) <> 0 then Exit;
   if not FRunning and (FHPty = 0) then Exit;
   FRunning := False;
+
+  if FStopEvent <> 0 then
+    SetEvent(FStopEvent);
+  if FOutputRead <> 0 then
+    CancelIoEx(FOutputRead, nil);
 
   if Assigned(FReaderThread) then
     FReaderThread.ClearHandler;

@@ -1,4 +1,4 @@
-﻿program GTermBoxServer;
+program GTermBoxServer;
 
 {$APPTYPE CONSOLE}
 
@@ -15,6 +15,9 @@ uses
   System.JSON,
   System.SyncObjs,
   System.Generics.Collections,
+  System.StrUtils,
+  System.NetEncoding,
+  Quic.Server in 'GHttpsIOCPSvr\Http3DelphiV3\Quic.Server.pas',
   Winapi.Windows,
   Winapi.Winsock2,
   GTerm.Types in 'src\GTerm.Types.pas',
@@ -54,6 +57,7 @@ const
 type
   TPendingSession = record
     Username: string;
+    Role: string;
     ClientIP: string;
     SandboxDir: string;
     AppKey: string;
@@ -111,6 +115,7 @@ var
   HttpsPortParam: Word;
   GmTLSMode: TmTLSMode = mtlsDisabled;
   GmTLSCaCertPath: string = '';
+  GAllowTestCA: Boolean = False;
   GmTLSPinnedThumbprint: string = '';
   GTrustedClientsDir: string = '';
   GBindAddress: string = '';
@@ -147,6 +152,7 @@ function BCryptGenRandom(hAlgorithm: THandle; pbBuffer: PByte; cbBuffer: ULONG; 
 const
   FILE_NAME_NORMALIZED = $0;
   VOLUME_NAME_DOS      = $0;
+  PATHCCH_DO_NOT_NORMALIZE_SEGMENTS = $00000008;
 
 function GetFinalPathNameByHandleW(
   hFile: THandle;
@@ -155,16 +161,31 @@ function GetFinalPathNameByHandleW(
   dwFlags: DWORD
 ): DWORD; stdcall; external kernel32 name 'GetFinalPathNameByHandleW';
 
+function GetLongPathNameW(
+  lpszShortPath, lpszLongPath: PWideChar;
+  cchBuffer: DWORD
+): DWORD; stdcall; external kernel32 name 'GetLongPathNameW';
+
+function PathCchCanonicalizeEx(
+  pszPathOut: PWideChar;
+  cchPathOut: SIZE_T;
+  pszPathIn: PWideChar;
+  dwFlags: ULONG
+): HRESULT; stdcall; external 'kernelbase.dll' name 'PathCchCanonicalizeEx';
+
 var
   GSecretPathPrefix: string = '';
 
-function GetDirectoryTotalSize(const ADir: string): Int64;
+{$WARN SYMBOL_PLATFORM OFF}
+function GetDirectoryTotalSize(const ADir: string; ADepth: Integer = 0): Int64;
 var
   Rec: TSearchRec;
   Path: string;
+  ItemPath: string;
+  ItemAttr: DWORD;
 begin
   Result := 0;
-  if not TDirectory.Exists(ADir) then
+  if (ADepth >= 32) or not TDirectory.Exists(ADir) then
     Exit;
   Path := IncludeTrailingPathDelimiter(ADir);
   if FindFirst(Path + '*', faAnyFile, Rec) = 0 then
@@ -173,16 +194,123 @@ begin
       repeat
         if (Rec.Name <> '.') and (Rec.Name <> '..') then
         begin
-          if (Rec.Attr and faDirectory) <> 0 then
-            Inc(Result, GetDirectoryTotalSize(Path + Rec.Name))
-          else
-            Inc(Result, Rec.Size);
+          ItemPath := Path + Rec.Name;
+          ItemAttr := GetFileAttributesW(PWideChar(ItemPath));
+          if (ItemAttr <> INVALID_FILE_ATTRIBUTES) and
+             ((ItemAttr and FILE_ATTRIBUTE_REPARSE_POINT) = 0) and
+             ((Rec.Attr and faSymLink) = 0) then
+          begin
+            if ((Rec.Attr and faDirectory) <> 0) and ((ItemAttr and FILE_ATTRIBUTE_DIRECTORY) <> 0) then
+              Inc(Result, GetDirectoryTotalSize(ItemPath, ADepth + 1))
+            else if (ItemAttr and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+              Inc(Result, Rec.Size);
+          end;
         end;
       until FindNext(Rec) <> 0;
     finally
       System.SysUtils.FindClose(Rec);
     end;
   end;
+end;
+{$WARN SYMBOL_PLATFORM ON}
+
+type
+  TQuotaReservationManager = class
+  private
+    FLock: TCriticalSection;
+    FReservations: TDictionary<string, Int64>;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function TryReserve(const AUserKey: string; ABytes: Int64; AMaxQuota: Int64; const ADirPath: string): Boolean;
+    procedure Release(const AUserKey: string; ABytes: Int64);
+  end;
+
+var
+  GlobalQuotaManager: TQuotaReservationManager = nil;
+
+constructor TQuotaReservationManager.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FReservations := TDictionary<string, Int64>.Create;
+end;
+
+destructor TQuotaReservationManager.Destroy;
+begin
+  FReservations.Free;
+  FLock.Free;
+  inherited Destroy;
+end;
+
+function TQuotaReservationManager.TryReserve(const AUserKey: string; ABytes: Int64; AMaxQuota: Int64; const ADirPath: string): Boolean;
+var
+  CurrentReserved: Int64;
+  CurrentDiskUsed: Int64;
+  Key: string;
+begin
+  if AMaxQuota <= 0 then
+    Exit(True);
+  Key := LowerCase(AUserKey);
+  FLock.Enter;
+  try
+    if not FReservations.TryGetValue(Key, CurrentReserved) then
+      CurrentReserved := 0;
+    CurrentDiskUsed := GetDirectoryTotalSize(ADirPath);
+    if CurrentDiskUsed + CurrentReserved + ABytes > AMaxQuota then
+      Exit(False);
+    FReservations.AddOrSetValue(Key, CurrentReserved + ABytes);
+    Result := True;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TQuotaReservationManager.Release(const AUserKey: string; ABytes: Int64);
+var
+  CurrentReserved: Int64;
+  Key: string;
+begin
+  if ABytes <= 0 then
+    Exit;
+  Key := LowerCase(AUserKey);
+  FLock.Enter;
+  try
+    if FReservations.TryGetValue(Key, CurrentReserved) then
+    begin
+      CurrentReserved := CurrentReserved - ABytes;
+      if CurrentReserved <= 0 then
+        FReservations.Remove(Key)
+      else
+        FReservations.AddOrSetValue(Key, CurrentReserved);
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function ExpandPathLongNames(const APath: string): string;
+var
+  Buf: array[0..32767] of WideChar;
+  Len: DWORD;
+begin
+  Len := GetLongPathNameW(PWideChar(APath), @Buf[0], Length(Buf));
+  if (Len > 0) and (Len < DWORD(Length(Buf))) then
+    SetString(Result, PWideChar(@Buf[0]), Len)
+  else
+    Result := APath;
+end;
+
+function CanonicalizePathCch(const APath: string): string;
+var
+  Buf: array[0..32767] of WideChar;
+  Hr: HRESULT;
+begin
+  Hr := PathCchCanonicalizeEx(@Buf[0], Length(Buf), PWideChar(APath), PATHCCH_DO_NOT_NORMALIZE_SEGMENTS);
+  if Hr = S_OK then
+    Result := string(Buf)
+  else
+    Result := TPath.GetFullPath(APath);
 end;
 
 function NormalizeCanonicalPath(const APath: string): string;
@@ -197,6 +325,17 @@ begin
   Result := LowerCase(ExcludeTrailingPathDelimiter(S));
 end;
 
+function IsSameDirectoryOrRoot(const APath1, APath2: string): Boolean;
+var
+  Norm1, Norm2: string;
+begin
+  if (APath1 = '') or (APath2 = '') then
+    Exit(False);
+  Norm1 := NormalizeCanonicalPath(TPath.GetFullPath(APath1));
+  Norm2 := NormalizeCanonicalPath(TPath.GetFullPath(APath2));
+  Result := SameFileName(Norm1, Norm2) or (Norm1 = Norm2);
+end;
+
 function IsPathInSandboxCanonical(const AFilePath, ASandboxDir: string): Boolean;
 var
   H: THandle;
@@ -204,9 +343,18 @@ var
   Len: DWORD;
   FinalPathStr, CanonicalSandbox, CheckTarget: string;
   ParentDir: string;
+  ColonPos: Integer;
 begin
-  CanonicalSandbox := NormalizeCanonicalPath(TPath.GetFullPath(ASandboxDir));
-  CheckTarget := AFilePath;
+  ColonPos := Pos(':', AFilePath);
+  if ColonPos > 0 then
+  begin
+    if not ((ColonPos = 2) and (Length(AFilePath) >= 2) and (PosEx(':', AFilePath, 3) = 0)) then
+      Exit(False);
+  end;
+
+  CanonicalSandbox := NormalizeCanonicalPath(CanonicalizePathCch(ExpandPathLongNames(TPath.GetFullPath(ASandboxDir))));
+  CheckTarget := CanonicalizePathCch(ExpandPathLongNames(TPath.GetFullPath(AFilePath)));
+
   var TargetAttr: DWORD := GetFileAttributesW(PWideChar(CheckTarget));
   if (TargetAttr <> INVALID_FILE_ATTRIBUTES) and ((TargetAttr and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
   begin
@@ -264,6 +412,7 @@ begin
   if ParentDir <> '' then
   begin
     ParentDir := ExcludeTrailingPathDelimiter(ParentDir);
+    ParentDir := ExpandPathLongNames(ParentDir);
     if DirectoryExists(ParentDir) then
     begin
       H := CreateFileW(
@@ -292,7 +441,7 @@ begin
     end;
   end;
 
-  FinalPathStr := NormalizeCanonicalPath(TPath.GetFullPath(CheckTarget));
+  FinalPathStr := NormalizeCanonicalPath(CheckTarget);
   Result := (FinalPathStr = CanonicalSandbox) or FinalPathStr.StartsWith(CanonicalSandbox + '\', True);
 end;
 
@@ -405,6 +554,53 @@ begin
       end;
     end;
   end;
+end;
+
+function ParseUrlQueryParams(const AUrl: string): TDictionary<string, string>;
+var
+  QPos, HashPos: Integer;
+  QueryStr, Pair, Key, Val: string;
+  Pairs: TArray<string>;
+  EqPos: Integer;
+begin
+  Result := TDictionary<string, string>.Create;
+  QPos := Pos('?', AUrl);
+  if QPos <= 0 then
+    Exit;
+  QueryStr := Copy(AUrl, QPos + 1, MaxInt);
+  HashPos := Pos('#', QueryStr);
+  if HashPos > 0 then
+    QueryStr := Copy(QueryStr, 1, HashPos - 1);
+  if QueryStr = '' then
+    Exit;
+  Pairs := QueryStr.Split(['&']);
+  for Pair in Pairs do
+  begin
+    if Pair = '' then
+      Continue;
+    EqPos := Pos('=', Pair);
+    if EqPos > 0 then
+    begin
+      Key := Copy(Pair, 1, EqPos - 1);
+      Val := Copy(Pair, EqPos + 1, MaxInt);
+    end
+    else
+    begin
+      Key := Pair;
+      Val := '';
+    end;
+    Key := LowerCase(Trim(TNetEncoding.URL.Decode(Key)));
+    Val := Trim(TNetEncoding.URL.Decode(Val));
+    if Key <> '' then
+      Result.AddOrSetValue(Key, Val);
+  end;
+end;
+
+function GetWTSessionPeerIP(Session: PWTSessionContext): string;
+begin
+  Result := '';
+  if (Session <> nil) and (Session^.ConnCtx <> nil) then
+    Result := PConnectionContext(Session^.ConnCtx)^.RemoteIP;
 end;
 
 function ResolveAppProfile(const APathOrQuery: string; const ASandboxDir: string = ''; const AUsername: string = ''): TGTermAppProfile;
@@ -604,6 +800,93 @@ begin
   Result := ExtractHostWithoutPort(S);
 end;
 
+function ExtractHostAndPort(const AOriginOrHost: string): string;
+var
+  S: string;
+  SlashPos: Integer;
+begin
+  S := Trim(AOriginOrHost);
+  if StartsText('https://', S) then
+    S := Copy(S, 9, MaxInt)
+  else if StartsText('http://', S) then
+    S := Copy(S, 8, MaxInt)
+  else if StartsText('wss://', S) then
+    S := Copy(S, 7, MaxInt)
+  else if StartsText('ws://', S) then
+    S := Copy(S, 6, MaxInt);
+  SlashPos := S.IndexOf('/');
+  if SlashPos >= 0 then
+    S := S.Substring(0, SlashPos);
+  Result := Trim(S);
+end;
+
+function IsOriginMatch(const AOrigin, AAllowed: string): Boolean;
+var
+  CleanOrig, CleanAllow: string;
+  OrigScheme, AllowScheme: string;
+  OrigHostPort, AllowHostPort: string;
+begin
+  Result := False;
+  CleanOrig := Trim(AOrigin);
+  CleanAllow := Trim(AAllowed);
+  if (CleanOrig = '') or (CleanAllow = '') then Exit;
+
+  if CleanAllow = '*' then Exit(True);
+
+  if SameText(CleanOrig, CleanAllow) then Exit(True);
+  if SameText(ExcludeTrailingPathDelimiter(CleanOrig), ExcludeTrailingPathDelimiter(CleanAllow)) then Exit(True);
+
+  OrigScheme := '';
+  if StartsText('https://', CleanOrig) then
+    OrigScheme := 'https'
+  else if StartsText('http://', CleanOrig) then
+    OrigScheme := 'http'
+  else if StartsText('wss://', CleanOrig) then
+    OrigScheme := 'wss'
+  else if StartsText('ws://', CleanOrig) then
+    OrigScheme := 'ws';
+
+  AllowScheme := '';
+  if StartsText('https://', CleanAllow) then
+    AllowScheme := 'https'
+  else if StartsText('http://', CleanAllow) then
+    AllowScheme := 'http'
+  else if StartsText('wss://', CleanAllow) then
+    AllowScheme := 'wss'
+  else if StartsText('ws://', CleanAllow) then
+    AllowScheme := 'ws';
+
+  if (AllowScheme <> '') and not SameText(OrigScheme, AllowScheme) then
+    Exit(False);
+
+  OrigHostPort := ExtractHostAndPort(CleanOrig);
+  AllowHostPort := ExtractHostAndPort(CleanAllow);
+
+  if SameText(OrigHostPort, AllowHostPort) then
+    Exit(True);
+
+  if (Pos(':', AllowHostPort) = 0) and SameText(ExtractHostWithoutPort(OrigHostPort), AllowHostPort) then
+    Exit(True);
+end;
+
+function IsOriginAllowed(const AOrigin: string): Boolean;
+var
+  EnvAllowed: string;
+begin
+  Result := False;
+  EnvAllowed := Trim(GetEnvironmentVariable('ALLOWED_ORIGINS'));
+  if EnvAllowed = '' then Exit;
+  if EnvAllowed = '*' then Exit(True);
+
+  for var Item in EnvAllowed.Split([',', ';']) do
+  begin
+    var CleanItem := Trim(Item);
+    if CleanItem = '' then Continue;
+    if IsOriginMatch(AOrigin, CleanItem) then
+      Exit(True);
+  end;
+end;
+
 function IsValidIPAddress(const AHost: string): Boolean;
 var
   H: string;
@@ -692,7 +975,7 @@ end;
 function IsAllowedRequestOrigin(const ARequest: TRequest): Boolean;
 var
   OriginHdr, LowOrigin, HostHdr, HostNoPort, FwdHost, FwdNoPort: string;
-  OriginHost, LocalIP: string;
+  OriginHost, LocalIP, EnvAllowed: string;
 begin
   OriginHdr := Trim(ARequest.Headers.GetHeader('Origin'));
   if OriginHdr = '' then
@@ -701,6 +984,10 @@ begin
   LowOrigin := LowerCase(OriginHdr);
   if LowOrigin = 'null' then
     Exit(False);
+
+  EnvAllowed := Trim(GetEnvironmentVariable('ALLOWED_ORIGINS'));
+  if EnvAllowed <> '' then
+    Exit(IsOriginAllowed(OriginHdr));
 
   OriginHost := ExtractHostFromOrigin(LowOrigin);
   if OriginHost = '' then
@@ -728,25 +1015,30 @@ begin
   if (LocalIP <> '') and (SameText(OriginHost, LocalIP) or (OriginHost = '[' + LocalIP + ']') or AreIPAddressesMatching(OriginHost, LocalIP)) then
     Exit(True);
 
-
-
-  var EnvAllowed := GetEnvironmentVariable('ALLOWED_ORIGINS');
-  if EnvAllowed <> '' then
-  begin
-    if (EnvAllowed = '*') or (Pos(LowerCase(OriginHost), LowerCase(EnvAllowed)) > 0) then
-      Exit(True);
-  end;
-
   Result := False;
+end;
+
+procedure ApplyCorsHeaders(const ARequest: TRequest; const AResponse: TResponse; const AAllowedMethods: string = 'GET, POST, OPTIONS');
+var
+  ReqOrigin: string;
+begin
+  ReqOrigin := Trim(ARequest.Headers.GetHeader('Origin'));
+  if (ReqOrigin <> '') and IsAllowedRequestOrigin(ARequest) then
+  begin
+    AResponse.AddHeader('Access-Control-Allow-Origin', ReqOrigin);
+    AResponse.AddHeader('Vary', 'Origin');
+    AResponse.AddHeader('Access-Control-Allow-Credentials', 'true');
+  end;
+  AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  AResponse.AddHeader('Access-Control-Allow-Methods', AAllowedMethods);
 end;
 
 function HasForbiddenFileNameChars(const AName: string): Boolean;
 var
   Ch: Char;
 begin
-  if AName = '' then
-    Exit(True);
-  if (AName[Length(AName)] = '.') or (AName[Length(AName)] = ' ') then
+  if (AName = '') or (Pos(':', AName) > 0) or (Pos('/', AName) > 0) or (Pos('\', AName) > 0) or
+     (Pos(#0, AName) > 0) or (Pos('..', AName) > 0) or (AName.EndsWith('.')) or (AName.EndsWith(' ')) then
     Exit(True);
   for Ch in AName do
   begin
@@ -758,17 +1050,42 @@ end;
 
 function IsForbiddenUploadExtension(const AName: string): Boolean;
 var
-  Ext: string;
+  Ext, LowerName: string;
+  Parts: TArray<string>;
+  P: string;
 begin
-  Ext := LowerCase(ExtractFileExt(AName));
-  Result := (Ext = '.cmd') or (Ext = '.bat') or (Ext = '.ps1') or (Ext = '.psm1') or
-            (Ext = '.psd1') or (Ext = '.exe') or (Ext = '.dll') or (Ext = '.com') or
-            (Ext = '.vbs') or (Ext = '.hta') or (Ext = '.scr') or (Ext = '.pif');
+  LowerName := LowerCase(AName);
+  if (LowerName = '') or (LowerName.EndsWith('.')) or (LowerName.EndsWith(' ')) or (Pos(':', LowerName) > 0) then
+    Exit(True);
+
+  Ext := ExtractFileExt(LowerName);
+  if (Ext = '.exe') or (Ext = '.dll') or (Ext = '.com') or (Ext = '.scr') or (Ext = '.pif') or
+     (Ext = '.sys') or (Ext = '.drv') or (Ext = '.ocx') or (Ext = '.cpl') or (Ext = '.msc') or
+     (Ext = '.bat') or (Ext = '.cmd') or (Ext = '.ps1') or (Ext = '.psm1') or (Ext = '.psd1') or (Ext = '.ps1xml') or
+     (Ext = '.vbs') or (Ext = '.vbe') or (Ext = '.js') or (Ext = '.jse') or (Ext = '.wsf') or (Ext = '.wsh') or (Ext = '.hta') or
+     (Ext = '.msi') or (Ext = '.msp') or (Ext = '.mst') or (Ext = '.lnk') or (Ext = '.inf') or (Ext = '.reg') or
+     (Ext = '.py') or (Ext = '.pyw') or (Ext = '.rb') or (Ext = '.pl') or (Ext = '.sh') or (Ext = '.bash') or (Ext = '.jar') then
+    Exit(True);
+
+  Parts := LowerName.Split(['.']);
+  if Length(Parts) > 2 then
+  begin
+    for P in Parts do
+    begin
+      if (P = 'exe') or (P = 'dll') or (P = 'com') or (P = 'scr') or (P = 'pif') or
+         (P = 'bat') or (P = 'cmd') or (P = 'ps1') or (P = 'vbs') or (P = 'js') or
+         (P = 'msi') or (P = 'lnk') or (P = 'hta') or (P = 'py') or (P = 'sh') then
+        Exit(True);
+    end;
+  end;
+
+  Result := False;
 end;
 
 function ValidateRequestToken(const ARequest: TRequest; AServer: TGHttpsServerIOCP; const ATokenStr: string; out AJWT: TJWTToken): Boolean;
 var
   ReqIP, TokenIP: string;
+  UserEntry: TUserEntry;
 begin
   Result := False;
   AJWT := nil;
@@ -792,6 +1109,23 @@ begin
       Exit(False);
     end;
   end;
+
+  if not TGTermUserConfig.Instance.FindUser(AJWT.Subject, UserEntry) then
+  begin
+    Logger.Warn(Format('[Security] User "%s" from token no longer exists in users.json. Token revoked.', [AJWT.Subject]));
+    AServer.JWTManager.RevokeToken(ATokenStr);
+    FreeAndNil(AJWT);
+    Exit(False);
+  end;
+
+  if (AJWT.GetClaim('role') <> '') and not SameText(AJWT.GetClaim('role'), UserEntry.Role) then
+  begin
+    Logger.Warn(Format('[Security] User "%s" role changed (token: %s, config: %s). Token revoked.', [AJWT.Subject, AJWT.GetClaim('role'), UserEntry.Role]));
+    AServer.JWTManager.RevokeToken(ATokenStr);
+    FreeAndNil(AJWT);
+    Exit(False);
+  end;
+
   Result := True;
 end;
 
@@ -1291,16 +1625,49 @@ begin
         Inc(IParam);
         GSecretPathPrefix := Trim(ParamStr(IParam));
       end
-      else if (SameText(Arg, '--mtls') or SameText(Arg, '-mtls')) and (IParam < ParamCount) then
+      else if SameText(Arg, '--deploy-app') and (IParam + 2 <= ParamCount) then
       begin
+        Inc(IParam);
+        var DeployAppId := ParamStr(IParam);
+        Inc(IParam);
+        var DeploySandbox := ParamStr(IParam);
+        var DeployEntry: TAppEntry;
+        if TGTermAppConfig.Instance.FindById(DeployAppId, DeployEntry) then
+        begin
+          DeployEntry.ToProfile(DeploySandbox);
+          Logger.Info(Format('[INFO] Deployed app "%s" to sandbox "%s"', [DeployAppId, DeploySandbox]));
+          ExitCode := 0; Exit;
+        end
+        else
+        begin
+          Logger.Error(Format('[ERROR] App not found: %s', [DeployAppId]));
+          ExitCode := 1; Exit;
+        end;
+      end
+      else if (SameText(Arg, '--mtls') or SameText(Arg, '-mtls')) then
+      begin
+        if IParam >= ParamCount then
+        begin
+          var ErrMsg := '[FATAL] Missing value for --mtls parameter. Allowed values: required, optional, disabled.';
+          Logger.Error(ErrMsg);
+          ExitCode := 1;
+          Exit;
+        end;
         Inc(IParam);
         var Val := LowerCase(Trim(ParamStr(IParam)));
         if (Val = 'required') or (Val = 'requireandverifyclientcert') or (Val = '1') or (Val = 'true') then
           GmTLSMode := mtlsRequired
         else if (Val = 'optional') or (Val = 'verifyclientcertifgiven') then
           GmTLSMode := mtlsOptional
+        else if (Val = 'disabled') or (Val = 'none') or (Val = '0') or (Val = 'false') then
+          GmTLSMode := mtlsDisabled
         else
-          GmTLSMode := mtlsDisabled;
+        begin
+          var ErrMsg := Format('[FATAL] Invalid --mtls value: "%s". Allowed values: required, optional, disabled.', [Val]);
+          Logger.Error(ErrMsg);
+          ExitCode := 1;
+          Exit;
+        end;
       end
       else if (SameText(Arg, '--ca-cert') or SameText(Arg, '--cacert') or SameText(Arg, '--capath') or SameText(Arg, '-cacert')) and (IParam < ParamCount) then
       begin
@@ -1316,42 +1683,25 @@ begin
       begin
         Inc(IParam);
         GTrustedClientsDir := Trim(ParamStr(IParam));
+      end
+      else if SameText(Arg, '--allow-test-ca') then
+      begin
+        GAllowTestCA := True;
       end;
       Inc(IParam);
     end;
 
     if GTrustedClientsDir = '' then
     begin
-      var DirCand1 := ExtractFilePath(ParamStr(0)) + 'trusted_clients';
-      var DirCand2 := TPath.Combine(GetCurrentDir, 'trusted_clients');
-      if TDirectory.Exists(DirCand1) then
-        GTrustedClientsDir := DirCand1
-      else if TDirectory.Exists(DirCand2) then
-        GTrustedClientsDir := DirCand2;
+      var AppClientsDir := ExtractFilePath(ParamStr(0)) + 'trusted_clients';
+      if TDirectory.Exists(AppClientsDir) then
+        GTrustedClientsDir := AppClientsDir;
     end;
 
     if (GTrustedClientsDir <> '') and TDirectory.Exists(GTrustedClientsDir) then
     begin
       var CountLoaded := LoadTrustedClientsFromDirectory(GTrustedClientsDir);
       Logger.Info(Format('[mTLS] Loaded %d trusted client certificate(s) from directory: %s', [CountLoaded, GTrustedClientsDir]));
-    end;
-
-    if (GmTLSMode <> mtlsDisabled) and (GmTLSCaCertPath = '') then
-    begin
-      var CaCandidates: TArray<string> := [
-        TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt'),
-        TPath.Combine(GetCurrentDir, 'test_certs\test_root_ca.crt'),
-        TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs\test_root_ca.crt'),
-        TPath.Combine(ExtractFilePath(ParamStr(0)), 'test_certs\test_root_ca.crt')
-      ];
-      for var Cand in CaCandidates do
-      begin
-        if TFile.Exists(Cand) then
-        begin
-          GmTLSCaCertPath := Cand;
-          Break;
-        end;
-      end;
     end;
 
     var CertCheckErr: string;
@@ -1364,15 +1714,7 @@ begin
       end
       else
       begin
-        Logger.Error('CRITICAL ERROR: ' + CertCheckErr);
-        try
-          Writeln;
-          Writeln('================================================================');
-          Writeln('  CRITICAL ERROR: ' + CertCheckErr);
-          Writeln('================================================================');
-          Writeln;
-        except
-        end;
+        Logger.Critical('CRITICAL ERROR: ' + CertCheckErr);
         ExitCode := 1; Exit;
       end;
     end;
@@ -1412,6 +1754,7 @@ begin
       PendingSessions := TDictionary<string, TPendingSession>.Create;
       LoginRateLock := TCriticalSection.Create;
       LoginRateMap := TDictionary<string, TLoginRateLimit>.Create;
+      GlobalQuotaManager := TQuotaReservationManager.Create;
       WTFileLock := TCriticalSection.Create;
       WTFileSessions := TDictionary<TWTSessionId, TWTFileSessionCtx>.Create;
       WTFileStreams := TDictionary<HQUIC, TWTFileStreamCtx>.Create;
@@ -1439,8 +1782,11 @@ begin
       );
 
       Server.SetSSLShutdownOptions(True, 200);
+      Server.JWTManager.SetRevocationStorePath(ExtractFilePath(ParamStr(0)) + 'revoked_tokens.json');
+      Server.JWTManager.SetRevocationStorePath(ExtractFilePath(ParamStr(0)) + 'revoked_tokens.json');
       Server.EnableKeepAlive := True;
       Server.EnableHttp3 := True;
+      Server.EnableCORS := False;
       Server.BindAddress := GBindAddress;
       Server.HttpsBindAddress := GHttpsBindAddress;
       Server.Http3BindAddress := GHttp3BindAddress;
@@ -1562,6 +1908,14 @@ begin
         end
       );
 
+      Server.RegisterEndpointProc(BuildRoutePath('/api/certificate-hash'), hmOPTIONS,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.SetStatus(204);
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
+        end
+      );
+
       Server.RegisterEndpointProc(BuildRoutePath('/api/certificate-hash'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
@@ -1570,9 +1924,15 @@ begin
           JsonArr: TJSONArray;
           I: Integer;
         begin
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
           AResponse.SetStatus(200);
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
           HashBytes := AServer.GetCertificateSha256Hash;
           JsonRes := TJSONObject.Create;
           try
@@ -1589,12 +1949,29 @@ begin
         end
       );
 
+      Server.RegisterEndpointProc(BuildRoutePath('/api/mtls/status'), hmOPTIONS,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.SetStatus(204);
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
+        end
+      );
+
       Server.RegisterEndpointProc(BuildRoutePath('/api/mtls/status'), hmGET,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         var
           JsonRes: TJSONObject;
           ModeStr: string;
+          ReqOrigin: string;
         begin
+          ReqOrigin := Trim(ARequest.Headers.GetHeader('Origin'));
+          if (ReqOrigin <> '') and not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+
           case AServer.mTLSMode of
             mtlsRequired: ModeStr := 'required';
             mtlsOptional: ModeStr := 'optional';
@@ -1634,7 +2011,7 @@ begin
               JsonRes.AddPair('whitelist_count', TJSONNumber.Create(0));
 
             AResponse.SetStatus(200);
-            AResponse.AddHeader('Access-Control-Allow-Origin', '*');
+            ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
             AResponse.AddHeader('Cache-Control', 'no-cache');
             AResponse.AddJSONContent(JsonRes.ToJSON);
           finally
@@ -1647,9 +2024,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
         end
       );
 
@@ -1665,12 +2040,19 @@ begin
           JsonRes: TJSONObject;
           HasFilesAppClaim: Boolean;
           ClientIP: string;
-          JsonReq: TJSONObject;
           ReqUser: string;
+          ReqOrigin: string;
         begin
+          ReqOrigin := Trim(ARequest.Headers.GetHeader('Origin'));
+          if (ReqOrigin <> '') and not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
 
           if (not ARequest.ClientCertificate.HasCertificate) or (not ARequest.ClientCertificate.IsVerified) then
           begin
@@ -1693,26 +2075,6 @@ begin
           if not UserFound then
             UserFound := TGTermUserConfig.Instance.FindUser(TargetUsername, UserEntry);
 
-          if (not UserFound) and (ARequest.BodyAsString <> '') then
-          begin
-            try
-              JsonReq := TJSONObject.ParseJSONValue(ARequest.BodyAsString) as TJSONObject;
-              if JsonReq <> nil then
-              begin
-                try
-                  ReqUser := Trim(JsonReq.GetValue<string>('username', ''));
-                  if (ReqUser <> '') and TGTermUserConfig.Instance.FindUser(ReqUser, UserEntry) then
-                  begin
-                    TargetUsername := ReqUser;
-                    UserFound := True;
-                  end;
-                finally
-                  JsonReq.Free;
-                end;
-              end;
-            except
-            end;
-          end;
 
 
           if not UserFound then
@@ -1782,9 +2144,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
         end
       );
 
@@ -1803,15 +2163,13 @@ begin
           RateInfo: TLoginRateLimit;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
           if not IsAllowedRequestOrigin(ARequest) then
           begin
             AResponse.SetStatus(403);
             AResponse.AddJSONContent('{"error":"Forbidden origin"}');
             Exit;
           end;
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
 
           ClientIP := FormatSockAddrIP(ARequest.RemoteAddr);
 
@@ -1835,6 +2193,13 @@ begin
               ExpList.Free;
             end;
 
+            var GlobalIpKeyPre := 'GLOBAL_IP_' + ClientIP;
+            if LoginRateMap.TryGetValue(GlobalIpKeyPre, RateInfo) and (RateInfo.BlockedUntilTick > 0) and (NowTick < RateInfo.BlockedUntilTick) then
+            begin
+              AResponse.SetStatus(429);
+              AResponse.AddJSONContent('{"error":"Too many failed attempts from this IP. Please wait 60 seconds."}');
+              Exit;
+            end;
             if LoginRateMap.TryGetValue(RateKey, RateInfo) then
             begin
               if (RateInfo.BlockedUntilTick > 0) and (NowTick < RateInfo.BlockedUntilTick) then
@@ -1866,6 +2231,13 @@ begin
               RateKey := ClientIP + '_' + LowerCase(Username);
             LoginRateLock.Enter;
             try
+              var GlobalIpKeyPost := 'GLOBAL_IP_' + ClientIP;
+              if LoginRateMap.TryGetValue(GlobalIpKeyPost, RateInfo) and (RateInfo.BlockedUntilTick > 0) and (NowTick < RateInfo.BlockedUntilTick) then
+              begin
+                AResponse.SetStatus(429);
+                AResponse.AddJSONContent('{"error":"Too many failed attempts from this IP. Please wait 60 seconds."}');
+                Exit;
+              end;
               if LoginRateMap.TryGetValue(RateKey, RateInfo) and (RateInfo.BlockedUntilTick > 0) and (NowTick < RateInfo.BlockedUntilTick) then
               begin
                 AResponse.SetStatus(429);
@@ -1925,6 +2297,21 @@ begin
             begin
               LoginRateLock.Enter;
               try
+                var GlobalIpKeyFail := 'GLOBAL_IP_' + ClientIP;
+                var GlobalRateInfo: TLoginRateLimit;
+                if not LoginRateMap.TryGetValue(GlobalIpKeyFail, GlobalRateInfo) then
+                begin
+                  GlobalRateInfo.FailedCount := 0;
+                  GlobalRateInfo.BlockedUntilTick := 0;
+                end;
+                Inc(GlobalRateInfo.FailedCount);
+                if GlobalRateInfo.FailedCount >= 20 then
+                begin
+                  GlobalRateInfo.BlockedUntilTick := NowTick + 60000;
+                  GlobalRateInfo.FailedCount := 0;
+                  Logger.Warn(Format('[Security] Global IP spray rate limit exceeded for IP %s. Blocked for 60 seconds.', [ClientIP]));
+                end;
+                LoginRateMap.AddOrSetValue(GlobalIpKeyFail, GlobalRateInfo);
                 if not LoginRateMap.TryGetValue(RateKey, RateInfo) then
                 begin
                   RateInfo.FailedCount := 0;
@@ -2015,9 +2402,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
         end
       );
 
@@ -2028,8 +2413,13 @@ begin
           JWT: TJWTToken;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
           begin
@@ -2069,9 +2459,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
         end
       );
 
@@ -2086,13 +2474,17 @@ begin
           SandboxStr: string;
           TokenStr: string;
           JWT: TJWTToken;
-          //QueryVal: string;
           UserRole: string;
           FoundUser: TUserEntry;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
 
@@ -2189,9 +2581,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
         end
       );
 
@@ -2209,8 +2599,13 @@ begin
           Pending: TPendingSession;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
           BodyStr := ARequest.GetBodyAsString;
@@ -2314,6 +2709,7 @@ begin
               SessionGuid := TGUID.NewGuid.ToString.Trim(['{', '}']);
 
               Pending.Username := JWT.Subject;
+              Pending.Role := UserRole;
               Pending.ClientIP := ReqClientIP;
               Pending.SandboxDir := JWT.GetClaim('sandbox');
               Pending.AppKey := AppKey;
@@ -2329,7 +2725,7 @@ begin
                   for var PK in PendingSessions.Keys do
                   begin
                     var PP: TPendingSession;
-                    if PendingSessions.TryGetValue(PK, PP) and ((NowTickPending - PP.CreatedTick) > 60000) then
+                    if PendingSessions.TryGetValue(PK, PP) and ((NowTickPending - PP.CreatedTick) > 15000) then
                       ExpKeys.Add(PK);
                   end;
                   for var PK in ExpKeys do
@@ -2345,6 +2741,7 @@ begin
               JsonRes := TJSONObject.Create;
               try
                 JsonRes.AddPair('status', 'ok');
+                JsonRes.AddPair('ticket', SessionGuid);
                 JsonRes.AddPair('sessionId', SessionGuid);
                 JsonRes.AddPair('app', AppKey);
                 AResponse.SetStatus(200);
@@ -2365,9 +2762,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, POST, DELETE, OPTIONS');
         end
       );
 
@@ -2377,12 +2772,16 @@ begin
           TokenStr: string;
           JWT: TJWTToken;
           QueryVal, FileName, UserSandbox, TargetDir, TargetPath: string;
-          FileBytes: TBytes;
           JsonRes: TJSONObject;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, POST, DELETE, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
 
@@ -2443,7 +2842,7 @@ begin
             var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
             if (UserRole = '') and HasUserEntry then
               UserRole := CheckUser.Role;
-            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess));
 
             var CanUploadVal: Boolean := True;
             var ClaimUpload: string := JWT.GetClaim('upload');
@@ -2468,7 +2867,11 @@ begin
             var ServerRoot: string := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
             var UserHome: string := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
             if not TDirectory.Exists(UserHome) then
-              TDirectory.CreateDirectory(UserHome);
+            begin
+              AResponse.SetStatus(404);
+              AResponse.AddJSONContent('{"error":"User sandbox directory does not exist"}');
+              Exit;
+            end;
 
             var Scope: string := 'home';
             if ARequest.RequestInfo.QueryParameters.TryGetValue('scope', QueryVal) then
@@ -2498,10 +2901,10 @@ begin
             var SubPath: string := '';
             if ARequest.RequestInfo.QueryParameters.TryGetValue('path', QueryVal) then
               SubPath := Trim(QueryVal);
-            if (Pos(#0, SubPath) > 0) or ((not IsAdmin) and (Pos(':', SubPath) > 0)) then
+            if (Pos(#0, SubPath) > 0) or (Pos(':', SubPath) > 0) or (not IsAdmin and (Pos('~', SubPath) > 0)) then
             begin
               AResponse.SetStatus(400);
-              AResponse.AddJSONContent('{"error":"Invalid path"}');
+              AResponse.AddJSONContent('{"error":"Invalid path format or alternate data streams forbidden"}');
               Exit;
             end;
             SubPath := SubPath.Replace('/', '\');
@@ -2539,11 +2942,11 @@ begin
               end;
             end;
 
-            var IncomingSize: Int64;
+            var IncomingSize: Int64 := 0;
             if Assigned(ARequest.BodyParser) and Assigned(ARequest.BodyParser.MainPart) then
               IncomingSize := ARequest.BodyParser.CurrentSize
-            else
-              IncomingSize := Length(ARequest.BodyAsBytes);
+            else if ARequest.GetBodyStream <> nil then
+              IncomingSize := ARequest.GetBodyStream.Size;
 
             if IncomingSize > 1073741824 then
             begin
@@ -2552,123 +2955,108 @@ begin
               Exit;
             end;
 
+            var ReservedQuota: Int64 := 0;
             if not IsAdmin and HasUserEntry then
             begin
               var QuotaBytes: Int64 := CheckUser.GetStorageQuotaBytes;
               if QuotaBytes > 0 then
               begin
-                var CurrentUsed: Int64 := GetDirectoryTotalSize(UserHome);
-                if CurrentUsed + IncomingSize > QuotaBytes then
+                if not GlobalQuotaManager.TryReserve(JWT.Subject, IncomingSize, QuotaBytes, UserHome) then
                 begin
                   AResponse.SetStatus(507);
                   AResponse.AddJSONContent(Format('{"error":"Storage quota exceeded: max %d MB allowed"}', [CheckUser.Grants.StorageQuotaMB]));
                   Exit;
                 end;
+                ReservedQuota := IncomingSize;
               end;
             end;
 
-            FileBytes := ARequest.BodyAsBytes;
-            if Length(FileBytes) > 0 then
-            begin
-              if IsExecutableBinaryHeader(@FileBytes[0], Length(FileBytes)) then
+            try
+              var SavedOk: Boolean := False;
+              var UploadedSize: Int64;
+
+              if FileExists(TargetPath) then
+                TFile.Delete(TargetPath);
+
+              if Assigned(ARequest.BodyParser) and Assigned(ARequest.BodyParser.MainPart) then
               begin
-                AResponse.SetStatus(403);
-                AResponse.AddJSONContent('{"error":"Malicious payload detected: executable PE binary header (MZ) forbidden"}');
+                SavedOk := ARequest.BodyParser.MainPart.SaveToFile(TargetPath);
+              end
+              else
+              begin
+                var InStream: TStream := ARequest.GetBodyStream;
+                if (InStream <> nil) and (InStream.Size > 0) then
+                begin
+                  var OutFile: TFileStream := TFileStream.Create(TargetPath, fmCreate);
+                  try
+                    InStream.Position := 0;
+                    OutFile.CopyFrom(InStream, InStream.Size);
+                    SavedOk := True;
+                  finally
+                    OutFile.Free;
+                  end;
+                end;
+              end;
+
+              if not SavedOk or not FileExists(TargetPath) then
+              begin
+                AResponse.SetStatus(500);
+                AResponse.AddJSONContent('{"error":"Failed to save file"}');
                 Exit;
               end;
-              var ThreatMsg: string := '';
-              if not ScanBufferForThreats(@FileBytes[0], Length(FileBytes), FileName, ThreatMsg) then
+
+              try
+                UploadedSize := TFile.GetSize(TargetPath);
+              except
+                UploadedSize := 0;
+              end;
+
+              if IsExecutableBinaryFile(TargetPath) then
               begin
+                try
+                  if FileExists(TargetPath) then
+                    TFile.Delete(TargetPath);
+                except
+                end;
+                AResponse.SetStatus(403);
+                AResponse.AddJSONContent('{"error":"Malicious payload detected: executable binary forbidden"}');
+                Exit;
+              end;
+
+              var ThreatMsg: string := '';
+              if not ScanFileForThreats(TargetPath, FileName, ThreatMsg) then
+              begin
+                try
+                  if FileExists(TargetPath) then
+                    TFile.Delete(TargetPath);
+                except
+                end;
                 AResponse.SetStatus(403);
                 AResponse.AddJSONContent(Format('{"error":"%s"}', [ThreatMsg]));
                 Exit;
               end;
-            end;
 
-            var SavedOk: Boolean := False;
-            var UploadedSize: Int64 := 0;
-
-            if Assigned(ARequest.BodyParser) and Assigned(ARequest.BodyParser.MainPart) then
-            begin
-              UploadedSize := ARequest.BodyParser.CurrentSize;
-              SavedOk := ARequest.BodyParser.MainPart.SaveToFile(TargetPath);
-            end;
-
-            if not SavedOk then
-            begin
-              UploadedSize := Length(FileBytes);
+              JsonRes := TJSONObject.Create;
               try
-                TFile.WriteAllBytes(TargetPath, FileBytes);
-                SavedOk := True;
-              except
-                on E: Exception do
-                begin
-                  AResponse.SetStatus(500);
-                  AResponse.AddJSONContent('{"error":"Failed to write file"}');
-                  Exit;
-                end;
+                JsonRes.AddPair('status', 'ok');
+                JsonRes.AddPair('filename', FileName);
+                JsonRes.AddPair('size', TJSONNumber.Create(UploadedSize));
+                AResponse.SetStatus(200);
+                AResponse.AddJSONContent(JsonRes.ToJSON);
+              finally
+                JsonRes.Free;
               end;
+            finally
+              if ReservedQuota > 0 then
+                GlobalQuotaManager.Release(JWT.Subject, ReservedQuota);
+              JWT.Free;
             end;
-
-            if not SavedOk then
+          except
+            on E: Exception do
             begin
               AResponse.SetStatus(500);
-              AResponse.AddJSONContent('{"error":"Failed to save file"}');
-              Exit;
+              AResponse.AddJSONContent(Format('{"error":"Internal upload error: %s"}', [E.Message]));
             end;
-
-            if FileExists(TargetPath) then
-            begin
-              var FStream: TFileStream := TFileStream.Create(TargetPath, fmOpenRead or fmShareDenyNone);
-              var ThreatFound: Boolean := False;
-              var ThreatMsg: string := '';
-              try
-                var HeaderBuf: array[0..511] of Byte;
-                var ReadBytes: Integer := FStream.Read(HeaderBuf, Length(HeaderBuf));
-                if (ReadBytes >= 2) and IsExecutableBinaryHeader(@HeaderBuf[0], ReadBytes) then
-                begin
-                  ThreatFound := True;
-                  ThreatMsg := 'Malicious payload detected: executable PE binary header (MZ) forbidden';
-                end
-                else if not ScanBufferForThreats(@HeaderBuf[0], ReadBytes, FileName, ThreatMsg) then
-                begin
-                  ThreatFound := True;
-                end;
-              finally
-                FStream.Free;
-              end;
-
-              if ThreatFound then
-              begin
-                TFile.Delete(TargetPath);
-                AResponse.SetStatus(403);
-                AResponse.AddJSONContent(Format('{"error":"%s"}', [ThreatMsg]));
-                Exit;
-              end;
-            end;
-
-            if FileExists(TargetPath) then
-            begin
-              var FInfo: TSearchRec;
-              if FindFirst(TargetPath, faAnyFile, FInfo) = 0 then
-              begin
-                UploadedSize := FInfo.Size;
-                System.SysUtils.FindClose(FInfo);
-              end;
-            end;
-
-            JsonRes := TJSONObject.Create;
-            try
-              JsonRes.AddPair('status', 'ok');
-              JsonRes.AddPair('filename', FileName);
-              JsonRes.AddPair('size', TJSONNumber.Create(UploadedSize));
-              AResponse.SetStatus(200);
-              AResponse.AddJSONContent(JsonRes.ToJSON);
-            finally
-              JsonRes.Free;
-            end;
-          finally
-            JWT.Free;
           end;
         end
       );
@@ -2680,8 +3068,13 @@ begin
           JWT: TJWTToken;
           QueryVal, FileName, UserSandbox, TargetDir, TargetPath: string;
         begin
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, POST, DELETE, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
 
@@ -2736,7 +3129,7 @@ begin
             var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
             if (UserRole = '') and HasUserEntry then
               UserRole := CheckUser.Role;
-            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess));
 
             var CanDownloadVal: Boolean := True;
             var ClaimDownload: string := JWT.GetClaim('download');
@@ -2856,8 +3249,13 @@ begin
           SubPath, FileName, UserSandbox, TargetDir, TargetPath: string;
           QueryVal: string;
         begin
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, POST, DELETE, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
@@ -2873,7 +3271,7 @@ begin
             var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
             if (UserRole = '') and HasUserEntry then
               UserRole := CheckUser.Role;
-            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess));
 
             var CanUploadVal: Boolean := True;
             var ClaimUpload: string := JWT.GetClaim('upload');
@@ -2896,20 +3294,23 @@ begin
             FileName := '';
             if ARequest.RequestInfo.QueryParameters.TryGetValue('name', QueryVal) then
               FileName := Trim(QueryVal);
-            if FileName = '' then
-            begin
-              AResponse.SetStatus(400);
-              AResponse.AddJSONContent('{"error":"Missing file name"}');
-              Exit;
-            end;
-
             if (Pos(#0, SubPath) > 0) or (Pos(#0, FileName) > 0) or
-               ((not IsAdmin) and ((Pos(':', SubPath) > 0) or (Pos(':', FileName) > 0))) or
-               (Pos('..', FileName) > 0) or (Pos('/', FileName) > 0) or (Pos('\', FileName) > 0) then
+               (Pos('..', FileName) > 0) or (Pos('/', FileName) > 0) or (Pos('\', FileName) > 0) or
+               (Pos(':', FileName) > 0) then
             begin
               AResponse.SetStatus(400);
               AResponse.AddJSONContent('{"error":"Invalid path or filename"}');
               Exit;
+            end;
+
+            if Pos(':', SubPath) > 0 then
+            begin
+              if not ((Pos(':', SubPath) = 2) and (Length(SubPath) >= 2) and (PosEx(':', SubPath, 3) = 0)) then
+              begin
+                AResponse.SetStatus(400);
+                AResponse.AddJSONContent('{"error":"Invalid path or filename"}');
+                Exit;
+              end;
             end;
 
             SubPath := SubPath.Replace('/', '\');
@@ -2979,7 +3380,7 @@ begin
             else
               BaseDir := UserHome;
 
-            if IsAdmin and (TPath.IsPathRooted(SubPath) or ((Length(SubPath) >= 2) and (SubPath[2] = ':'))) then
+            if (TPath.IsPathRooted(SubPath) or ((Length(SubPath) >= 2) and (SubPath[2] = ':'))) then
               TargetDir := TPath.GetFullPath(SubPath)
             else if SubPath <> '' then
               TargetDir := TPath.GetFullPath(TPath.Combine(BaseDir, SubPath))
@@ -2991,6 +3392,27 @@ begin
             else
               TargetPath := TargetDir;
 
+            var CanonTarget: string := NormalizeCanonicalPath(TPath.GetFullPath(TargetPath));
+            var CanonHome: string := NormalizeCanonicalPath(TPath.GetFullPath(UserHome));
+            var CanonServer: string := NormalizeCanonicalPath(TPath.GetFullPath(ServerRoot));
+            var CanonApp: string := NormalizeCanonicalPath(TPath.GetFullPath(ExtractFilePath(ParamStr(0))));
+
+            var RootPathToCheck: string;
+            if (Scope = 'server') and IsAdmin then
+              RootPathToCheck := CanonServer
+            else
+              RootPathToCheck := CanonHome;
+
+            if IsSameDirectoryOrRoot(CanonTarget, CanonHome) or
+               IsSameDirectoryOrRoot(CanonTarget, CanonServer) or
+               IsSameDirectoryOrRoot(CanonTarget, CanonApp) or
+               (Length(CanonTarget) <= Length(RootPathToCheck)) then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent('{"error":"Cannot delete sandbox root"}');
+              Exit;
+            end;
+
             if not IsAdmin then
             begin
               if not IsPathInSandboxCanonical(TargetPath, UserHome) then
@@ -2999,13 +3421,6 @@ begin
                 AResponse.AddJSONContent('{"error":"Forbidden: Path traversal violation"}');
                 Exit;
               end;
-            end;
-
-            if (TargetPath = UserHome) or (TargetPath = ServerRoot) or (TargetPath = ExtractFilePath(ParamStr(0))) then
-            begin
-              AResponse.SetStatus(403);
-              AResponse.AddJSONContent('{"error":"Cannot delete sandbox root"}');
-              Exit;
             end;
 
             if FileExists(TargetPath) then
@@ -3035,9 +3450,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
         end
       );
 
@@ -3046,7 +3459,7 @@ begin
         var
           TokenStr: string;
           JWT: TJWTToken;
-          SubPath, UserSandbox, TargetDir{, SandboxRoot}: string;
+          SubPath, UserSandbox, TargetDir: string;
           QueryVal: string;
           JsonRes: TJSONObject;
           JsonArr: TJSONArray;
@@ -3058,8 +3471,13 @@ begin
           ItemTime: string;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
@@ -3075,7 +3493,7 @@ begin
             var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
             if (UserRole = '') and HasUserEntry then
               UserRole := CheckUser.Role;
-            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess));
 
             var CanAccessFiles: Boolean;
             var ClaimUp: string := JWT.GetClaim('upload');
@@ -3129,7 +3547,11 @@ begin
             var ServerRoot: string := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
             var UserHome: string := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
             if not TDirectory.Exists(UserHome) then
-              TDirectory.CreateDirectory(UserHome);
+            begin
+              AResponse.SetStatus(404);
+              AResponse.AddJSONContent('{"error":"User sandbox directory does not exist"}');
+              Exit;
+            end;
 
             var Scope: string := 'home';
             if ARequest.RequestInfo.QueryParameters.TryGetValue('scope', QueryVal) then
@@ -3280,9 +3702,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
         end
       );
 
@@ -3299,8 +3719,13 @@ begin
           JsonRes: TJSONObject;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
           if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
@@ -3316,7 +3741,7 @@ begin
             var HasUserEntry: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
             if (UserRole = '') and HasUserEntry then
               UserRole := CheckUser.Role;
-            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess or CheckUser.CanPowerShellAccessEverywhere));
+            var IsAdmin: Boolean := SameText(UserRole, 'admin') or (HasUserEntry and (CheckUser.IsAdmin or CheckUser.Grants.FullDiskAccess));
 
             var CanDownloadVal: Boolean := True;
             var ClaimDownload: string := JWT.GetClaim('download');
@@ -3557,13 +3982,84 @@ begin
         end
       );
 
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/quota'), hmOPTIONS,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        begin
+          AResponse.SetStatus(204);
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
+        end
+      );
+
+      Server.RegisterEndpointProc(BuildRoutePath('/api/sandbox/quota'), hmGET,
+        procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
+        var
+          TokenStr: string;
+          JWT: TJWTToken;
+          UserSandbox, ServerRoot, UserHome: string;
+          CheckUser: TUserEntry;
+          HasUserEntry: Boolean;
+          CurrentUsed: Int64;
+          QuotaBytes: Int64;
+          JsonRes: TJSONObject;
+        begin
+          AResponse.AddHeader('Cache-Control', 'no-cache');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
+
+          TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
+          if not ValidateRequestToken(ARequest, AServer, TokenStr, JWT) then
+          begin
+            AResponse.SetStatus(401);
+            AResponse.AddJSONContent('{"error":"Unauthorized"}');
+            Exit;
+          end;
+
+          try
+            UserSandbox := JWT.GetClaim('sandbox');
+            HasUserEntry := TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckUser);
+            if (UserSandbox = '') and HasUserEntry and (CheckUser.Sandbox <> '') then
+              UserSandbox := CheckUser.Sandbox;
+            if UserSandbox = '' then
+              UserSandbox := 'sandbox';
+
+            ServerRoot := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
+            UserHome := TPath.GetFullPath(TPath.Combine(ServerRoot, UserSandbox));
+
+            CurrentUsed := GetDirectoryTotalSize(UserHome);
+            QuotaBytes := 0;
+            if HasUserEntry then
+              QuotaBytes := CheckUser.GetStorageQuotaBytes;
+
+            JsonRes := TJSONObject.Create;
+            try
+              JsonRes.AddPair('status', 'ok');
+              JsonRes.AddPair('used_bytes', TJSONNumber.Create(CurrentUsed));
+              JsonRes.AddPair('quota_bytes', TJSONNumber.Create(QuotaBytes));
+              if HasUserEntry then
+                JsonRes.AddPair('quota_mb', TJSONNumber.Create(CheckUser.Grants.StorageQuotaMB))
+              else
+                JsonRes.AddPair('quota_mb', TJSONNumber.Create(0));
+              AResponse.SetStatus(200);
+              AResponse.AddJSONContent(JsonRes.ToJSON);
+            finally
+              JsonRes.Free;
+            end;
+          finally
+            JWT.Free;
+          end;
+        end
+      );
+
       Server.RegisterEndpointProc(BuildRoutePath('/api/admin/sessions'), hmOPTIONS,
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
         end
       );
 
@@ -3572,7 +4068,6 @@ begin
         var
           TokenStr: string;
           JWT: TJWTToken;
-          //QueryVal: string;
           Snapshots: TArray<TGTermSessionInfo>;
           JsonRes: TJSONObject;
           JsonArr: TJSONArray;
@@ -3580,8 +4075,13 @@ begin
           I: Integer;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'GET, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
 
@@ -3641,9 +4141,7 @@ begin
         procedure(Sender: TObject; const ARequest: TRequest; const AResponse: TResponse; AServer: TGHttpsServerIOCP)
         begin
           AResponse.SetStatus(204);
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          AResponse.AddHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
         end
       );
 
@@ -3658,8 +4156,13 @@ begin
           Success: Boolean;
         begin
           AResponse.AddHeader('Cache-Control', 'no-cache');
-          AResponse.AddHeader('Access-Control-Allow-Origin', '*');
-          AResponse.AddHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          if not IsAllowedRequestOrigin(ARequest) then
+          begin
+            AResponse.SetStatus(403);
+            AResponse.AddJSONContent('{"error":"Forbidden origin"}');
+            Exit;
+          end;
+          ApplyCorsHeaders(ARequest, AResponse, 'POST, OPTIONS');
 
           TokenStr := AServer.JWTManager.ExtractTokenFromAuthHeader(ARequest.Headers.Authorization);
           BodyStr := ARequest.GetBodyAsString;
@@ -3746,83 +4249,65 @@ begin
         var
           Profile: TGTermAppProfile;
           TermSession: TGTermSession;
-          TokenStr: string;
-          JWT: TJWTToken;
-          AppKey: string;
-          UserSandbox: string;
-          LowerPath: string;
-          P: Integer;
-          SessionGuid: string;
+          QueryParams: TDictionary<string, string>;
+          TicketStr, TokenStr, AppKey, UserSandbox: string;
           HasPending: Boolean;
           Pending: TPendingSession;
+          QuicPeerIP: string;
+          NowTick: UInt64;
+          JWT: TJWTToken;
         begin
           var CleanLogPath := Session^.Path;
           var QPos := Pos('?', CleanLogPath);
           if QPos > 0 then CleanLogPath := Copy(CleanLogPath, 1, QPos - 1);
           Logger.Info(Format('[WT] Client connected (SessionId: %d, Path: %s)', [Session^.SessionId, CleanLogPath]));
-          LowerPath := LowerCase(Session^.Path);
 
-          TokenStr := '';
-          P := Pos('token=', LowerPath);
-          if P > 0 then
-          begin
-            TokenStr := Copy(Session^.Path, P + 6, MaxInt);
-            P := Pos('&', TokenStr);
-            if P > 0 then SetLength(TokenStr, P - 1);
-            P := Pos('#', TokenStr);
-            if P > 0 then SetLength(TokenStr, P - 1);
+          QuicPeerIP := GetWTSessionPeerIP(Session);
+          QueryParams := ParseUrlQueryParams(Session^.Path);
+          try
+            TicketStr := '';
+            if not QueryParams.TryGetValue('ticket', TicketStr) or (TicketStr = '') then
+              QueryParams.TryGetValue('session', TicketStr);
+            TicketStr := Trim(TicketStr);
+
+            TokenStr := '';
+            QueryParams.TryGetValue('token', TokenStr);
             TokenStr := Trim(TokenStr);
-          end;
 
-          SessionGuid := '';
-          P := Pos('session=', LowerPath);
-          if P > 0 then
-          begin
-            SessionGuid := Copy(Session^.Path, P + 8, MaxInt);
-            P := Pos('&', SessionGuid);
-            if P > 0 then SetLength(SessionGuid, P - 1);
-            P := Pos('#', SessionGuid);
-            if P > 0 then SetLength(SessionGuid, P - 1);
-            SessionGuid := Trim(SessionGuid);
-          end;
+            AppKey := '';
+            QueryParams.TryGetValue('app', AppKey);
+            AppKey := LowerCase(Trim(AppKey));
+            if AppKey = '' then
+              AppKey := TGTermAppConfig.Instance.GetDefaultAppId;
 
-          HasPending := False;
-          if SessionGuid <> '' then
-          begin
-            PendingSessionsLock.Enter;
-            try
-              HasPending := PendingSessions.TryGetValue(SessionGuid, Pending);
-              if HasPending then
-                PendingSessions.Remove(SessionGuid);
-            finally
-              PendingSessionsLock.Leave;
-            end;
-          end;
-
-          if HasPending then
-          begin
-            if (TokenStr = '') or not Server.JWTManager.ValidateToken(TokenStr, JWT) then
+            if TicketStr <> '' then
             begin
-              if Assigned(JWT) then
-                FreeAndNil(JWT);
-              Logger.Warn(Format('[WT] Rejecting connection: invalid or missing token (SessionId: %d)', [Session^.SessionId]));
-              Exit;
-            end;
+              PendingSessionsLock.Enter;
+              try
+                HasPending := PendingSessions.TryGetValue(TicketStr, Pending);
+                if HasPending then
+                  PendingSessions.Remove(TicketStr);
+              finally
+                PendingSessionsLock.Leave;
+              end;
 
-            var TokenIP := JWT.GetClaim('ip');
-            if (Pending.ClientIP <> '') and (TokenIP <> '') and not AreIPAddressesMatching(Pending.ClientIP, TokenIP) then
-            begin
-              Logger.Warn(Format('[WT] Rejecting connection: Token IP does not match session IP (token=%s, pending=%s, SessionId=%d)',
-                [TokenIP, Pending.ClientIP, Session^.SessionId]));
-              JWT.Free;
-              Exit;
-            end;
-
-            try
-              if not SameText(JWT.Subject, Pending.Username) then
+              if not HasPending then
               begin
-                Logger.Warn(Format('[WT] Rejecting connection: token user "%s" does not match session owner "%s" (SessionId: %d)',
-                  [JWT.Subject, Pending.Username, Session^.SessionId]));
+                Logger.Warn(Format('[WT] Rejecting connection: invalid or already consumed ticket "%s" (SessionId: %d)', [TicketStr, Session^.SessionId]));
+                Exit;
+              end;
+
+              NowTick := GetTickCount64;
+              if (NowTick - Pending.CreatedTick) > 15000 then
+              begin
+                Logger.Warn(Format('[WT] Rejecting connection: expired ticket "%s" (SessionId: %d)', [TicketStr, Session^.SessionId]));
+                Exit;
+              end;
+
+              if (Pending.ClientIP <> '') and (QuicPeerIP <> '') and not AreIPAddressesMatching(Pending.ClientIP, QuicPeerIP) then
+              begin
+                Logger.Warn(Format('[WT] Rejecting connection: QUIC peer IP "%s" does not match ticket client IP "%s" (SessionId: %d)',
+                  [QuicPeerIP, Pending.ClientIP, Session^.SessionId]));
                 Exit;
               end;
 
@@ -3830,67 +4315,67 @@ begin
               Profile := ResolveAppProfile(Pending.AppKey, UserSandbox, Pending.Username);
               if Pending.Cols > 0 then Profile.DefaultCols := Pending.Cols;
               if Pending.Rows > 0 then Profile.DefaultRows := Pending.Rows;
-              TermSession := TGTermSession.Create(Session, Profile, Pending.Username, JWT.GetClaim('role'));
+              TermSession := TGTermSession.Create(Session, Profile, Pending.Username, Pending.Role);
               SessionManager.RegisterSession(Pointer(Session^.SessionId), TermSession);
-            finally
-              JWT.Free;
-            end;
-          end
-          else
-          begin
-            AppKey := '';
-            P := Pos('app=', LowerPath);
-            if P > 0 then
+            end
+            else if TokenStr <> '' then
             begin
-              AppKey := Copy(Session^.Path, P + 4, MaxInt);
-              P := Pos('&', AppKey);
-              if P > 0 then SetLength(AppKey, P - 1);
-              P := Pos('#', AppKey);
-              if P > 0 then SetLength(AppKey, P - 1);
-              AppKey := LowerCase(Trim(AppKey));
-            end;
-            if AppKey = '' then
-              AppKey := TGTermAppConfig.Instance.GetDefaultAppId;
+              if not Server.JWTManager.ValidateToken(TokenStr, JWT) then
+              begin
+                if Assigned(JWT) then
+                  FreeAndNil(JWT);
+                Logger.Warn(Format('[WT] Rejecting direct token connection: invalid token (SessionId: %d)', [Session^.SessionId]));
+                Exit;
+              end;
 
-            if (TokenStr = '') or not Server.JWTManager.ValidateToken(TokenStr, JWT) then
+              try
+                var TokenIP := JWT.GetClaim('ip');
+                if (TokenIP <> '') and (QuicPeerIP <> '') and not AreIPAddressesMatching(TokenIP, QuicPeerIP) then
+                begin
+                  Logger.Warn(Format('[WT] Rejecting direct connection: QUIC peer IP "%s" does not match token IP "%s" (SessionId: %d)',
+                    [QuicPeerIP, TokenIP, Session^.SessionId]));
+                  Exit;
+                end;
+
+                var UserRole := JWT.GetClaim('role');
+                if UserRole = '' then
+                begin
+                  var CheckU: TUserEntry;
+                  if TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckU) then
+                    UserRole := CheckU.Role
+                  else
+                    UserRole := 'user';
+                end;
+
+                if not TGTermAppConfig.Instance.CanRoleAccessApp(UserRole, AppKey) or
+                   not TGTermUserConfig.Instance.CanAccessApp(JWT.Subject, AppKey) then
+                begin
+                  Logger.Warn(Format('[WT] Forbidden app access for user "%s" to app "%s"', [JWT.Subject, AppKey]));
+                  Exit;
+                end;
+
+                var WtCheckApp: TAppEntry;
+                if TGTermAppConfig.Instance.FindById(AppKey, WtCheckApp) and not WtCheckApp.IsExecutableAvailable then
+                begin
+                  Logger.Warn(Format('[WT] Rejected connection for unavailable app "%s" for user "%s"', [AppKey, JWT.Subject]));
+                  Exit;
+                end;
+
+                UserSandbox := JWT.GetClaim('sandbox');
+                Profile := ResolveAppProfile(Session^.Path, UserSandbox, JWT.Subject);
+                TermSession := TGTermSession.Create(Session, Profile, JWT.Subject, UserRole);
+                SessionManager.RegisterSession(Pointer(Session^.SessionId), TermSession);
+              finally
+                JWT.Free;
+              end;
+            end
+            else
             begin
-              if Assigned(JWT) then
-                FreeAndNil(JWT);
-              Logger.Warn(Format('[WT] Rejecting connection: invalid or missing token (SessionId: %d)', [Session^.SessionId]));
+              Logger.Warn(Format('[WT] Rejecting connection: missing ticket or token parameter (SessionId: %d)', [Session^.SessionId]));
               Exit;
             end;
-
-            try
-              var UserRole := JWT.GetClaim('role');
-              if UserRole = '' then
-              begin
-                var CheckU: TUserEntry;
-                if TGTermUserConfig.Instance.FindUser(JWT.Subject, CheckU) then
-                  UserRole := CheckU.Role
-                else
-                  UserRole := 'user';
-              end;
-
-              if not TGTermAppConfig.Instance.CanRoleAccessApp(UserRole, AppKey) or
-                 not TGTermUserConfig.Instance.CanAccessApp(JWT.Subject, AppKey) then
-              begin
-                Logger.Warn(Format('[WT] Forbidden app access for user "%s" to app "%s"', [JWT.Subject, AppKey]));
-                Exit;
-              end;
-              var WtCheckApp: TAppEntry;
-              if TGTermAppConfig.Instance.FindById(AppKey, WtCheckApp) and not WtCheckApp.IsExecutableAvailable then
-              begin
-                Logger.Warn(Format('[WT] Rejected connection for unavailable app "%s" for user "%s"', [AppKey, JWT.Subject]));
-                Exit;
-              end;
-
-              UserSandbox := JWT.GetClaim('sandbox');
-              Profile := ResolveAppProfile(Session^.Path, UserSandbox, JWT.Subject);
-              TermSession := TGTermSession.Create(Session, Profile, JWT.Subject, UserRole);
-              SessionManager.RegisterSession(Pointer(Session^.SessionId), TermSession);
-            finally
-              JWT.Free;
-            end;
+          finally
+            QueryParams.Free;
           end;
         end,
         procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
@@ -3901,8 +4386,7 @@ begin
           if Assigned(TermSession) then
           begin
             try
-              TermSession.SetWTStream(Session, Stream);
-              TermSession.ProcessClientMessage(TEncoding.UTF8.GetString(Data));
+              TermSession.ProcessStreamData(Session, Stream, Data);
             finally
               TermSession.Release;
             end;
@@ -3916,7 +4400,7 @@ begin
           if Assigned(TermSession) then
           begin
             try
-              TermSession.ProcessClientMessage(TEncoding.UTF8.GetString(Data));
+              TermSession.ProcessControlStreamData(Data);
             finally
               TermSession.Release;
             end;
@@ -4132,7 +4616,20 @@ begin
               ServerRoot := TPath.GetFullPath(ExtractFilePath(ParamStr(0)));
               UserHome := TPath.GetFullPath(TPath.Combine(ServerRoot, SessCtx.Sandbox));
               if not TDirectory.Exists(UserHome) then
-                TDirectory.CreateDirectory(UserHome);
+              begin
+                RespLine := '{"status":"error","message":"User sandbox directory does not exist"}'#10;
+                SetLength(RespBytes, Length(RespLine));
+                Move(RespLine[1], RespBytes[0], Length(RespLine));
+                Session.SendOnStream(Stream, RespBytes, True);
+                WTFileLock.Enter;
+                try
+                  WTFileStreams.Remove(Stream);
+                finally
+                  WTFileLock.Leave;
+                end;
+                StreamCtx.Free;
+                Exit;
+              end;
 
               if (ScopeVal = 'server') and not IsAdmin then
               begin
@@ -4736,7 +5233,9 @@ begin
         Logger.Info('  mTLS Client Authentication:       DISABLED (Standard TLS)');
       end;
       if GmTLSCaCertPath <> '' then
-        Logger.Info('  mTLS CA Certificate:              ' + GmTLSCaCertPath);
+        Logger.Info('  mTLS CA Certificate:              ' + GmTLSCaCertPath)
+      else if GmTLSMode <> mtlsDisabled then
+        Logger.Info('  mTLS CA Certificate:              NONE (Direct Trust / Windows Store only)');
       if GmTLSPinnedThumbprint <> '' then
         Logger.Info('  mTLS Pinned Direct Trust:         ' + GmTLSPinnedThumbprint);
       if Assigned(GTrustedClients) and (GTrustedClients.Count > 0) then
@@ -4786,6 +5285,7 @@ begin
       FreeAndNil(PendingSessionsLock);
       FreeAndNil(LoginRateMap);
       FreeAndNil(LoginRateLock);
+      FreeAndNil(GlobalQuotaManager);
       if Assigned(WTFileStreams) then
       begin
         for var Strm in WTFileStreams.Values do

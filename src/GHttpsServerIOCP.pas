@@ -283,16 +283,11 @@ type
     function InitializeRequestProcessing(OverlappedEx: POverlappedEx): Boolean;
     procedure ContinueReadingRequest(OverlappedEx: POverlappedEx);
     function ProcessSSLHandshakeStep(var OverlappedEx: TOverlappedEx; BytesReceived: DWORD): Boolean;
-    function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
-                             var PlainData: TBytes; out BytesConsumed: Integer): Boolean; overload;
-    function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
-                             var PlainData: TBytes; out BytesConsumed: Integer; out AStatus: SECURITY_STATUS): Boolean; overload;
     function EncryptBytesToSend(var Context: TCtxtHandle; const PlainData: TBytes; var EncryptedData: TBytes): Boolean;
     class function WorkerThreadProc(Parameter: Pointer): DWORD; stdcall; static;
     class function MonitorThreadProc(Parameter: Pointer): DWORD; stdcall; static;
     procedure CleanupOverlappedEx(OverlappedEx: POverlappedEx);
     function IsRequestComplete(Request: TRequest): Boolean;
-    procedure FreeSSLBuffer(var Buffer: Pointer; Size: Cardinal; const Context: string);
     procedure ProcessHttpRequest(OverlappedEx: POverlappedEx);
     procedure HandleHttp3Request(
       Sender: TObject;
@@ -316,6 +311,12 @@ type
     function HandleQuicBeforeAcceptConnection(Sender: TObject; const ARemoteIP: string): Boolean;
     procedure HandleQuicAfterCloseConnection(Sender: TObject; const ARemoteIP: string);
     procedure HandleQuicHandshakeFailed(Sender: TObject; const ARemoteIP: string);
+  protected
+    function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
+                             var PlainData: TBytes; out BytesConsumed: Integer): Boolean; overload;
+    function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
+                             var PlainData: TBytes; out BytesConsumed: Integer; out AStatus: SECURITY_STATUS): Boolean; overload;
+    procedure FreeSSLBuffer(var Buffer: Pointer; Size: Cardinal; const Context: string);
   public
     procedure TriggerWebSocketWrite(Session: TWebSocketSession);
     procedure CleanupWebSocketSession(Session: TWebSocketSession; const Reason: string);
@@ -634,7 +635,6 @@ begin
     end;
 
     Server.FOverlappedPool.Release(AOverlapped);
-    AOverlapped := nil;
   except
     on E: Exception do
       Logger.Error('Error in CleanupConnectionWithReason: ' + E.Message);
@@ -967,8 +967,6 @@ var
   OutputBufferDesc: TSecBufferDesc;
   Status: SECURITY_STATUS;
   dwType: DWORD;
-  StartTime: Cardinal;
-  BytesSent: Integer;
   i: Integer;
   OriginalBuffers: array[0..1] of Pointer;
   AllocatedBuffers: array[0..1] of Pointer;
@@ -991,7 +989,6 @@ begin
     end;
     Exit;
   end;
-  StartTime := GetTickCount;
   BuffersToFree := 0;
   FillChar(OriginalBuffers, SizeOf(OriginalBuffers), 0);
   FillChar(AllocatedBuffers, SizeOf(AllocatedBuffers), 0);
@@ -1063,7 +1060,7 @@ begin
       end;
     end;
     if (Status = SEC_E_OK) and (OutputBuffers[0].cbBuffer > 0) then
-      BytesSent := send(OverlappedEx.Socket, OutputBuffers[0].pvBuffer^, OutputBuffers[0].cbBuffer, 0)
+      send(OverlappedEx.Socket, OutputBuffers[0].pvBuffer^, OutputBuffers[0].cbBuffer, 0)
     else
       Logger.Error('Could not generate close_notify: Status=0x%x, Size=%d',
         [Status, OutputBuffers[0].cbBuffer]);
@@ -1089,7 +1086,7 @@ begin
       if Assigned(AllocatedBuffers[i]) then
       begin
         try
-          var FreeResult := FreeContextBuffer(AllocatedBuffers[i]);
+          FreeContextBuffer(AllocatedBuffers[i]);
         except
           on E: Exception do
             Logger.Error(Format('Exception freeing SSL shutdown buffer[%d]: %s', [i, E.Message]));
@@ -1548,7 +1545,6 @@ var
   end;
 
 begin
-  Result := False;
   if FCertificateStore = '' then
     FCertificateStore := 'GHttpsIOCPSvr';
 
@@ -1596,7 +1592,6 @@ var
   HashBytes: array[0..31] of Byte;
   HashSize: DWORD;
   CertPtr: PCERT_CONTEXT;
-  RawBytes: TBytes;
 begin
   SetLength(Result, 0);
   if FCertContext = nil then Exit;
@@ -1857,15 +1852,9 @@ begin
   var Http3DllErr: string;
   if FEnableHttp3 and (FProtocolMode <> pmHttpOnly) and not IsMsQuicDllAvailable(Http3DllErr) then
   begin
-    Writeln;
-    Writeln('================================================================');
-    Writeln('  CRITICAL ERROR: Failed to load required HTTP/3 libraries!');
-    Writeln('  Reason: ' + Http3DllErr);
-    Writeln('  The server cannot start without working msquic.dll and ls-qpack.dll.');
-    Writeln(Format('  Place valid 64-bit DLL files in: %s', [ExtractFilePath(ParamStr(0))]));
-    Writeln('================================================================');
-    Writeln;
-    Logger.Error('CRITICAL ERROR: Failed to load HTTP/3 libraries: %s', [Http3DllErr]);
+    Logger.Critical('CRITICAL ERROR: Failed to load required HTTP/3 libraries: ' + Http3DllErr);
+    Logger.Critical('The server cannot start without working msquic.dll and ls-qpack.dll.');
+    Logger.Critical(Format('Place valid 64-bit DLL files in: %s', [ExtractFilePath(ParamStr(0))]));
     Exit;
   end;
 
@@ -2277,7 +2266,6 @@ begin
         FActiveOverlappedLock.Leave;
       end;
       FOverlappedPool.Release(OverlappedEx);
-      OverlappedEx := nil;
     end;
   end;
 end;
@@ -2393,13 +2381,11 @@ var
   AllocatedBuffers: array[0..1] of Pointer;
   AllocatedSizes: array[0..1] of Cardinal;
   BuffersToFree: Integer;
-  StartTime: Cardinal;
   AlpnContext: SecPkgContext_ApplicationProtocol;
   AlpnStatus: SECURITY_STATUS;
 begin
   Result := False;
   BuffersToFree := 0;
-  StartTime := GetTickCount;
   FillChar(OriginalBuffers, SizeOf(OriginalBuffers), 0);
   FillChar(AllocatedBuffers, SizeOf(AllocatedBuffers), 0);
   FillChar(AllocatedSizes, SizeOf(AllocatedSizes), 0);
@@ -2495,7 +2481,7 @@ begin
             Logger.Info(Format('EROR: Allocated buffer too large: %d > %d',
               [OutputBuffers[i].cbBuffer, SizeOf(OverlappedEx.SSLOutputBuffer)]));
             OverlappedEx.SSLNeedsMoreData := False;
-            Result := False;
+            Exit(False);
           end;
         end
         else
@@ -2620,7 +2606,6 @@ var
   HexStr: string;
   SysTime: TSystemTime;
 begin
-  Result := False;
   FillChar(OverlappedEx.ClientCertInfo, SizeOf(OverlappedEx.ClientCertInfo), 0);
   RemoteCert := nil;
 
@@ -3506,13 +3491,6 @@ procedure TGHttpsServerIOCP.ProcessHttpRequest(OverlappedEx: POverlappedEx);
 var
   Response: TResponse;
   Request: TRequest;
-  Html, Json, FilePath: string;
-  I: Integer;
-  HeadersHtml: TStringBuilder;
-  RawHeadersString: string;
-  HeaderLines: TStringList;
-  HeaderLine, HeaderName, HeaderValue: string;
-  ColonPos: Integer;
   EmptyStream: TMemoryStream;
   Endpoint: TEndpointItem;
 begin
@@ -3575,7 +3553,7 @@ begin
       Exit;
     end;
 
-    var IsWebSocketRoute: Boolean := False;
+    var IsWebSocketRoute: Boolean;
     FLock.Enter;
     try
       IsWebSocketRoute := FWebSocketRoutes.ContainsKey(Request.RequestInfo.Path.ToLower);
@@ -3731,7 +3709,6 @@ begin
             AuthHeader := FJWTManager.ExtractTokenFromAuthHeader(AuthHeader);
             if Length(AuthHeader) > 0 then
             begin
-               isAuthorization:= False;
                var JWT: TJWTToken;
                if FJWTManager.ValidateToken(AuthHeader, JWT) then
                   isAuthorization:= True
@@ -4009,7 +3986,6 @@ begin
         end;
       end;
 
-      isAuthorized := True;
       if Endpoint.AuthorizationType = atJWTBearer then
       begin
         isAuthorized := False;
@@ -4108,7 +4084,6 @@ var
   //FreeMemMb: Int64;
   //RejectReason: string;
 begin
-  Result := 0;
   Server := TGHttpsServerIOCP(Parameter);
   GracefulShutdown := False;
   ConsecutiveErrors := 0;
@@ -4782,7 +4757,7 @@ begin
         begin
           if Assigned(OverlappedEx) then
           begin
-            var IsActive: Boolean := False;
+            var IsActive: Boolean;
             Server.FActiveOverlappedLock.Enter;
             try
               IsActive := Server.FActiveOverlapped.Contains(OverlappedEx);
@@ -4818,7 +4793,7 @@ begin
           begin
              if (CompletionKey <> 0) and (OverlappedEx^.OpType <> otAccept) and (CompletionKey <> ULONG_PTR(OverlappedEx^.Socket)) then
                Continue;
-            var IsActive: Boolean := False;
+            var IsActive: Boolean;
             Server.FActiveOverlappedLock.Enter;
             try
               IsActive := Server.FActiveOverlapped.Contains(OverlappedEx);
@@ -4837,7 +4812,7 @@ begin
         begin
           if Assigned(OverlappedEx) then
           begin
-            var IsActive: Boolean := False;
+            var IsActive: Boolean;
             Server.FActiveOverlappedLock.Enter;
             try
               IsActive := Server.FActiveOverlapped.Contains(OverlappedEx);
@@ -4878,7 +4853,7 @@ procedure TGHttpsServerIOCP.ContinueSendingResponse(OverlappedEx: POverlappedEx)
 var
   PlainChunk: TBytes;
   EncryptedChunk: TBytes;
-  BytesToEncrypt, BytesConsumed: Integer;
+  BytesToEncrypt: Integer;
   WSABuf: TWSABUF;
   BytesSentIO, Flags: DWORD;
   Response: TResponse;
@@ -4968,7 +4943,6 @@ begin
     end;
     SetLength(PlainChunk, BytesToEncrypt);
     Move(PlainChunkBuffer[0], PlainChunk[0], BytesToEncrypt);
-    BytesConsumed := 0;
     if OverlappedEx^.IsTLS and OverlappedEx^.SSLContextValid then
     begin
       if not EncryptBytesToSend(OverlappedEx^.SSLContext, PlainChunk, EncryptedChunk) then
@@ -5035,12 +5009,10 @@ var
   AllocatedBuffers: array[0..3] of Pointer;
   AllocatedSizes: array[0..3] of Cardinal;
   BuffersToFree: Integer;
-  StartTime: Cardinal;
 begin
   Result := False;
   SetLength(EncryptedData, 0);
   BuffersToFree := 0;
-  StartTime := GetTickCount;
   FillChar(OriginalBuffers, SizeOf(OriginalBuffers), 0);
   FillChar(AllocatedBuffers, SizeOf(AllocatedBuffers), 0);
   FillChar(AllocatedSizes, SizeOf(AllocatedSizes), 0);

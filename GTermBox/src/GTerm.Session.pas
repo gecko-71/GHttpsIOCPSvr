@@ -46,8 +46,12 @@ type
   TGTermSession = class
   private
     FRefCount: Integer;
-    FWTSession: TWTSessionContext;
+    FWTSessionContext: TWTSessionContext;
+    FWTSession: PWTSessionContext;
+    FWTHasSession: Boolean;
     FWTStream: HQUIC;
+    FWTControlStream: HQUIC;
+    FControlBuffer: string;
     FConPty: TGTermConPty;
     FCols: Integer;
     FRows: Integer;
@@ -70,6 +74,10 @@ type
     procedure Retain;
     procedure Release;
     procedure SetWTStream(ASession: PWTSessionContext; AStream: HQUIC);
+    procedure SetWTControlStream(ASession: PWTSessionContext; AStream: HQUIC);
+    procedure ProcessStreamData(ASession: PWTSessionContext; AStream: HQUIC; const Data: TBytes);
+    procedure ProcessControlStreamData(const Data: TBytes);
+    procedure WriteInputChunked(const AInputStr: string);
     procedure Start;
     procedure Stop;
     procedure SwitchProfile(const AAppKey: string);
@@ -79,6 +87,7 @@ type
     property ConnectedTick: UInt64 read FConnectedTick;
     property LastActivityTick: UInt64 read FLastActivityTick;
     property WTStream: HQUIC read FWTStream;
+    property WTControlStream: HQUIC read FWTControlStream;
     property ConPty: TGTermConPty read FConPty;
     property Profile: TGTermAppProfile read FProfile;
     property Username: string read FUsername;
@@ -137,10 +146,19 @@ begin
   inherited Create;
   FRefCount := 1;
   if AWTSession <> nil then
-    FWTSession := AWTSession^
+  begin
+    FWTSessionContext := AWTSession^;
+    FWTSession := @FWTSessionContext;
+    FWTHasSession := True;
+  end
   else
-    FWTSession := Default(TWTSessionContext);
+  begin
+    FWTSession := nil;
+    FWTHasSession := False;
+  end;
   FWTStream := nil;
+  FWTControlStream := nil;
+  FControlBuffer := '';
   FProfile := AProfile;
   FUsername := AUsername;
   FRole := ARole;
@@ -196,13 +214,17 @@ var
   IsNewStream: Boolean;
   PendingBytes: TBytes;
 begin
-  IsNewStream := (FWTStream = nil) or (FWTStream <> AStream);
-  if ASession <> nil then
-    FWTSession := ASession^;
-  FWTStream := AStream;
   if FSessionLock <> nil then
     FSessionLock.Enter;
   try
+    IsNewStream := (FWTStream = nil) or (FWTStream <> AStream);
+    if ASession <> nil then
+    begin
+      FWTSessionContext := ASession^;
+      FWTSession := @FWTSessionContext;
+      FWTHasSession := True;
+    end;
+    FWTStream := AStream;
     PendingBytes := FInitialBuffer;
     SetLength(FInitialBuffer, 0);
   finally
@@ -210,8 +232,13 @@ begin
       FSessionLock.Leave;
   end;
   Logger.Info(Format('[Session] SetWTStream called: Stream=%p, PendingBytes=%d', [Pointer(AStream), Length(PendingBytes)]));
-  if (FWTStream <> nil) and (Length(PendingBytes) > 0) then
-    FWTSession.SendOnStream(FWTStream, PendingBytes, False);
+  if (FWTStream <> nil) and (Length(PendingBytes) > 0) and FWTHasSession and (FWTSession <> nil) then
+  begin
+    try
+      FWTSession^.SendOnStream(FWTStream, PendingBytes, False);
+    except
+    end;
+  end;
   FLastActivityTick := GetTickCount64;
   if not FConPty.Running then
     Start;
@@ -239,8 +266,13 @@ begin
       var ErrMsg := #13#10#27'[1;31m[GTermBox Error] Application unavailable: "' + FProfile.ProfileName + '"'#27'[0m'#13#10 +
                     #27'[33mThe specified application is not installed on this server.'#27'[0m'#13#10#13#10;
       var ErrBytes := TEncoding.UTF8.GetBytes(ErrMsg);
-      if FWTStream <> nil then
-        FWTSession.SendOnStream(FWTStream, ErrBytes, False);
+      if (FWTStream <> nil) and FWTHasSession and (FWTSession <> nil) then
+      begin
+        try
+          FWTSession^.SendOnStream(FWTStream, ErrBytes, False);
+        except
+        end;
+      end;
       SendClientText('{"type":"app_error","app":"' + FProfile.ProfileName + '","reason":"process_failed"}');
       Stop;
       Exit;
@@ -326,44 +358,88 @@ procedure TGTermSession.Stop;
 var
   DataBytes: TBytes;
   StreamToClose: HQUIC;
+  ControlStreamToClose: HQUIC;
+  PtyToStop: TGTermConPty;
+  SessionToClose: PWTSessionContext;
+  HasSessionToClose: Boolean;
 begin
+  PtyToStop := nil;
   if Assigned(FSessionLock) then
     FSessionLock.Enter;
   try
     if TInterlocked.CompareExchange(FStopping, 1, 0) <> 0 then Exit;
     FClosed := True;
     StreamToClose := FWTStream;
+    ControlStreamToClose := FWTControlStream;
+    SessionToClose := FWTSession;
+    HasSessionToClose := FWTHasSession and (SessionToClose <> nil);
+    FWTHasSession := False;
+    FWTSession := nil;
     FWTStream := nil;
-    if StreamToClose <> nil then
-    begin
-      SetLength(DataBytes, 0);
-      try
-        FWTSession.SendOnStream(StreamToClose, DataBytes, True);
-        FWTSession.Close;
-      except
-      end;
-    end;
+    FWTControlStream := nil;
     if Assigned(FConPty) then
     begin
       FConPty.OnDataReceived := nil;
       FConPty.OnProcessTerminated := nil;
-      FConPty.StopProcess;
+      PtyToStop := FConPty;
     end;
   finally
     if Assigned(FSessionLock) then
       FSessionLock.Leave;
   end;
+
+  if (ControlStreamToClose <> nil) and HasSessionToClose then
+  begin
+    SetLength(DataBytes, 0);
+    try
+      SessionToClose^.SendOnStream(ControlStreamToClose, DataBytes, True);
+    except
+    end;
+  end;
+
+  if (StreamToClose <> nil) and HasSessionToClose then
+  begin
+    SetLength(DataBytes, 0);
+    try
+      SessionToClose^.SendOnStream(StreamToClose, DataBytes, True);
+      SessionToClose^.Close;
+    except
+    end;
+  end;
+
+  if Assigned(PtyToStop) then
+    PtyToStop.StopProcess;
 end;
 
 procedure TGTermSession.SendClientText(const AText: string);
 var
   DataBytes: TBytes;
+  ActiveStream: HQUIC;
+  ActiveSession: PWTSessionContext;
+  HasActiveSession: Boolean;
 begin
-  if FClosed or (AText = '') or (FWTStream = nil) then Exit;
-
+  if FClosed or (AText = '') then Exit;
   FLastActivityTick := GetTickCount64;
-  DataBytes := TEncoding.UTF8.GetBytes(AText + #10);
-  FWTSession.SendOnStream(FWTStream, DataBytes, False);
+
+  if FSessionLock <> nil then
+    FSessionLock.Enter;
+  try
+    ActiveStream := FWTStream;
+    ActiveSession := FWTSession;
+    HasActiveSession := FWTHasSession and (ActiveSession <> nil);
+  finally
+    if FSessionLock <> nil then
+      FSessionLock.Leave;
+  end;
+
+  if (ActiveStream <> nil) and HasActiveSession then
+  begin
+    DataBytes := TEncoding.UTF8.GetBytes(AText + #10);
+    try
+      ActiveSession^.SendOnStream(ActiveStream, DataBytes, False);
+    except
+    end;
+  end;
 end;
 
 procedure TGTermSession.SendInitialScreen;
@@ -377,33 +453,48 @@ begin
 end;
 
 procedure TGTermSession.HandlePtyDataReceived(const AData: TBytes; ACount: Integer);
+var
+  ActiveStream: HQUIC;
+  ActiveSession: PWTSessionContext;
+  HasActiveSession: Boolean;
 begin
   Retain;
   try
     if FClosed or (FStopping <> 0) or (Length(AData) = 0) then Exit;
     FLastActivityTick := GetTickCount64;
-    Logger.Info(Format('[Session] PTY data received: %d bytes (Stream=%p)', [Length(AData), Pointer(FWTStream)]));
 
-    if FWTStream <> nil then
+    if FSessionLock <> nil then
+      FSessionLock.Enter;
+    try
+      ActiveStream := FWTStream;
+      ActiveSession := FWTSession;
+      HasActiveSession := FWTHasSession and (ActiveSession <> nil);
+      if ActiveStream = nil then
       begin
-        FWTSession.SendOnStream(FWTStream, AData, False);
-      end
-      else
-      begin
-        if FSessionLock <> nil then
-          FSessionLock.Enter;
-        try
-          var OldLen := Length(FInitialBuffer);
-          if OldLen + Length(AData) < 524288 then
-          begin
-            SetLength(FInitialBuffer, OldLen + Length(AData));
-            Move(AData[0], FInitialBuffer[OldLen], Length(AData));
-          end;
-        finally
-          if FSessionLock <> nil then
-            FSessionLock.Leave;
+        var OldLen := Length(FInitialBuffer);
+        if OldLen + Length(AData) < 524288 then
+        begin
+          SetLength(FInitialBuffer, OldLen + Length(AData));
+          Move(AData[0], FInitialBuffer[OldLen], Length(AData));
         end;
       end;
+    finally
+      if FSessionLock <> nil then
+        FSessionLock.Leave;
+    end;
+
+    if (ActiveStream <> nil) and HasActiveSession then
+    begin
+      Logger.Info(Format('[Session] HandlePtyDataReceived sending %d bytes to stream %p', [Length(AData), Pointer(ActiveStream)]));
+      try
+        ActiveSession^.SendOnStream(ActiveStream, AData, False);
+      except
+        on E: Exception do
+          Logger.Error('[Session] SendOnStream exception: ' + E.Message);
+      end;
+    end
+    else
+      Logger.Warn(Format('[Session] HandlePtyDataReceived dropped %d bytes (ActiveStream=%p, HasSession=%s)', [Length(AData), Pointer(ActiveStream), IfThen(HasActiveSession, 'true', 'false')]));
   finally
     Release;
   end;
@@ -421,18 +512,124 @@ begin
   end;
 end;
 
+procedure TGTermSession.SetWTControlStream(ASession: PWTSessionContext; AStream: HQUIC);
+begin
+  if FSessionLock <> nil then
+    FSessionLock.Enter;
+  try
+    if ASession <> nil then
+    begin
+      FWTSessionContext := ASession^;
+      FWTSession := @FWTSessionContext;
+      FWTHasSession := True;
+    end;
+    FWTControlStream := AStream;
+  finally
+    if FSessionLock <> nil then
+      FSessionLock.Leave;
+  end;
+  Logger.Info(Format('[Session] SetWTControlStream called: Stream=%p', [Pointer(AStream)]));
+end;
+
+procedure TGTermSession.WriteInputChunked(const AInputStr: string);
+const
+  CHUNK_SIZE = 4096;
+var
+  Offset, ChunkLen: Integer;
+begin
+  if FClosed or (FStopping <> 0) or (AInputStr = '') then Exit;
+  FLastActivityTick := GetTickCount64;
+  if Assigned(FConPty) and FConPty.Running then
+  begin
+    Offset := 1;
+    while Offset <= Length(AInputStr) do
+    begin
+      ChunkLen := Length(AInputStr) - Offset + 1;
+      if ChunkLen > CHUNK_SIZE then
+        ChunkLen := CHUNK_SIZE;
+      FConPty.WriteInput(Copy(AInputStr, Offset, ChunkLen));
+      Inc(Offset, ChunkLen);
+    end;
+  end;
+end;
+
+procedure TGTermSession.ProcessStreamData(ASession: PWTSessionContext; AStream: HQUIC; const Data: TBytes);
+begin
+  if FClosed or (FStopping <> 0) or (Length(Data) = 0) then Exit;
+  FLastActivityTick := GetTickCount64;
+
+  if FSessionLock <> nil then
+    FSessionLock.Enter;
+  try
+    if FWTStream = nil then
+      SetWTStream(ASession, AStream);
+
+    if AStream = FWTStream then
+    begin
+      var LRawData := TEncoding.UTF8.GetString(Data);
+      var LTrimData := Trim(LRawData);
+      if (LTrimData <> '') and (LTrimData[1] = '{') and (LTrimData[Length(LTrimData)] = '}') and
+         (Pos('"type"', LTrimData) > 0) then
+        ProcessClientMessage(LTrimData)
+      else
+        WriteInputChunked(TEncoding.UTF8.GetString(Data));
+      Exit;
+    end;
+
+    if FWTControlStream = nil then
+      FWTControlStream := AStream;
+  finally
+    if FSessionLock <> nil then
+      FSessionLock.Leave;
+  end;
+
+  if AStream = FWTControlStream then
+    ProcessControlStreamData(Data);
+end;
+
+procedure TGTermSession.ProcessControlStreamData(const Data: TBytes);
+var
+  Chunk: string;
+  NewlinePos: Integer;
+  Line: string;
+begin
+  Chunk := TEncoding.UTF8.GetString(Data);
+  FControlBuffer := FControlBuffer + Chunk;
+
+  while True do
+  begin
+    NewlinePos := Pos(#10, FControlBuffer);
+    if NewlinePos > 0 then
+    begin
+      Line := Trim(Copy(FControlBuffer, 1, NewlinePos - 1));
+      FControlBuffer := Copy(FControlBuffer, NewlinePos + 1, MaxInt);
+      if Line <> '' then
+        ProcessSingleClientMessage(Line);
+    end
+    else
+    begin
+      Line := Trim(FControlBuffer);
+      if (Line <> '') and (Line[1] = '{') and (Line[Length(Line)] = '}') then
+      begin
+        FControlBuffer := '';
+        ProcessSingleClientMessage(Line);
+      end;
+      Break;
+    end;
+  end;
+end;
 procedure TGTermSession.ProcessClientMessage(const AMessageText: string);
 var
   CleanText: string;
 begin
-  if FClosed or (FStopping <> 0) or (AMessageText = '') or (Length(AMessageText) > 65536) then Exit;
+  if FClosed or (FStopping <> 0) or (AMessageText = '') then Exit;
   FLastActivityTick := GetTickCount64;
 
   CleanText := Trim(AMessageText);
   if (CleanText <> '') and (CleanText[1] = '{') and (CleanText[Length(CleanText)] = '}') then
     ProcessSingleClientMessage(CleanText)
-  else if Assigned(FConPty) and FConPty.Running then
-    FConPty.WriteInput(AMessageText);
+  else
+    WriteInputChunked(AMessageText);
 end;
 
 procedure TGTermSession.ProcessSingleClientMessage(const AMessageText: string);

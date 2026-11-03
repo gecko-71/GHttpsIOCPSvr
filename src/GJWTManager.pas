@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -27,7 +27,7 @@ unit GJWTManager;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, System.Threading, System.StrUtils,
+  Winapi.Windows, SysUtils, Classes, SyncObjs, System.Threading, System.StrUtils,
   System.JSON, System.NetEncoding, System.Generics.Collections,
   System.DateUtils, System.Hash, System.Math;
 
@@ -103,6 +103,7 @@ type
     FEnableSecurityLogging: Boolean;
     FRevokedTokens: TDictionary<string, TDateTime>;
     FRevocationLock: TCriticalSection;
+    FRevocationStorePath: string;
     function ValidateAlgorithm(const Algorithm: string): Boolean;
     function CreateSignature(const HeaderPayload: string): string;
     function VerifySignature(const HeaderPayload, Signature: string): Boolean;
@@ -135,6 +136,10 @@ type
     function IsTokenRevoked(const Token: string): Boolean;
     function IsJtiRevoked(const AJti: string): Boolean;
     procedure PruneExpiredRevocations;
+    procedure SetRevocationStorePath(const APath: string);
+    procedure SaveRevocationsToFile(const APath: string);
+    procedure LoadRevocationsFromFile(const APath: string);
+    property RevocationStorePath: string read FRevocationStorePath write SetRevocationStorePath;
 
     property SecretKey: string read FSecretKey write FSecretKey;
     property Issuer: string read FIssuer write FIssuer;
@@ -409,7 +414,7 @@ const
 var
   DataBytes, KeyBytes, PaddedKey, o_key_pad, i_key_pad, InnerHash, OuterHash, HashedKey: TBytes;
   i: Integer;
-  KeyAnsi, InnerDataAnsi, OuterDataAnsi: AnsiString;
+  KeyAnsi: AnsiString;
 begin
   Result := '';
   DataBytes := TEncoding.UTF8.GetBytes(HeaderPayload);
@@ -457,7 +462,6 @@ function TJWTManager.VerifySignature(const HeaderPayload, Signature: string): Bo
 var
   ExpectedSignature: string;
 begin
-  Result := False;
   try
     ExpectedSignature := CreateSignature(HeaderPayload);
     Result := (ExpectedSignature <> '') and SecureCompare(ExpectedSignature, Signature);
@@ -1001,6 +1005,8 @@ begin
     FRevocationLock.Leave;
   end;
   LogSecurityEvent('JWT token revoked', SigKey);
+  if FRevocationStorePath <> '' then
+    SaveRevocationsToFile(FRevocationStorePath);
 end;
 
 function TJWTManager.NowUTC: TDateTime;
@@ -1021,6 +1027,8 @@ begin
     FRevocationLock.Leave;
   end;
   LogSecurityEvent('JWT JTI revoked', AJti);
+  if FRevocationStorePath <> '' then
+    SaveRevocationsToFile(FRevocationStorePath);
 end;
 
 function TJWTManager.IsTokenRevoked(const Token: string): Boolean;
@@ -1090,6 +1098,164 @@ begin
   finally
     KeysToRemove.Free;
   end;
+end;
+
+type
+  PSECURITY_DESCRIPTOR = Pointer;
+
+const
+  SE_FILE_OBJECT = 1;
+  DACL_SECURITY_INFORMATION = $00000004;
+  PROTECTED_DACL_SECURITY_INFORMATION = $80000000;
+
+function ConvertStringSecurityDescriptorToSecurityDescriptorW(
+  StringSecurityDescriptor: LPCWSTR;
+  StringSDRevision: DWORD;
+  var SecurityDescriptor: PSECURITY_DESCRIPTOR;
+  SecurityDescriptorSize: PULONG): BOOL; stdcall; external 'advapi32.dll';
+
+function SetNamedSecurityInfoW(
+  pObjectName: LPCWSTR;
+  ObjectType: DWORD;
+  SecurityInfo: DWORD;
+  psidOwner, psidGroup: Pointer;
+  pDacl, pSacl: Pointer): DWORD; stdcall; external 'advapi32.dll';
+
+function GetSecurityDescriptorDacl(
+  pSecurityDescriptor: Pointer;
+  var lpbDaclPresent: BOOL;
+  var pDacl: Pointer;
+  var lpbDaclDefaulted: BOOL): BOOL; stdcall; external 'advapi32.dll';
+
+function LocalFree(hMem: THandle): THandle; stdcall; external 'kernel32.dll';
+
+procedure RestrictRevocationFileAcl(const APath: string);
+var
+  pSD: PSECURITY_DESCRIPTOR;
+  pDacl: Pointer;
+  bPresent, bDefaulted: BOOL;
+begin
+  pSD := nil;
+  pDacl := nil;
+  bPresent := False;
+  bDefaulted := False;
+  if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+    'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)', 1, pSD, nil) then
+  begin
+    try
+      if GetSecurityDescriptorDacl(pSD, bPresent, pDacl, bDefaulted) then
+      begin
+        SetNamedSecurityInfoW(
+          PWideChar(APath),
+          SE_FILE_OBJECT,
+          DACL_SECURITY_INFORMATION or PROTECTED_DACL_SECURITY_INFORMATION,
+          nil, nil, pDacl, nil
+        );
+      end;
+    finally
+      LocalFree(THandle(pSD));
+    end;
+  end;
+end;
+
+procedure TJWTManager.SaveRevocationsToFile(const APath: string);
+var
+  Root: TJSONObject;
+  K: string;
+  ExpVal: TDateTime;
+  TargetDir: string;
+begin
+  if APath = '' then Exit;
+  Root := TJSONObject.Create;
+  try
+    FRevocationLock.Enter;
+    try
+      for K in FRevokedTokens.Keys do
+      begin
+        if FRevokedTokens.TryGetValue(K, ExpVal) then
+        begin
+          if (ExpVal = 0) or (ExpVal > NowUTC) then
+            Root.AddPair(K, DateToISO8601(ExpVal));
+        end;
+      end;
+    finally
+      FRevocationLock.Leave;
+    end;
+
+    try
+      TargetDir := ExtractFilePath(APath);
+      if (TargetDir <> '') and not DirectoryExists(TargetDir) then
+        ForceDirectories(TargetDir);
+
+      with TStringList.Create do
+      try
+        Text := Root.Format(2);
+        var EncNoBom := TUTF8Encoding.Create(False);
+        try
+          SaveToFile(APath, EncNoBom);
+        finally
+          EncNoBom.Free;
+        end;
+      finally
+        Free;
+      end;
+
+      RestrictRevocationFileAcl(APath);
+    except
+      on E: Exception do
+        Logger.Error(Format('[JWT] Error saving revocations: %s', [E.Message]));
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TJWTManager.LoadRevocationsFromFile(const APath: string);
+var
+  Root: TJSONObject;
+  Content: string;
+  I: Integer;
+  Pair: TJSONPair;
+  ExpDate: TDateTime;
+begin
+  if not FileExists(APath) then Exit;
+  with TStringList.Create do
+  try
+    LoadFromFile(APath, TEncoding.UTF8);
+    Content := Text;
+  finally
+    Free;
+  end;
+
+  Root := TJSONObject.ParseJSONValue(Content) as TJSONObject;
+  if Root = nil then Exit;
+  try
+    FRevocationLock.Enter;
+    try
+      for I := 0 to Root.Count - 1 do
+      begin
+        Pair := Root.Pairs[I];
+        try
+          ExpDate := ISO8601ToDate(Pair.JsonValue.Value);
+        except
+          ExpDate := IncHour(NowUTC, 24);
+        end;
+        if (ExpDate = 0) or (ExpDate > NowUTC) then
+          FRevokedTokens.AddOrSetValue(Pair.JsonString.Value, ExpDate);
+      end;
+    finally
+      FRevocationLock.Leave;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TJWTManager.SetRevocationStorePath(const APath: string);
+begin
+  FRevocationStorePath := APath;
+  if (FRevocationStorePath <> '') and FileExists(FRevocationStorePath) then
+    LoadRevocationsFromFile(FRevocationStorePath);
 end;
 
 end.

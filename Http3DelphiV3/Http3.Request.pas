@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) 2026 GECKO-71
@@ -85,7 +85,6 @@ function TQuicHttp3Request.AddHeader(const Name, Value: string): Boolean;
 var
   LowerName: string;
 begin
-  Result := False;
   LowerName := LowerCase(Trim(Name));
 
   if (LowerName = 'connection') or (LowerName = 'keep-alive') or

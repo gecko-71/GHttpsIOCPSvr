@@ -19,5 +19,6 @@
     <File Path="GHttpsIOCPSvr\Http3DelphiV3\MsQuic.Types.pas"/>
     <File Path="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Types.pas"/>
     <File Path="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Session.pas"/>
+    <File Path="GHttpsIOCPSvr\Http3DelphiV3\Quic.Server.pas"/>
   </ProjectSortOrder>
 </BorlandProject>

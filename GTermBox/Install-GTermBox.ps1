@@ -2,7 +2,7 @@
 param(
   [string]$BindIp = '',
   [int]$Port = 8443,
-  [string]$Password = '1234',
+  [string]$Password = '',
   [string]$AssetsDir = '',
   [string]$InstallDir = '',
   [switch]$SkipFirewall,
@@ -15,6 +15,17 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   $InstallDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 }
 $InstallDir = (Resolve-Path $InstallDir).Path
+
+if ([string]::IsNullOrWhiteSpace($Password)) {
+  $rngBytes = New-Object byte[] 16
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  $rng.GetBytes($rngBytes)
+  $Password = [System.Convert]::ToBase64String($rngBytes).Replace('+', 'A').Replace('/', 'B').TrimEnd('=') + '!9a'
+  Write-Host "==========================================================" -ForegroundColor Yellow
+  Write-Host " GENERATED SECURE ADMIN PASSWORD: $Password" -ForegroundColor Green
+  Write-Host " Store this password securely! You must change it on first login." -ForegroundColor Yellow
+  Write-Host "==========================================================" -ForegroundColor Yellow
+}
 
 function Write-Step([string]$Text) { Write-Host ''; Write-Host $Text -ForegroundColor Yellow }
 function Write-Ok([string]$Text) { Write-Host "  [+] $Text" -ForegroundColor Green }
@@ -367,12 +378,18 @@ if (Test-Path $genScript) {
     if ($ecdsaKey -and $ecdsaKey.Key -and $ecdsaKey.Key.UniqueName) {
       $keyPath = "$env:ProgramData\Microsoft\Crypto\Keys\" + $ecdsaKey.Key.UniqueName
       if (Test-Path $keyPath) {
-        $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'Read', 'Allow')
+        & icacls.exe $keyPath /remove "*S-1-1-0" /Q | Out-Null
+        & icacls.exe $keyPath /grant "*S-1-5-18:(R)" "*S-1-5-32-544:(R)" /Q | Out-Null
         $acl = Get-Acl -Path $keyPath
-        $acl.AddAccessRule($rule)
+        $rulesToRemove = @($acl.Access | Where-Object { $_.IdentityReference.Value -match 'S-1-1-0|Everyone|Wszyscy' })
+        foreach ($r in $rulesToRemove) {
+          [void]$acl.RemoveAccessRule($r)
+        }
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem, 'Read', 'Allow')))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins, 'Read', 'Allow')))
         Set-Acl -Path $keyPath -AclObject $acl
-        & icacls.exe $keyPath /grant "*S-1-1-0:(R)" /Q | Out-Null
       }
     }
   } catch {}
@@ -450,7 +467,7 @@ try {
 }
 
 Write-Step '[8/9] Configuring ACLs, firewall and start script...'
-foreach ($acl in @(@{ P = 'sandbox_admin'; R = '(OI)(CI)F' }, @{ P = 'sandbox_usr1'; R = '(OI)(CI)F' }, @{ P = 'web'; R = '(OI)(CI)RX' }, @{ P = 'PyTui'; R = '(OI)(CI)RX' }, @{ P = 'trusted_clients'; R = '(OI)(CI)RX' })) {
+foreach ($acl in @(@{ P = 'web'; R = '(OI)(CI)RX' }, @{ P = 'PyTui'; R = '(OI)(CI)RX' }, @{ P = 'trusted_clients'; R = '(OI)(CI)RX' })) {
   $p = Join-Path $InstallDir $acl.P
   if (Test-Path $p) { & icacls $p /grant "*S-1-15-2-1:$($acl.R)" /T /C /Q | Out-Null }
 }

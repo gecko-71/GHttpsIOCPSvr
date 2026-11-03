@@ -1,7 +1,11 @@
 [CmdletBinding()]
 param(
   [string]$InstallDir = '',
-  [switch]$ForceDownload
+  [switch]$ForceDownload,
+  [string]$FarArchive = '',
+  [string]$FarExpectedSha256 = '',
+  [string]$EditArchive = '',
+  [string]$EditExpectedSha256 = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +23,13 @@ $InstallDir = (Resolve-Path $InstallDir).Path
 
 $ManageExe = Join-Path $InstallDir 'ManageUsers.exe'
 if (-not (Test-Path $ManageExe)) {
+  if (Test-Path (Join-Path $PSScriptRoot 'ManageUsers.exe')) {
+    $ManageExe = Join-Path $PSScriptRoot 'ManageUsers.exe'
+  } elseif (Test-Path (Join-Path (Get-Location).Path 'ManageUsers.exe')) {
+    $ManageExe = Join-Path (Get-Location).Path 'ManageUsers.exe'
+  }
+}
+if (-not (Test-Path $ManageExe)) {
   Write-Host "ManageUsers.exe not found in $InstallDir" -ForegroundColor Red
   exit 1
 }
@@ -28,6 +39,21 @@ function Write-Ok([string]$Text) { Write-Host "  [+] $Text" -ForegroundColor Gre
 function Write-Info([string]$Text) { Write-Host "  [=] $Text" -ForegroundColor DarkGray }
 function Write-Warn([string]$Text) { Write-Host "  [!] $Text" -ForegroundColor DarkYellow }
 function Stop-Script([string]$Text) { Write-Host "  [X] $Text" -ForegroundColor Red; exit 1 }
+
+function Get-ArchiveSha256([string]$Path) {
+  if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+  }
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $bytes = $sha.ComputeHash($stream)
+    return ([System.BitConverter]::ToString($bytes) -replace '-').ToUpperInvariant()
+  } finally {
+    $stream.Close()
+    $sha.Dispose()
+  }
+}
 
 function Invoke-Manage {
   param([string[]]$Arguments)
@@ -51,40 +77,72 @@ $FarDir = Join-Path $InstallDir 'Far'
 $FarExe = Join-Path $FarDir 'Far.exe'
 $farInstalled = $false
 
-if ((Test-Path $FarExe) -and (-not $ForceDownload)) {
+if ((Test-Path $FarExe) -and (-not $ForceDownload) -and (-not $FarArchive)) {
   Write-Info "Far.exe already present in $FarDir"
   $farInstalled = $true
 } else {
   Write-Info 'Attempting to download Far Manager from GitHub releases...'
+  $tempArchive = ''
+  $isTempFile = $false
   try {
-    $downloadUrl = ''
-    try {
-      $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/FarGroup/FarManager/releases/latest' -Headers @{ 'User-Agent' = 'PowerShell' } -TimeoutSec 15
-      $asset = $rel.assets | Where-Object { $_.name -like '*x64*.7z' -and $_.name -notlike '*pdb*' } | Select-Object -First 1
-      if ($asset) { $downloadUrl = $asset.browser_download_url }
-    } catch {
-    }
-
-    if (-not $downloadUrl) {
-      $downloadUrl = 'https://github.com/FarGroup/FarManager/releases/download/ci/v3.0.6750.5033/Far_3.0.6750.5033_x64_20261102_b16f95d.7z'
-    }
-
-    $tempArchive = Join-Path $env:TEMP ("far_download_" + [System.Guid]::NewGuid().ToString('N') + '.7z')
-    try {
-      Invoke-WebRequest -Uri $downloadUrl -OutFile $tempArchive -TimeoutSec 45
-      if (-not (Test-Path $FarDir)) { New-Item -ItemType Directory -Path $FarDir -Force | Out-Null }
-      & tar.exe -xf $tempArchive -C $FarDir
-      if (Test-Path $FarExe) {
-        $farInstalled = $true
-        Write-Ok "Far Manager downloaded and deployed to $FarDir"
-      } else {
-        Write-Warn "Extraction finished but Far.exe not found in $FarDir"
+    if (-not [string]::IsNullOrWhiteSpace($FarArchive)) {
+      $tempArchive = (Resolve-Path $FarArchive).Path
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:FAR_ARCHIVE_PATH)) {
+      $tempArchive = (Resolve-Path $env:FAR_ARCHIVE_PATH).Path
+    } else {
+      $downloadUrl = ''
+      try {
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/FarGroup/FarManager/releases/latest' -Headers @{ 'User-Agent' = 'PowerShell' } -TimeoutSec 15
+        $asset = $rel.assets | Where-Object { $_.name -like '*x64*.7z' -and $_.name -notlike '*pdb*' } | Select-Object -First 1
+        if ($asset) { $downloadUrl = $asset.browser_download_url }
+      } catch {
       }
-    } finally {
-      if (Test-Path $tempArchive) { Remove-Item $tempArchive -Force -ErrorAction SilentlyContinue }
+
+      if (-not $downloadUrl) {
+        $downloadUrl = 'https://github.com/FarGroup/FarManager/releases/download/ci/v3.0.6750.5033/Far_3.0.6750.5033_x64_20261102_b16f95d.7z'
+      }
+
+      $tempArchive = Join-Path $env:TEMP ("far_download_" + [System.Guid]::NewGuid().ToString('N') + '.7z')
+      $isTempFile = $true
+      Invoke-WebRequest -Uri $downloadUrl -OutFile $tempArchive -TimeoutSec 45
     }
+
+    if (-not (Test-Path $tempArchive)) {
+      Stop-Script "Archive file not found: $tempArchive"
+    }
+
+    $actualHash = (Get-ArchiveSha256 -Path $tempArchive)
+    $expectedHash = $FarExpectedSha256
+    if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+      $expectedHash = $env:FAR_EXPECTED_SHA256
+    }
+    if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+      $expectedHash = '67B54784615E28B0263690B754B4B1842C62F885743D5155E627B139CD17D01A'
+    }
+
+    if ($actualHash.ToUpperInvariant() -ne $expectedHash.ToUpperInvariant()) {
+      if (Test-Path $tempArchive) {
+        Remove-Item $tempArchive -Force -ErrorAction SilentlyContinue
+      }
+      Stop-Script "SHA256 checksum mismatch for Far Manager archive ($tempArchive). Expected $expectedHash, got $actualHash. Verification failed."
+    }
+
+    if (-not (Test-Path $FarDir)) { New-Item -ItemType Directory -Path $FarDir -Force | Out-Null }
+    & tar.exe -xf $tempArchive -C $FarDir
+    if (Test-Path $FarExe) {
+      $farInstalled = $true
+      Write-Ok "Far Manager deployed to $FarDir"
+    } else {
+      Write-Warn "Extraction finished but Far.exe not found in $FarDir"
+    }
+  } catch [System.Management.Automation.RuntimeException] {
+    throw
   } catch {
     Write-Warn "Internet access unavailable or download failed for Far Manager ($($_.Exception.Message)). Skipping."
+  } finally {
+    if ($isTempFile -and (Test-Path $tempArchive)) {
+      Remove-Item $tempArchive -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 
@@ -93,44 +151,78 @@ $EditDir = Join-Path $InstallDir 'Edit'
 $EditExe = Join-Path $EditDir 'edit.exe'
 $editInstalled = $false
 
-if ((Test-Path $EditExe) -and (-not $ForceDownload)) {
+if ((Test-Path $EditExe) -and (-not $ForceDownload) -and (-not $EditArchive)) {
   Write-Info "edit.exe already present in $EditDir"
   $editInstalled = $true
 } else {
   Write-Info 'Attempting to download Microsoft Edit from GitHub releases...'
+  $tempArchive = ''
+  $isTempFile = $false
+  $tempExtract = Join-Path $env:TEMP ("edit_extract_" + [System.Guid]::NewGuid().ToString('N'))
   try {
-    $downloadUrl = ''
-    try {
-      $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/edit/releases/latest' -Headers @{ 'User-Agent' = 'PowerShell' } -TimeoutSec 15
-      $asset = $rel.assets | Where-Object { $_.name -like '*x86_64-windows.zip' } | Select-Object -First 1
-      if ($asset) { $downloadUrl = $asset.browser_download_url }
-    } catch {
-    }
-
-    if (-not $downloadUrl) {
-      $downloadUrl = 'https://github.com/microsoft/edit/releases/download/v2.0.0/edit-2.0.0-x86_64-windows.zip'
-    }
-
-    $tempArchive = Join-Path $env:TEMP ("edit_download_" + [System.Guid]::NewGuid().ToString('N') + '.zip')
-    $tempExtract = Join-Path $env:TEMP ("edit_extract_" + [System.Guid]::NewGuid().ToString('N'))
-    try {
-      Invoke-WebRequest -Uri $downloadUrl -OutFile $tempArchive -TimeoutSec 45
-      Expand-Archive -Path $tempArchive -DestinationPath $tempExtract -Force
-      if (-not (Test-Path $EditDir)) { New-Item -ItemType Directory -Path $EditDir -Force | Out-Null }
-      $extractedExe = Get-ChildItem -Path $tempExtract -Filter 'edit.exe' -Recurse | Select-Object -First 1
-      if ($extractedExe) {
-        Move-Item $extractedExe.FullName $EditExe -Force
-        $editInstalled = $true
-        Write-Ok "Microsoft Edit downloaded and deployed to $EditDir"
-      } else {
-        Write-Warn "Extraction finished but edit.exe not found"
+    if (-not [string]::IsNullOrWhiteSpace($EditArchive)) {
+      $tempArchive = (Resolve-Path $EditArchive).Path
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:EDIT_ARCHIVE_PATH)) {
+      $tempArchive = (Resolve-Path $env:EDIT_ARCHIVE_PATH).Path
+    } else {
+      $downloadUrl = ''
+      try {
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/edit/releases/latest' -Headers @{ 'User-Agent' = 'PowerShell' } -TimeoutSec 15
+        $asset = $rel.assets | Where-Object { $_.name -like '*x86_64-windows.zip' } | Select-Object -First 1
+        if ($asset) { $downloadUrl = $asset.browser_download_url }
+      } catch {
       }
-    } finally {
-      if (Test-Path $tempArchive) { Remove-Item $tempArchive -Force -ErrorAction SilentlyContinue }
-      if (Test-Path $tempExtract) { Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue }
+
+      if (-not $downloadUrl) {
+        $downloadUrl = 'https://github.com/microsoft/edit/releases/download/v2.0.0/edit-2.0.0-x86_64-windows.zip'
+      }
+
+      $tempArchive = Join-Path $env:TEMP ("edit_download_" + [System.Guid]::NewGuid().ToString('N') + '.zip')
+      $isTempFile = $true
+      Invoke-WebRequest -Uri $downloadUrl -OutFile $tempArchive -TimeoutSec 45
     }
+
+    if (-not (Test-Path $tempArchive)) {
+      Stop-Script "Archive file not found: $tempArchive"
+    }
+
+    $actualEditHash = (Get-ArchiveSha256 -Path $tempArchive)
+    $expectedEditHash = $EditExpectedSha256
+    if ([string]::IsNullOrWhiteSpace($expectedEditHash)) {
+      $expectedEditHash = $env:EDIT_EXPECTED_SHA256
+    }
+    if ([string]::IsNullOrWhiteSpace($expectedEditHash)) {
+      $expectedEditHash = 'F423C32BE1508AC68E68579ED83279147D1BE85F49326D77EC7CFDCB2421A4B0'
+    }
+
+    if ($actualEditHash.ToUpperInvariant() -ne $expectedEditHash.ToUpperInvariant()) {
+      if (Test-Path $tempArchive) {
+        Remove-Item $tempArchive -Force -ErrorAction SilentlyContinue
+      }
+      Stop-Script "SHA256 checksum mismatch for Microsoft Edit archive ($tempArchive). Expected $expectedEditHash, got $actualEditHash. Verification failed."
+    }
+
+    Expand-Archive -Path $tempArchive -DestinationPath $tempExtract -Force
+    if (-not (Test-Path $EditDir)) { New-Item -ItemType Directory -Path $EditDir -Force | Out-Null }
+    $extractedExe = Get-ChildItem -Path $tempExtract -Filter 'edit.exe' -Recurse | Select-Object -First 1
+    if ($extractedExe) {
+      Move-Item $extractedExe.FullName $EditExe -Force
+      $editInstalled = $true
+      Write-Ok "Microsoft Edit deployed to $EditDir"
+    } else {
+      Write-Warn "Extraction finished but edit.exe not found"
+    }
+  } catch [System.Management.Automation.RuntimeException] {
+    throw
   } catch {
     Write-Warn "Internet access unavailable or download failed for Microsoft Edit ($($_.Exception.Message)). Skipping."
+  } finally {
+    if ($isTempFile -and (Test-Path $tempArchive)) {
+      Remove-Item $tempArchive -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $tempExtract) {
+      Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 

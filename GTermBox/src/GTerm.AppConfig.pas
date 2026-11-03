@@ -27,7 +27,7 @@ interface
 
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.JSON, System.IOUtils,
-  System.Generics.Collections,
+  System.Generics.Collections, System.SyncObjs,
   Quick.Logger, GTerm.Types;
 
 type
@@ -51,6 +51,8 @@ type
 
   TGTermAppConfig = class
   private
+    FLock: TCriticalSection;
+    FLastCheckTick: UInt64;
     FApps: TArray<TAppEntry>;
     FConfigPath: string;
     FLastWriteTime: TDateTime;
@@ -59,6 +61,8 @@ type
     function ParseSandbox(const S: string): TSandboxMode;
     procedure CheckReload;
   public
+    constructor Create;
+    destructor Destroy; override;
     procedure LoadFromFile(const APath: string);
     function FindById(const AId: string; out AEntry: TAppEntry): Boolean;
     function FindByIndex(AIndex: Integer; out AEntry: TAppEntry): Boolean;
@@ -67,16 +71,25 @@ type
     function GetDefaultAppId: string;
     function CanRoleAccessApp(const ARole: string; const AAppId: string): Boolean;
     class property Instance: TGTermAppConfig read GetInstance;
-    class destructor Destroy;
   end;
 
 procedure DeployAppToSandbox(const ASrcDir, ADstDir: string);
 
 implementation
 
-class destructor TGTermAppConfig.Destroy;
+constructor TGTermAppConfig.Create;
 begin
-  FreeAndNil(FInstance);
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FLastCheckTick := 0;
+  SetLength(FApps, 0);
+end;
+
+destructor TGTermAppConfig.Destroy;
+begin
+  FLock.Free;
+  SetLength(FApps, 0);
+  inherited Destroy;
 end;
 
 class function TGTermAppConfig.GetInstance: TGTermAppConfig;
@@ -93,23 +106,42 @@ begin
   Lower := LowerCase(Trim(S));
   if Lower = 'job-only' then
     Result := smJobOnly
-  else if Lower = 'standard' then
-    Result := smStandard
   else if Lower = 'none' then
     Result := smNone
   else
-    Result := smInvalid;
+    Result := smStandard;
 end;
 
 procedure TGTermAppConfig.CheckReload;
 var
   CurrTime: TDateTime;
+  NowTick: UInt64;
+  ShouldReload: Boolean;
 begin
-  if (FConfigPath <> '') and FileExists(FConfigPath) then
-  begin
-    if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
-      LoadFromFile(FConfigPath);
+  if FConfigPath = '' then Exit;
+  NowTick := GetTickCount64;
+  if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
+    Exit;
+
+  ShouldReload := False;
+  FLock.Enter;
+  try
+    NowTick := GetTickCount64;
+    if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
+      Exit;
+    FLastCheckTick := NowTick;
+
+    if FileExists(FConfigPath) then
+    begin
+      if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
+        ShouldReload := True;
+    end;
+  finally
+    FLock.Leave;
   end;
+
+  if ShouldReload then
+    LoadFromFile(FConfigPath);
 end;
 
 procedure TGTermAppConfig.LoadFromFile(const APath: string);
@@ -123,17 +155,16 @@ var
   JsonVal: TJSONValue;
   Entry: TAppEntry;
   I, J: Integer;
+  NewApps: TArray<TAppEntry>;
+  NewWriteTime: TDateTime;
 begin
-  SetLength(FApps, 0);
-
   if not FileExists(APath) then
   begin
     Logger.Warn(Format('[Config] apps.json not found at: %s — using hardcoded defaults', [APath]));
     Exit;
   end;
 
-  FConfigPath := APath;
-  FileAge(APath, FLastWriteTime);
+  FileAge(APath, NewWriteTime);
 
   try
     with TStringList.Create do
@@ -159,7 +190,7 @@ begin
         Exit;
       end;
 
-      SetLength(FApps, AppsArr.Count);
+      SetLength(NewApps, AppsArr.Count);
       for I := 0 to AppsArr.Count - 1 do
       begin
         AppObj := AppsArr.Items[I] as TJSONObject;
@@ -169,7 +200,7 @@ begin
         Entry.WorkingDir  := AppObj.GetValue<string>('workingDir', '');
         Entry.Cols        := AppObj.GetValue<Integer>('cols', 80);
         Entry.Rows        := AppObj.GetValue<Integer>('rows', 25);
-        Entry.Sandbox     := ParseSandbox(AppObj.GetValue<string>('sandbox', 'none'));
+        Entry.Sandbox     := ParseSandbox(AppObj.GetValue<string>('sandbox', 'standard'));
         Entry.Network     := AppObj.GetValue<Boolean>('network', False);
 
         JsonVal := AppObj.FindValue('allowedDirs');
@@ -227,13 +258,19 @@ begin
         else
           SetLength(Entry.Args, 0);
 
-        FApps[I] := Entry;
+        NewApps[I] := Entry;
       end;
 
-      Logger.Info(Format('[Config] Loaded %d apps from %s', [Length(FApps), APath]));
-      for I := 0 to High(FApps) do
-        Logger.Info(Format('[Config]   [%s] %s (%s) sandbox=%d',
-          [FApps[I].Id, FApps[I].Name, FApps[I].Command, Ord(FApps[I].Sandbox)]));
+      FLock.Enter;
+      try
+        FConfigPath := APath;
+        FLastWriteTime := NewWriteTime;
+        FApps := NewApps;
+      finally
+        FLock.Leave;
+      end;
+
+      Logger.Info(Format('[Config] Loaded %d apps from %s', [Length(NewApps), APath]));
 
     finally
       Root.Free;
@@ -248,12 +285,17 @@ end;
 function TGTermAppConfig.FindByIndex(AIndex: Integer; out AEntry: TAppEntry): Boolean;
 begin
   CheckReload;
-  if (AIndex >= 0) and (AIndex < Length(FApps)) then
-  begin
-    AEntry := FApps[AIndex];
-    Exit(True);
+  FLock.Enter;
+  try
+    if (AIndex >= 0) and (AIndex < Length(FApps)) then
+    begin
+      AEntry := FApps[AIndex];
+      Exit(True);
+    end;
+    Result := False;
+  finally
+    FLock.Leave;
   end;
-  Result := False;
 end;
 
 function TGTermAppConfig.FindById(const AId: string; out AEntry: TAppEntry): Boolean;
@@ -263,28 +305,50 @@ var
 begin
   CheckReload;
   Lower := LowerCase(AId);
-  for I := 0 to High(FApps) do
-  begin
-    if LowerCase(FApps[I].Id) = Lower then
+  FLock.Enter;
+  try
+    for I := 0 to High(FApps) do
     begin
-      AEntry := FApps[I];
-      Exit(True);
+      if LowerCase(FApps[I].Id) = Lower then
+      begin
+        AEntry := FApps[I];
+        Exit(True);
+      end;
     end;
+    Result := False;
+  finally
+    FLock.Leave;
   end;
-  Result := False;
 end;
 
 function TGTermAppConfig.AppCount: Integer;
 begin
   CheckReload;
-  Result := Length(FApps);
+  FLock.Enter;
+  try
+    Result := Length(FApps);
+  finally
+    FLock.Leave;
+  end;
 end;
 
 function TGTermAppConfig.GetDefaultProfile(const ASandboxDir: string = ''): TGTermAppProfile;
+var
+  HaveApp: Boolean;
+  FirstApp: TAppEntry;
 begin
   CheckReload;
-  if Length(FApps) > 0 then
-    Result := FApps[0].ToProfile(ASandboxDir)
+  FLock.Enter;
+  try
+    HaveApp := Length(FApps) > 0;
+    if HaveApp then
+      FirstApp := FApps[0];
+  finally
+    FLock.Leave;
+  end;
+
+  if HaveApp then
+    Result := FirstApp.ToProfile(ASandboxDir)
   else
   begin
     Result.ProfileName := 'Command Prompt';
@@ -304,10 +368,15 @@ end;
 function TGTermAppConfig.GetDefaultAppId: string;
 begin
   CheckReload;
-  if Length(FApps) > 0 then
-    Result := FApps[0].Id
-  else
-    Result := 'cmd';
+  FLock.Enter;
+  try
+    if Length(FApps) > 0 then
+      Result := FApps[0].Id
+    else
+      Result := 'cmd';
+  finally
+    FLock.Leave;
+  end;
 end;
 
 function TGTermAppConfig.CanRoleAccessApp(const ARole: string; const AAppId: string): Boolean;
@@ -316,7 +385,6 @@ var
   I: Integer;
   RoleLower: string;
 begin
-  CheckReload;
   Result := False;
   if not FindById(AAppId, App) then Exit;
   if Length(App.Roles) = 0 then Exit(True);
@@ -350,8 +418,7 @@ begin
           begin
             if not FileExists(DstItem) then
             begin
-              if not CreateHardLinkW(PChar(DstItem), PChar(SrcItem), nil) then
-                CopyFileW(PChar(SrcItem), PChar(DstItem), False);
+              CopyFileW(PChar(SrcItem), PChar(DstItem), False);
             end;
           end;
         end;
@@ -526,5 +593,14 @@ begin
 
   Result := False;
 end;
+
+initialization
+
+finalization
+  if TGTermAppConfig.FInstance <> nil then
+  begin
+    TGTermAppConfig.FInstance.Free;
+    TGTermAppConfig.FInstance := nil;
+  end;
 
 end.

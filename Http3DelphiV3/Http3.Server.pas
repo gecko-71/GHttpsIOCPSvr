@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) 2026 GECKO-71
@@ -1110,7 +1110,6 @@ begin
           on EFree: Exception do
             Logger.Error('[HTTP/3] Error freeing SendCtx on exception: %s', [EFree.Message]);
         end;
-        SendCtx := nil;
       end;
 
       if (StreamHandle <> nil) and Assigned(FQuicServer) and Assigned(FQuicServer.MsQuic) and Assigned(FQuicServer.MsQuic.Api) then

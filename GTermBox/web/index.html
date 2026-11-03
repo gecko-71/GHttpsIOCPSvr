@@ -963,7 +963,7 @@
 
         },
 
-        allowProposedApi: true
+        allowProposedApi: false
 
       });
 
@@ -972,6 +972,24 @@
       this.fitAddon = new FitAddon.FitAddon();
 
       this.term.loadAddon(this.fitAddon);
+
+      if (this.term && this.term.parser && typeof this.term.parser.registerOscHandler === 'function') {
+        this.term.parser.registerOscHandler(52, () => true);
+        this.term.parser.registerOscHandler(0, (data) => {
+          if (typeof data === 'string' && data.length <= 128) {
+            const clean = data.replace(/[<>"'&]/g, '').trim();
+            if (clean) document.title = 'GTermBox - ' + clean;
+          }
+          return true;
+        });
+        this.term.parser.registerOscHandler(2, (data) => {
+          if (typeof data === 'string' && data.length <= 128) {
+            const clean = data.replace(/[<>"'&]/g, '').trim();
+            if (clean) document.title = 'GTermBox - ' + clean;
+          }
+          return true;
+        });
+      }
 
       this.term.open(this.container);
 
@@ -1216,7 +1234,7 @@
           }
           if (sRes.ok) {
             const sData = await sRes.json();
-            sessionId = sData.sessionId || '';
+            sessionId = sData.ticket || sData.sessionId || '';
           } else {
             const sData = await sRes.json().catch(() => ({}));
             const errMsg = sData.error || 'Failed to start session.';
@@ -1232,15 +1250,15 @@
 
 
 
-        let wtUrl = `https://${window.location.host}/wt/terminal?cols=${this.term.cols || 120}&rows=${this.term.rows || 30}&token=${encodeURIComponent(token)}`;
+        let wtUrl = `https://${window.location.host}/wt/terminal?cols=${this.term.cols || 120}&rows=${this.term.rows || 30}`;
 
         if (sessionId) {
 
-          wtUrl += `&session=${encodeURIComponent(sessionId)}`;
+          wtUrl += `&ticket=${encodeURIComponent(sessionId)}`;
 
         } else {
 
-          wtUrl += `&app=${encodeURIComponent(this.appName)}`;
+          wtUrl += `&app=${encodeURIComponent(this.appName)}&token=${encodeURIComponent(token)}`;
 
         }
 

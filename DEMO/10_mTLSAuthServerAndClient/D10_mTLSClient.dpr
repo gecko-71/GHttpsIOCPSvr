@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -231,7 +231,10 @@ begin
     Writeln('  [Q] Quit');
     Write('Select option: ');
     if Eof then
+    begin
+      RunAllScenarios;
       Break;
+    end;
     Readln(Choice);
     Writeln;
 
@@ -255,6 +258,25 @@ end;
 
 begin
   try
+    for var I := 1 to ParamCount do
+    begin
+      if SameText(ParamStr(I), '--all') or SameText(ParamStr(I), '-a') or SameText(ParamStr(I), 'A') then
+      begin
+        ServerHost := GetEnvironmentVariable('SERVER_HOST');
+        if ServerHost = '' then
+          ServerHost := GetPrimaryIPv4Address;
+        CertsDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'cercts_client');
+        if not DirectoryExists(CertsDir) then
+        begin
+          var FallbackDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs_client');
+          if DirectoryExists(FallbackDir) then
+            CertsDir := FallbackDir;
+        end;
+        RunAllScenarios;
+        Exit;
+      end;
+    end;
+
     ServerHost := GetEnvironmentVariable('SERVER_HOST');
     if ServerHost = '' then
     begin

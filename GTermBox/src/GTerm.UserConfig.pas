@@ -26,8 +26,8 @@ unit GTerm.UserConfig;
 interface
 
 uses
-  System.SysUtils, System.Classes, System.JSON, System.Hash, System.StrUtils,
-  System.Generics.Collections,
+  Winapi.Windows, System.SysUtils, System.Classes, System.JSON, System.Hash, System.StrUtils,
+  System.Generics.Collections, System.SyncObjs,
   Quick.Logger;
 
 type
@@ -63,19 +63,24 @@ type
 
   TGTermUserConfig = class
   private
+    FLock: TCriticalSection;
+    FLastCheckTick: UInt64;
     FUsers: TArray<TUserEntry>;
     FConfigPath: string;
     FLastWriteTime: TDateTime;
     class var FInstance: TGTermUserConfig;
-    class function HashPassword(const APassword: string): string;
     class function HashPasswordWithSalt(const APassword, ASalt: string): string;
     procedure CheckReload;
   public
     constructor Create;
     destructor Destroy; override;
     class function Instance: TGTermUserConfig;
+    class function GenerateSalt: string;
+    class function DerivePBKDF2(const APassword, ASalt: string; const AIterations: UInt64 = 100000): string;
+    class function ConstantTimeCompare(const A, B: string): Boolean;
     function LoadFromFile(const APath: string): Boolean;
     function LoadFromString(const AJsonText: string): Boolean;
+    function SaveToFile(const APath: string): Boolean;
     function ValidateUser(const AUsername, APassword: string; out AUser: TUserEntry): Boolean;
     function CanAccessApp(const AUsername, AAppId: string): Boolean;
     function FindUser(const AUsername: string; out AUser: TUserEntry): Boolean;
@@ -83,6 +88,38 @@ type
   end;
 
 implementation
+
+const
+  BCRYPT_USE_SYSTEM_PREFERRED_RNG = $00000002;
+  BCRYPT_ALG_HANDLE_HMAC_FLAG = $00000008;
+  BCRYPT_SHA256_ALGORITHM = 'SHA256';
+
+function BCryptOpenAlgorithmProvider(
+  out phAlgorithm: THandle;
+  pszAlgId: LPCWSTR;
+  pszImplementation: LPCWSTR;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
+
+function BCryptCloseAlgorithmProvider(
+  hAlgorithm: THandle;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
+
+function BCryptGenRandom(
+  hAlgorithm: THandle;
+  pbBuffer: PByte;
+  cbBuffer: ULONG;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
+
+function BCryptDeriveKeyPBKDF2(
+  hPrf: THandle;
+  pbPassword: PByte;
+  cbPassword: ULONG;
+  pbSalt: PByte;
+  cbSalt: ULONG;
+  cIterations: UInt64;
+  pbDerivedKey: PByte;
+  cbDerivedKey: ULONG;
+  dwFlags: ULONG): LongInt; stdcall; external 'bcrypt.dll';
 
 function TUserEntry.HasApp(const AAppId: string): Boolean;
 var
@@ -140,11 +177,14 @@ end;
 constructor TGTermUserConfig.Create;
 begin
   inherited Create;
+  FLock := TCriticalSection.Create;
+  FLastCheckTick := 0;
   SetLength(FUsers, 0);
 end;
 
 destructor TGTermUserConfig.Destroy;
 begin
+  FLock.Free;
   SetLength(FUsers, 0);
   inherited Destroy;
 end;
@@ -156,14 +196,179 @@ begin
   Result := FInstance;
 end;
 
-class function TGTermUserConfig.HashPassword(const APassword: string): string;
+class function TGTermUserConfig.ConstantTimeCompare(const A, B: string): Boolean;
+var
+  I, MaxLen, Diff: Integer;
+  aChar, bChar: Word;
 begin
-  Result := LowerCase(THashSHA2.GetHashString(APassword, THashSHA2.TSHA2Version.SHA256));
+  MaxLen := Length(A);
+  if Length(B) > MaxLen then
+    MaxLen := Length(B);
+  Diff := Length(A) xor Length(B);
+  for I := 1 to MaxLen do
+  begin
+    aChar := 0;
+    bChar := 0;
+    if I <= Length(A) then
+      aChar := Ord(A[I]);
+    if I <= Length(B) then
+      bChar := Ord(B[I]);
+    Diff := Diff or (aChar xor bChar);
+  end;
+  Result := (Diff = 0);
+end;
+
+class function TGTermUserConfig.GenerateSalt: string;
+var
+  SaltBytes: array[0..15] of Byte;
+  I: Integer;
+begin
+  if BCryptGenRandom(0, @SaltBytes[0], Length(SaltBytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) <> 0 then
+  begin
+    for I := 0 to High(SaltBytes) do
+      SaltBytes[I] := Random(256);
+  end;
+  Result := '';
+  for I := 0 to High(SaltBytes) do
+    Result := Result + IntToHex(SaltBytes[I], 2).ToLower;
+end;
+
+class function TGTermUserConfig.DerivePBKDF2(const APassword, ASalt: string; const AIterations: UInt64): string;
+var
+  hAlg: THandle;
+  PassBytes, SaltBytes: TBytes;
+  DerivedBytes: array[0..31] of Byte;
+  I: Integer;
+  pPass, pSalt: PByte;
+begin
+  Result := '';
+  PassBytes := TEncoding.UTF8.GetBytes(APassword);
+  SaltBytes := TEncoding.UTF8.GetBytes(ASalt);
+  FillChar(DerivedBytes[0], Length(DerivedBytes), 0);
+  if BCryptOpenAlgorithmProvider(hAlg, BCRYPT_SHA256_ALGORITHM, nil, BCRYPT_ALG_HANDLE_HMAC_FLAG) = 0 then
+  begin
+    try
+      pPass := nil;
+      if Length(PassBytes) > 0 then
+        pPass := @PassBytes[0];
+      pSalt := nil;
+      if Length(SaltBytes) > 0 then
+        pSalt := @SaltBytes[0];
+      if BCryptDeriveKeyPBKDF2(hAlg, pPass, Length(PassBytes), pSalt, Length(SaltBytes), AIterations, @DerivedBytes[0], Length(DerivedBytes), 0) = 0 then
+      begin
+        for I := 0 to High(DerivedBytes) do
+          Result := Result + IntToHex(DerivedBytes[I], 2).ToLower;
+      end;
+    finally
+      BCryptCloseAlgorithmProvider(hAlg, 0);
+    end;
+  end;
+  if Result <> '' then
+    Result := Format('PBKDF2$%d$%s', [AIterations, Result]);
 end;
 
 class function TGTermUserConfig.HashPasswordWithSalt(const APassword, ASalt: string): string;
 begin
-  Result := LowerCase(THashSHA2.GetHashString(ASalt + ':' + APassword, THashSHA2.TSHA2Version.SHA256));
+  Result := DerivePBKDF2(APassword, ASalt, 100000);
+end;
+
+function TGTermUserConfig.SaveToFile(const APath: string): Boolean;
+var
+  Root, UserObj, GrantsObj: TJSONObject;
+  UsersArr, AppsArr, ReadArr, WriteArr: TJSONArray;
+  I, J: Integer;
+  LocalUsers: TArray<TUserEntry>;
+  NewWriteTime: TDateTime;
+begin
+  FLock.Enter;
+  try
+    LocalUsers := Copy(FUsers);
+  finally
+    FLock.Leave;
+  end;
+
+  Root := TJSONObject.Create;
+  try
+    UsersArr := TJSONArray.Create;
+    for I := 0 to High(LocalUsers) do
+    begin
+      UserObj := TJSONObject.Create;
+      UserObj.AddPair('username', LocalUsers[I].Username);
+      UserObj.AddPair('role', LocalUsers[I].Role);
+      UserObj.AddPair('sandbox', LocalUsers[I].Sandbox);
+
+      AppsArr := TJSONArray.Create;
+      for J := 0 to High(LocalUsers[I].Apps) do
+        AppsArr.Add(LocalUsers[I].Apps[J]);
+      UserObj.AddPair('apps', AppsArr);
+
+      GrantsObj := TJSONObject.Create;
+      GrantsObj.AddPair('network', TJSONBool.Create(LocalUsers[I].Grants.Network));
+      GrantsObj.AddPair('allowJobOnly', TJSONBool.Create(LocalUsers[I].Grants.AllowJobOnly));
+      GrantsObj.AddPair('fullDiskAccess', TJSONBool.Create(LocalUsers[I].Grants.FullDiskAccess));
+      GrantsObj.AddPair('powershellAccessEverywhere', TJSONBool.Create(LocalUsers[I].Grants.PowerShellAccessEverywhere));
+      GrantsObj.AddPair('powershellOutsideSandbox', TJSONBool.Create(LocalUsers[I].Grants.PowerShellOutsideSandbox));
+      GrantsObj.AddPair('upload', TJSONBool.Create(LocalUsers[I].Grants.Upload));
+      GrantsObj.AddPair('download', TJSONBool.Create(LocalUsers[I].Grants.Download));
+      GrantsObj.AddPair('storageQuotaMB', TJSONNumber.Create(LocalUsers[I].Grants.StorageQuotaMB));
+
+      ReadArr := TJSONArray.Create;
+      for J := 0 to High(LocalUsers[I].Grants.AllowedDirsRead) do
+        ReadArr.Add(LocalUsers[I].Grants.AllowedDirsRead[J]);
+      GrantsObj.AddPair('allowedDirsRead', ReadArr);
+
+      WriteArr := TJSONArray.Create;
+      for J := 0 to High(LocalUsers[I].Grants.AllowedDirsWrite) do
+        WriteArr.Add(LocalUsers[I].Grants.AllowedDirsWrite[J]);
+      GrantsObj.AddPair('allowedDirsWrite', WriteArr);
+
+      UserObj.AddPair('grants', GrantsObj);
+      UserObj.AddPair('salt', LocalUsers[I].Salt);
+      UserObj.AddPair('passwordHash', LocalUsers[I].PasswordHash);
+      if LocalUsers[I].ClientCertificate <> '' then
+        UserObj.AddPair('clientCertificate', LocalUsers[I].ClientCertificate);
+
+      UsersArr.AddElement(UserObj);
+    end;
+    Root.AddPair('users', UsersArr);
+
+    with TStringList.Create do
+    try
+      Text := Root.Format(2);
+      var EncNoBom := TUTF8Encoding.Create(False);
+      try
+        var Saved := False;
+        for var Retry := 1 to 5 do
+        begin
+          try
+            SaveToFile(APath, EncNoBom);
+            Saved := True;
+            Break;
+          except
+            Sleep(30);
+          end;
+        end;
+        Result := Saved;
+        if Saved then
+        begin
+          NewWriteTime := 0;
+          FileAge(APath, NewWriteTime);
+          FLock.Enter;
+          try
+            FLastWriteTime := NewWriteTime;
+          finally
+            FLock.Leave;
+          end;
+        end;
+      finally
+        EncNoBom.Free;
+      end;
+    finally
+      Free;
+    end;
+  finally
+    Root.Free;
+  end;
 end;
 
 function TGTermUserConfig.LoadFromString(const AJsonText: string): Boolean;
@@ -177,9 +382,9 @@ var
   JsonVal, ArrVal: TJSONValue;
   GrantsObj: TJSONObject;
   ReadArr, WriteArr: TJSONArray;
+  NewUsers: TArray<TUserEntry>;
 begin
   Result := False;
-  SetLength(FUsers, 0);
 
   Root := TJSONObject.ParseJSONValue(AJsonText) as TJSONObject;
   if Root = nil then
@@ -196,7 +401,7 @@ begin
       Exit;
     end;
 
-    SetLength(FUsers, UsersArr.Count);
+    SetLength(NewUsers, UsersArr.Count);
     for I := 0 to UsersArr.Count - 1 do
     begin
       UserObj := UsersArr.Items[I] as TJSONObject;
@@ -208,10 +413,15 @@ begin
         Entry.PasswordHash := UserObj.GetValue<string>('password_hash', '');
       if Entry.PasswordHash = '' then
       begin
-        if Entry.Salt <> '' then
-          Entry.PasswordHash := HashPasswordWithSalt(UserObj.GetValue<string>('password', ''), Entry.Salt)
+        var PlainPass: string := UserObj.GetValue<string>('password', '');
+        if PlainPass <> '' then
+        begin
+          if Entry.Salt = '' then
+            Entry.Salt := GenerateSalt;
+          Entry.PasswordHash := HashPasswordWithSalt(PlainPass, Entry.Salt);
+        end
         else
-          Entry.PasswordHash := HashPassword(UserObj.GetValue<string>('password', ''));
+          Entry.PasswordHash := 'DISABLED_NO_PASSWORD_' + GenerateSalt;
       end;
 
       Entry.Sandbox := UserObj.GetValue<string>('sandbox', '');
@@ -303,7 +513,14 @@ begin
         end;
       end;
 
-      FUsers[I] := Entry;
+      NewUsers[I] := Entry;
+    end;
+
+    FLock.Enter;
+    try
+      FUsers := NewUsers;
+    finally
+      FLock.Leave;
     end;
 
     Result := True;
@@ -315,7 +532,7 @@ end;
 function TGTermUserConfig.LoadFromFile(const APath: string): Boolean;
 var
   JsonText: string;
-  I: Integer;
+  NewWriteTime: TDateTime;
 begin
   Result := False;
   if not FileExists(APath) then
@@ -324,8 +541,7 @@ begin
     Exit;
   end;
 
-  FConfigPath := APath;
-  FileAge(APath, FLastWriteTime);
+  FileAge(APath, NewWriteTime);
 
   try
     with TStringList.Create do
@@ -339,10 +555,15 @@ begin
     Result := LoadFromString(JsonText);
     if Result then
     begin
+      FLock.Enter;
+      try
+        FConfigPath := APath;
+        FLastWriteTime := NewWriteTime;
+      finally
+        FLock.Leave;
+      end;
+
       Logger.Info(Format('[UserConfig] Loaded %d users from %s', [Length(FUsers), APath]));
-      for I := 0 to High(FUsers) do
-        Logger.Info(Format('[UserConfig]   User [%s] sandbox=%s apps=[%s]',
-          [FUsers[I].Username, FUsers[I].Sandbox, string.Join(',', FUsers[I].Apps)]));
     end;
   except
     on E: Exception do
@@ -353,44 +574,105 @@ end;
 procedure TGTermUserConfig.CheckReload;
 var
   CurrTime: TDateTime;
+  NowTick: UInt64;
+  ShouldReload: Boolean;
 begin
-  if (FConfigPath <> '') and FileExists(FConfigPath) then
-  begin
-    if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
-      LoadFromFile(FConfigPath);
+  if FConfigPath = '' then Exit;
+  NowTick := GetTickCount64;
+  if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
+    Exit;
+
+  ShouldReload := False;
+  FLock.Enter;
+  try
+    NowTick := GetTickCount64;
+    if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
+      Exit;
+    FLastCheckTick := NowTick;
+
+    if FileExists(FConfigPath) then
+    begin
+      if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
+        ShouldReload := True;
+    end;
+  finally
+    FLock.Leave;
   end;
+
+  if ShouldReload then
+    LoadFromFile(FConfigPath);
 end;
 
 function TGTermUserConfig.ValidateUser(const AUsername, APassword: string; out AUser: TUserEntry): Boolean;
 var
   I: Integer;
   CalculatedHash: string;
+  Matched: Boolean;
+  FoundIndex: Integer;
+  MigratePassword: Boolean;
 begin
   CheckReload;
-  for I := 0 to High(FUsers) do
-  begin
-    if SameText(FUsers[I].Username, AUsername) then
-    begin
-      if FUsers[I].Salt <> '' then
-        CalculatedHash := HashPasswordWithSalt(APassword, FUsers[I].Salt)
-      else
-        CalculatedHash := HashPassword(APassword);
+  if (AUsername = '') or (APassword = '') then
+    Exit(False);
 
-      if SameText(FUsers[I].PasswordHash, CalculatedHash) then
+  FoundIndex := -1;
+  MigratePassword := False;
+
+  FLock.Enter;
+  try
+    for I := 0 to High(FUsers) do
+    begin
+      if SameText(FUsers[I].Username, AUsername) then
       begin
-        AUser := FUsers[I];
-        Exit(True);
+        if (FUsers[I].PasswordHash = '') or StartsText('DISABLED_NO_PASSWORD_', FUsers[I].PasswordHash) then
+          Exit(False);
+
+        if StartsText('PBKDF2$', FUsers[I].PasswordHash) then
+        begin
+          CalculatedHash := HashPasswordWithSalt(APassword, FUsers[I].Salt);
+          Matched := ConstantTimeCompare(FUsers[I].PasswordHash, CalculatedHash);
+        end
+        else
+        begin
+          if FUsers[I].Salt <> '' then
+            CalculatedHash := LowerCase(THashSHA2.GetHashString(FUsers[I].Salt + ':' + APassword, THashSHA2.TSHA2Version.SHA256))
+          else
+            CalculatedHash := LowerCase(THashSHA2.GetHashString(APassword, THashSHA2.TSHA2Version.SHA256));
+
+          Matched := ConstantTimeCompare(FUsers[I].PasswordHash, CalculatedHash);
+          if Matched then
+          begin
+            FUsers[I].Salt := GenerateSalt;
+            FUsers[I].PasswordHash := HashPasswordWithSalt(APassword, FUsers[I].Salt);
+            MigratePassword := True;
+          end;
+        end;
+
+        if Matched then
+        begin
+          AUser := FUsers[I];
+          FoundIndex := I;
+          Break;
+        end;
       end;
     end;
+  finally
+    FLock.Leave;
   end;
-  Result := False;
+
+  if (FoundIndex >= 0) and MigratePassword and (FConfigPath <> '') then
+  try
+    SaveToFile(FConfigPath);
+  except
+  end;
+
+  Result := (FoundIndex >= 0);
 end;
 
 function TGTermUserConfig.CanAccessApp(const AUsername, AAppId: string): Boolean;
 var
   User: TUserEntry;
 begin
-  CheckReload;
   Result := FindUser(AUsername, User) and User.HasApp(AAppId);
 end;
 
@@ -399,15 +681,20 @@ var
   I: Integer;
 begin
   CheckReload;
-  for I := 0 to High(FUsers) do
-  begin
-    if SameText(FUsers[I].Username, AUsername) then
+  FLock.Enter;
+  try
+    for I := 0 to High(FUsers) do
     begin
-      AUser := FUsers[I];
-      Exit(True);
+      if SameText(FUsers[I].Username, AUsername) then
+      begin
+        AUser := FUsers[I];
+        Exit(True);
+      end;
     end;
+    Result := False;
+  finally
+    FLock.Leave;
   end;
-  Result := False;
 end;
 
 function TGTermUserConfig.FindUserByCert(const ACertIdentifier: string; out AUser: TUserEntry): Boolean;
@@ -420,40 +707,45 @@ begin
   if CleanId = '' then
     Exit(False);
 
-  for I := 0 to High(FUsers) do
-  begin
-    CertFile := Trim(FUsers[I].ClientCertificate);
-    if CertFile <> '' then
+  FLock.Enter;
+  try
+    for I := 0 to High(FUsers) do
     begin
-      if SameText(CertFile, CleanId) then
+      CertFile := Trim(FUsers[I].ClientCertificate);
+      if CertFile <> '' then
       begin
-        AUser := FUsers[I];
-        Exit(True);
+        for var SingleCert in CertFile.Split([';', ',']) do
+        begin
+          var CleanSingle := Trim(SingleCert);
+          if CleanSingle = '' then Continue;
+          if SameText(CleanSingle, CleanId) or SameText(ExtractFileName(CleanSingle), ExtractFileName(CleanId)) then
+          begin
+            AUser := FUsers[I];
+            Exit(True);
+          end;
+          CertBase := ChangeFileExt(ExtractFileName(CleanSingle), '');
+          if SameText(CertBase, CleanId) or SameText(CertBase, ChangeFileExt(ExtractFileName(CleanId), '')) then
+          begin
+            AUser := FUsers[I];
+            Exit(True);
+          end;
+        end;
       end;
-      if SameText(ExtractFileName(CertFile), ExtractFileName(CleanId)) then
-      begin
-        AUser := FUsers[I];
-        Exit(True);
-      end;
-      CertBase := ChangeFileExt(ExtractFileName(CertFile), '');
-      if SameText(CertBase, CleanId) or SameText(CertBase, ChangeFileExt(ExtractFileName(CleanId), '')) then
+    end;
+
+    for I := 0 to High(FUsers) do
+    begin
+      if SameText(FUsers[I].Username, CleanId) or SameText(FUsers[I].Username, ChangeFileExt(ExtractFileName(CleanId), '')) then
       begin
         AUser := FUsers[I];
         Exit(True);
       end;
     end;
-  end;
 
-  for I := 0 to High(FUsers) do
-  begin
-    if SameText(FUsers[I].Username, CleanId) or SameText(FUsers[I].Username, ChangeFileExt(ExtractFileName(CleanId), '')) then
-    begin
-      AUser := FUsers[I];
-      Exit(True);
-    end;
+    Result := False;
+  finally
+    FLock.Leave;
   end;
-
-  Result := False;
 end;
 
 initialization

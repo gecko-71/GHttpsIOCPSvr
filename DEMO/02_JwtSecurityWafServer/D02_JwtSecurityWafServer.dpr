@@ -260,7 +260,6 @@ begin
               Exit;
             end;
 
-            JSONReq := nil;
             try
               JSONReq := TJSONObject.ParseJSONValue(ARequest.GetBodyString) as TJSONObject;
             except
@@ -453,7 +452,7 @@ begin
             if (RequestedPath = '/') or (RequestedPath = '') then
               RequestedPath := '/index.html';
 
-            FullPath := TPath.Combine(WebRootDir, StringReplace(RequestedPath.TrimStart(['/', '\']), '/', '\', [rfReplaceAll]));
+            FullPath := TPath.Combine(WebRootDir, StringReplace(RequestedPath.TrimLeft(['/', '\']), '/', '\', [rfReplaceAll]));
             if TryServeStaticFile(FullPath, ARequest, AResponse) then
                Exit;
 
