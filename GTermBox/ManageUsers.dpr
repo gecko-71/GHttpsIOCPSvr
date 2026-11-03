@@ -1613,22 +1613,42 @@ begin
   end;
 end;
 
-procedure RunIcaclsGrant(const APath, ASidGrant: string);
+function RunIcaclsGrant(const APath, ASidGrant: string): Boolean;
 var
   SI: TStartupInfo;
   PI: TProcessInformation;
   CmdLine: string;
+  WaitRes: DWORD;
+  ExitCode: DWORD;
 begin
+  Result := False;
   if not TDirectory.Exists(APath) and not TFile.Exists(APath) then Exit;
   FillChar(SI, SizeOf(SI), 0);
   SI.cb := SizeOf(SI);
   SI.dwFlags := STARTF_USESHOWWINDOW;
   SI.wShowWindow := SW_HIDE;
-  CmdLine := Format('icacls "%s" /grant %s /T /C /Q', [APath, ASidGrant]);
+  CmdLine := Format('icacls "%s" /grant %s /T /Q', [APath, ASidGrant]);
   UniqueString(CmdLine);
   if CreateProcess(nil, PChar(CmdLine), nil, nil, False, CREATE_NO_WINDOW, nil, nil, SI, PI) then
   begin
-    WaitForSingleObject(PI.hProcess, 15000);
+    WaitRes := WaitForSingleObject(PI.hProcess, 15000);
+    if WaitRes = WAIT_TIMEOUT then
+    begin
+      TerminateProcess(PI.hProcess, 1);
+      WaitForSingleObject(PI.hProcess, 2000);
+      Writeln(Format('[WARN] icacls timed out after 15s on "%s"', [APath]));
+    end
+    else
+    begin
+      ExitCode := 0;
+      if GetExitCodeProcess(PI.hProcess, ExitCode) then
+      begin
+        if ExitCode <> 0 then
+          Writeln(Format('[WARN] icacls failed with exit code %d on "%s"', [ExitCode, APath]))
+        else
+          Result := True;
+      end;
+    end;
     CloseHandle(PI.hProcess);
     CloseHandle(PI.hThread);
   end;
@@ -1654,8 +1674,9 @@ begin
     ArgsArr := TJSONArray.Create;
     ArgsArr.Add('-NoExit');
     ArgsArr.Add('-NoLogo');
+    ArgsArr.Add('-NoProfile');
     ArgsArr.Add('-ExecutionPolicy');
-    ArgsArr.Add('Bypass');
+    ArgsArr.Add('Restricted');
     App.AddPair('args', ArgsArr);
     EnvArr := TJSONArray.Create;
     EnvArr.Add('TERM=xterm-256color');
@@ -1663,7 +1684,7 @@ begin
     App.AddPair('env', EnvArr);
     App.AddPair('cols', TJSONNumber.Create(120));
     App.AddPair('rows', TJSONNumber.Create(30));
-    App.AddPair('sandbox', 'job-only');
+    App.AddPair('sandbox', 'standard');
     App.AddPair('network', TJSONBool.Create(False));
     App.AddPair('allowedDirs', TJSONArray.Create);
     App.AddPair('allowedDirsWrite', TJSONArray.Create);
@@ -1689,7 +1710,7 @@ begin
     App.AddPair('env', EnvArr);
     App.AddPair('cols', TJSONNumber.Create(120));
     App.AddPair('rows', TJSONNumber.Create(30));
-    App.AddPair('sandbox', 'standard');
+    App.AddPair('sandbox', 'job-only');
     App.AddPair('network', TJSONBool.Create(True));
     App.AddPair('allowedDirs', TJSONArray.Create);
     App.AddPair('allowedDirsWrite', TJSONArray.Create);
@@ -1872,8 +1893,6 @@ begin
   EnsureDefaultAppsJson(TPath.Combine(BaseDir, 'apps.json'));
   EnsureDefaultUsersJson(TPath.Combine(BaseDir, 'users.json'));
 
-  RunIcaclsGrant(TPath.Combine(BaseDir, 'sandbox_usr1'), '*S-1-15-2-1:(OI)(CI)F');
-  RunIcaclsGrant(TPath.Combine(BaseDir, 'sandbox_admin'), '*S-1-15-2-1:(OI)(CI)F');
   RunIcaclsGrant(TPath.Combine(BaseDir, 'web'), '*S-1-15-2-1:(OI)(CI)RX');
   if TDirectory.Exists(TPath.Combine(BaseDir, 'Python')) then
     RunIcaclsGrant(TPath.Combine(BaseDir, 'Python'), '*S-1-15-2-1:(OI)(CI)RX');

@@ -485,7 +485,7 @@ begin
 
     if (ActiveStream <> nil) and HasActiveSession then
     begin
-      Logger.Info(Format('[Session] HandlePtyDataReceived sending %d bytes to stream %p', [Length(AData), Pointer(ActiveStream)]));
+      Logger.Debug(Format('[Session] HandlePtyDataReceived sending %d bytes to stream %p', [Length(AData), Pointer(ActiveStream)]));
       try
         ActiveSession^.SendOnStream(ActiveStream, AData, False);
       except

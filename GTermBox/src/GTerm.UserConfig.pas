@@ -733,15 +733,6 @@ begin
       end;
     end;
 
-    for I := 0 to High(FUsers) do
-    begin
-      if SameText(FUsers[I].Username, CleanId) or SameText(FUsers[I].Username, ChangeFileExt(ExtractFileName(CleanId), '')) then
-      begin
-        AUser := FUsers[I];
-        Exit(True);
-      end;
-    end;
-
     Result := False;
   finally
     FLock.Leave;

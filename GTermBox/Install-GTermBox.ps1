@@ -429,7 +429,15 @@ Write-Ok "Valid: $($ServerCert.NotBefore) to $($ServerCert.NotAfter)"
 
 Write-Step '[7/9] Generating mTLS client certificates (admin, usr1)...'
 $Now = Get-Date
-$ClientPasswords = @{ 'admin' = 'PasswordAdmin!'; 'usr1' = 'PasswordUsr1!' }
+function New-RandomClientPassword {
+  $bytes = New-Object byte[] 18
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  return [Convert]::ToBase64String($bytes).Replace('+', 'A').Replace('/', 'B').Replace('=', 'C') + '!9'
+}
+$ClientPasswords = @{
+  'admin' = (New-RandomClientPassword);
+  'usr1'  = (New-RandomClientPassword)
+}
 $MyStore = Open-CertStore 'My' 'CurrentUser'
 try {
   foreach ($u in @('admin', 'usr1')) {

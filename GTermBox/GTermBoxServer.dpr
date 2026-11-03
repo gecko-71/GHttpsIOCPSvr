@@ -1793,6 +1793,25 @@ begin
       Logger.Info(Format('[Bind] all="%s" https="%s" http3/webtransport="%s"',
         [GBindAddress, GHttpsBindAddress, GHttp3BindAddress]));
       Server.mTLSMode := GmTLSMode;
+      if (GmTLSCaCertPath = '') and GAllowTestCA then
+      begin
+        var PathsToCheck: TArray<string> := [
+          ExtractFilePath(ParamStr(0)) + 'test_certs\test_root_ca.crt',
+          TPath.Combine(ExtractFilePath(ParamStr(0)), '..\test_certs\test_root_ca.crt'),
+          TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\test_certs\test_root_ca.crt'),
+          TPath.Combine(ExtractFilePath(ParamStr(0)), '..\..\..\test_certs\test_root_ca.crt')
+        ];
+        for var PCheck in PathsToCheck do
+        begin
+          if TFile.Exists(PCheck) then
+          begin
+            GmTLSCaCertPath := TPath.GetFullPath(PCheck);
+            Break;
+          end;
+        end;
+        if GmTLSCaCertPath <> '' then
+          Logger.Warn('[mTLS] --allow-test-ca active: using test CA from: ' + GmTLSCaCertPath);
+      end;
       if GmTLSCaCertPath <> '' then
       begin
         if not Server.LoadCACertificate(GmTLSCaCertPath) then
@@ -2061,19 +2080,18 @@ begin
             Exit;
           end;
 
-          TargetUsername := Trim(ARequest.ClientCertificate.CommonName);
+          TargetUsername := '';
           if Assigned(GTrustedClients) and GTrustedClients.TryGetValue(ARequest.ClientCertificate.ThumbprintSHA256, ReqUser) then
           begin
             if ReqUser <> '' then
               TargetUsername := ReqUser;
           end;
-          UserFound := TGTermUserConfig.Instance.FindUserByCert(TargetUsername, UserEntry);
-          if not UserFound then
-            UserFound := TGTermUserConfig.Instance.FindUserByCert(ARequest.ClientCertificate.CommonName, UserEntry);
+
+          UserFound := False;
+          if TargetUsername <> '' then
+            UserFound := TGTermUserConfig.Instance.FindUser(TargetUsername, UserEntry);
           if not UserFound then
             UserFound := TGTermUserConfig.Instance.FindUserByCert(ARequest.ClientCertificate.ThumbprintSHA256, UserEntry);
-          if not UserFound then
-            UserFound := TGTermUserConfig.Instance.FindUser(TargetUsername, UserEntry);
 
 
 
