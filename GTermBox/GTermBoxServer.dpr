@@ -3949,25 +3949,12 @@ begin
               end;
             end;
 
-            var CopyStream: TFileStream := TFileStream.Create(SourceFile, fmOpenRead or fmShareDenyNone);
-            try
-              var HeaderBuf: array[0..511] of Byte;
-              var ReadBytes: Integer := CopyStream.Read(HeaderBuf, Length(HeaderBuf));
-              if (ReadBytes >= 2) and IsExecutableBinaryHeader(@HeaderBuf[0], ReadBytes) then
-              begin
-                AResponse.SetStatus(403);
-                AResponse.AddJSONContent('{"error":"Malicious payload detected: executable PE binary header (MZ) forbidden"}');
-                Exit;
-              end;
-              var ThreatMsg: string := '';
-              if not ScanBufferForThreats(@HeaderBuf[0], ReadBytes, ToName, ThreatMsg) then
-              begin
-                AResponse.SetStatus(403);
-                AResponse.AddJSONContent(Format('{"error":"%s"}', [ThreatMsg]));
-                Exit;
-              end;
-            finally
-              CopyStream.Free;
+            var ThreatMsg: string := '';
+            if not ScanFileForThreats(SourceFile, ToName, ThreatMsg) then
+            begin
+              AResponse.SetStatus(403);
+              AResponse.AddJSONContent(Format('{"error":"%s"}', [ThreatMsg]));
+              Exit;
             end;
 
             if not TDirectory.Exists(DestDir) then
@@ -4828,22 +4815,8 @@ begin
                   try
                     if FileExists(StreamCtx.FullPath) then
                     begin
-                      var CheckStream: TFileStream := TFileStream.Create(StreamCtx.FullPath, fmOpenRead or fmShareDenyNone);
-                      try
-                        var HeadBuf: array[0..511] of Byte;
-                        var ReadHead: Integer := CheckStream.Read(HeadBuf, Length(HeadBuf));
-                        if (ReadHead >= 2) and IsExecutableBinaryHeader(@HeadBuf[0], ReadHead) then
-                        begin
-                          ThreatDetected := True;
-                          ThreatReason := 'Malicious payload detected: executable PE binary header (MZ) forbidden';
-                        end
-                        else if not ScanBufferForThreats(@HeadBuf[0], ReadHead, StreamCtx.Filename, ThreatReason) then
-                        begin
-                          ThreatDetected := True;
-                        end;
-                      finally
-                        CheckStream.Free;
-                      end;
+                      if not ScanFileForThreats(StreamCtx.FullPath, StreamCtx.Filename, ThreatReason) then
+                        ThreatDetected := True;
                     end;
                   except
                     on E: Exception do
@@ -5097,22 +5070,8 @@ begin
                 try
                   if FileExists(StreamCtx.FullPath) then
                   begin
-                    var CheckStream: TFileStream := TFileStream.Create(StreamCtx.FullPath, fmOpenRead or fmShareDenyNone);
-                    try
-                      var HeadBuf: array[0..511] of Byte;
-                      var ReadHead: Integer := CheckStream.Read(HeadBuf, Length(HeadBuf));
-                      if (ReadHead >= 2) and IsExecutableBinaryHeader(@HeadBuf[0], ReadHead) then
-                      begin
-                        ThreatDetected := True;
-                        ThreatReason := 'Malicious payload detected: executable PE binary header (MZ) forbidden';
-                      end
-                      else if not ScanBufferForThreats(@HeadBuf[0], ReadHead, StreamCtx.Filename, ThreatReason) then
-                      begin
-                        ThreatDetected := True;
-                      end;
-                    finally
-                      CheckStream.Free;
-                    end;
+                    if not ScanFileForThreats(StreamCtx.FullPath, StreamCtx.Filename, ThreatReason) then
+                      ThreatDetected := True;
                   end;
                 except
                   on E: Exception do

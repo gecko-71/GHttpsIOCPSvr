@@ -174,7 +174,12 @@ begin
 
   HAmsi := LoadLibraryW('amsi.dll');
   if HAmsi = 0 then
-    Exit(True);
+  begin
+    if GetEnvironmentVariable('AMSI_OPTIONAL') = '1' then
+      Exit(True);
+    AThreatMsg := 'Security scanner unavailable: failed to load amsi.dll';
+    Exit(False);
+  end;
 
   try
     @pAmsiInitialize := GetProcAddress(HAmsi, 'AmsiInitialize');
@@ -184,12 +189,22 @@ begin
     @pAmsiUninitialize := GetProcAddress(HAmsi, 'AmsiUninitialize');
 
     if not Assigned(pAmsiInitialize) or not Assigned(pAmsiScanBuffer) then
-      Exit(True);
+    begin
+      if GetEnvironmentVariable('AMSI_OPTIONAL') = '1' then
+        Exit(True);
+      AThreatMsg := 'Security scanner unavailable: amsi.dll functions missing';
+      Exit(False);
+    end;
 
     Context := nil;
     Hr := pAmsiInitialize('GTermBoxServer', Context);
     if Failed(Hr) or (Context = nil) then
-      Exit(True);
+    begin
+      if GetEnvironmentVariable('AMSI_OPTIONAL') = '1' then
+        Exit(True);
+      AThreatMsg := Format('Security scanner unavailable: AmsiInitialize failed (0x%x)', [Hr]);
+      Exit(False);
+    end;
 
     try
       Session := nil;
@@ -256,6 +271,15 @@ begin
   end;
 
   HAmsi := LoadLibraryW('amsi.dll');
+  if HAmsi = 0 then
+  begin
+    if GetEnvironmentVariable('AMSI_OPTIONAL') <> '1' then
+    begin
+      AThreatMsg := 'Security scanner unavailable: failed to load amsi.dll';
+      Exit(False);
+    end;
+  end;
+
   AmsiReady := False;
   Context := nil;
   Session := nil;
@@ -280,13 +304,24 @@ begin
     end;
   end;
 
+  if not AmsiReady and (GetEnvironmentVariable('AMSI_OPTIONAL') <> '1') then
+  begin
+    if HAmsi <> 0 then
+      FreeLibrary(HAmsi);
+    AThreatMsg := 'Security scanner unavailable: Windows AMSI provider failed to initialize';
+    Exit(False);
+  end;
+
   try
     try
       FStream := TFileStream.Create(AFilePath, fmOpenRead or fmShareDenyNone);
     except
       on E: Exception do
       begin
-        AThreatMsg := 'Antivirus threat detected by Windows AMSI: EICAR test signature';
+        if GetLastError = 225 then
+          AThreatMsg := 'Antivirus real-time protection blocked access to file'
+        else
+          AThreatMsg := Format('Failed to open file for security scanning: %s', [E.Message]);
         Exit(False);
       end;
     end;
