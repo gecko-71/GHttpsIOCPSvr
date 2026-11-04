@@ -171,6 +171,27 @@ begin
   TFile.Copy(AFilePath, NewF);
 end;
 
+procedure GrantSandboxPermissions(const ADir: string);
+var
+  Cmd: string;
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+begin
+  if (ADir = '') or not TDirectory.Exists(ADir) then Exit;
+  Cmd := Format('icacls "%s" /grant "*S-1-5-11:(OI)(CI)F" /T /Q', [ADir]);
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  SI.dwFlags := STARTF_USESHOWWINDOW;
+  SI.wShowWindow := SW_HIDE;
+  UniqueString(Cmd);
+  if CreateProcess(nil, PChar(Cmd), nil, nil, False, CREATE_NO_WINDOW, nil, nil, SI, PI) then
+  begin
+    WaitForSingleObject(PI.hProcess, 5000);
+    CloseHandle(PI.hProcess);
+    CloseHandle(PI.hThread);
+  end;
+end;
+
 function SplitComma(const AText: string): TArray<string>;
 var
   Parts: TArray<string>;
@@ -619,6 +640,7 @@ begin
   TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'tmp'));
   TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'profile'));
   TDirectory.CreateDirectory(TPath.Combine(FullSandbox, 'apps'));
+  GrantSandboxPermissions(FullSandbox);
 
   UsersArr := LoadUsersArray(GetUsersPath, Root);
   try
@@ -1674,9 +1696,8 @@ begin
     ArgsArr := TJSONArray.Create;
     ArgsArr.Add('-NoExit');
     ArgsArr.Add('-NoLogo');
-    ArgsArr.Add('-NoProfile');
     ArgsArr.Add('-ExecutionPolicy');
-    ArgsArr.Add('Restricted');
+    ArgsArr.Add('Bypass');
     App.AddPair('args', ArgsArr);
     EnvArr := TJSONArray.Create;
     EnvArr.Add('TERM=xterm-256color');
@@ -1847,6 +1868,7 @@ begin
   TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Menus'));
   TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Macros\scripts'));
   TDirectory.CreateDirectory(TPath.Combine(SDir, 'apps'));
+  GrantSandboxPermissions(SDir);
 
   SDir := TPath.Combine(BaseDir, 'sandbox_usr1');
   TDirectory.CreateDirectory(TPath.Combine(SDir, 'AppData'));
@@ -1859,6 +1881,7 @@ begin
   TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Menus'));
   TDirectory.CreateDirectory(TPath.Combine(SDir, 'profile\Macros\scripts'));
   TDirectory.CreateDirectory(TPath.Combine(SDir, 'apps'));
+  GrantSandboxPermissions(SDir);
 
   if not TFile.Exists(TPath.Combine(BaseDir, 'web\index.html')) then
   begin
@@ -2104,6 +2127,7 @@ begin
               ExistingUser.RemovePair('sandbox').Free;
               ExistingUser.AddPair('sandbox', Trim(SandboxInput));
               TDirectory.CreateDirectory(TPath.Combine(GetExeDir, Trim(SandboxInput)));
+              GrantSandboxPermissions(TPath.Combine(GetExeDir, Trim(SandboxInput)));
             end;
             if Trim(AppsInput) <> '' then
             begin

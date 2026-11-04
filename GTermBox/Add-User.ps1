@@ -194,6 +194,7 @@ foreach ($FullSandbox in $targetDirs) {
       [System.IO.File]::WriteAllText($profFile, $psProfileContent, [System.Text.Encoding]::UTF8)
     }
   }
+  & icacls $FullSandbox /grant "*S-1-5-11:(OI)(CI)F" /T /C /Q | Out-Null
 }
 
 $cliArgs = @(

@@ -172,6 +172,8 @@ function CancelIoEx(hFile: THandle; lpOverlapped: POverlapped): BOOL; stdcall; e
 function ConvertStringSecurityDescriptorToSecurityDescriptorW(StringSecurityDescriptor: PWideChar;
   StringSDRevision: DWORD; var SecurityDescriptor: Pointer; SecurityDescriptorSize: PULONG): BOOL; stdcall;
   external advapi32 name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
+function ConvertSidToStringSidW(Sid: PSID; var StringSid: LPWSTR): BOOL; stdcall;
+  external advapi32 name 'ConvertSidToStringSidW';
 
 function CreateProcessExW(
   lpApplicationName: LPCWSTR;
@@ -777,8 +779,9 @@ begin
                 AddAce(NewDacl, ACL_REVISION, MAXDWORD, AcePtr,
                   PDWORD(AcePtr)^ shr 16);
 
-        if SetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT,
-             DACL_SECURITY_INFORMATION, nil, nil, NewDacl, nil) = 0 then
+        var SetRes := SetNamedSecurityInfoW(PWideChar(ADir), SE_FILE_OBJECT,
+             DACL_SECURITY_INFORMATION, nil, nil, NewDacl, nil);
+        if SetRes = 0 then
         begin
           Logger.Info(Format('[ConPTY] Granted AppContainer access to: %s', [ADir]));
           var FoundDir := False;
@@ -791,7 +794,56 @@ begin
           end;
         end
         else
-          Logger.Warn(Format('[ConPTY] SetNamedSecurityInfo failed for: %s', [ADir]));
+        begin
+          Logger.Warn(Format('[ConPTY] SetNamedSecurityInfo failed (%d) for: %s, attempting icacls fallback...', [SetRes, ADir]));
+          var StrSid: LPWSTR := nil;
+          if ConvertSidToStringSidW(FAppContainerSid, StrSid) and (StrSid <> nil) then
+          begin
+            try
+              var SidStr := string(StrSid);
+              var PermStr: string;
+              if AFullAccess then PermStr := ':(OI)(CI)F' else PermStr := ':(OI)(CI)RX';
+              var IcaclsCmd := Format('icacls "%s" /grant "*%s%s" /T /Q', [ADir, SidStr, PermStr]);
+              var SI: TStartupInfo;
+              var PI: TProcessInformation;
+              FillChar(SI, SizeOf(SI), 0);
+              SI.cb := SizeOf(SI);
+              SI.dwFlags := STARTF_USESHOWWINDOW;
+              SI.wShowWindow := SW_HIDE;
+              UniqueString(IcaclsCmd);
+              if CreateProcess(nil, PChar(IcaclsCmd), nil, nil, False, CREATE_NO_WINDOW, nil, nil, SI, PI) then
+              begin
+                if WaitForSingleObject(PI.hProcess, 10000) = WAIT_OBJECT_0 then
+                begin
+                  var ExitCode: DWORD := 0;
+                  if GetExitCodeProcess(PI.hProcess, ExitCode) and (ExitCode = 0) then
+                  begin
+                    Logger.Info(Format('[ConPTY] icacls granted AppContainer access to: %s', [ADir]));
+                    var FoundDir := False;
+                    for var G in FGrantedDirs do
+                      if SameText(G, ADir) then begin FoundDir := True; Break; end;
+                    if not FoundDir then
+                    begin
+                      SetLength(FGrantedDirs, Length(FGrantedDirs) + 1);
+                      FGrantedDirs[High(FGrantedDirs)] := ADir;
+                    end;
+                  end
+                  else
+                    Logger.Warn(Format('[ConPTY] icacls fallback failed with exit code %d for: %s', [ExitCode, ADir]));
+                end
+                else
+                begin
+                  TerminateProcess(PI.hProcess, 1);
+                  Logger.Warn(Format('[ConPTY] icacls fallback timed out for: %s', [ADir]));
+                end;
+                CloseHandle(PI.hProcess);
+                CloseHandle(PI.hThread);
+              end;
+            finally
+              LocalFree(HLOCAL(StrSid));
+            end;
+          end;
+        end;
       finally
         FreeMem(NewDacl);
       end;

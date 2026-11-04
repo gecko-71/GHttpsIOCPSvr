@@ -310,7 +310,9 @@ foreach ($app in @($AppsJson.apps)) {
 }
 $CurrentAppIds = @((Get-Content (Join-Path $InstallDir 'apps.json') -Raw | ConvertFrom-Json).apps | ForEach-Object { $_.id })
 if ($CurrentAppIds -notcontains 'powershell') {
-  Invoke-Manage @('add-app', 'powershell', 'PowerShell', 'powershell.exe', '--sandbox=job-only', '--args=-NoExit,-NoLogo,-ExecutionPolicy,Bypass', '--roles=user,admin', '--no-network') | Out-Null
+  Invoke-Manage @('add-app', 'powershell', 'PowerShell', 'powershell.exe', '--sandbox=standard', '--args=-NoExit,-NoLogo,-ExecutionPolicy,Bypass', '--roles=user,admin', '--no-network') | Out-Null
+} else {
+  Invoke-Manage @('edit-app', 'powershell', '--args=-NoExit,-NoLogo,-ExecutionPolicy,Bypass') | Out-Null
 }
 if ($CurrentAppIds -notcontains 'pytui') {
   Invoke-Manage @('add-app', 'pytui', 'Python TUI', 'PyTui\run.cmd', '--cols=120', '--rows=30', '--sandbox=job-only', '--roles=admin', '--env=TERM=xterm-256color,COLORTERM=truecolor,PYTHONIOENCODING=utf-8,PYTHONUTF8=1', '--no-network') | Out-Null
@@ -334,6 +336,9 @@ if ($Existing -notcontains 'admin') { Invoke-Manage @('add', 'admin', $Password,
 if ($Existing -notcontains 'usr1') { Invoke-Manage @('add', 'usr1', $Password, '--role=user', '--apps=powershell') | Out-Null }
 Invoke-Manage @('passwd', 'admin', $Password) | Out-Null
 Invoke-Manage @('passwd', 'usr1', $Password) | Out-Null
+Get-ChildItem -Path $InstallDir -Filter 'sandbox_*' -Directory | ForEach-Object {
+  & icacls $_.FullName /grant "*S-1-5-11:(OI)(CI)F" /T /C /Q | Out-Null
+}
 Write-Ok 'users.json: admin (admin), usr1 (user)'
 
 Write-Step '[6/9] Generating W3C WebTransport TLS certificate (ECDSA P-256)...'
@@ -484,6 +489,9 @@ Write-Step '[8/9] Configuring ACLs, firewall and start script...'
 foreach ($acl in @(@{ P = 'web'; R = '(OI)(CI)RX' }, @{ P = 'PyTui'; R = '(OI)(CI)RX' }, @{ P = 'trusted_clients'; R = '(OI)(CI)RX' })) {
   $p = Join-Path $InstallDir $acl.P
   if (Test-Path $p) { & icacls $p /grant "*S-1-15-2-1:$($acl.R)" /T /C /Q | Out-Null }
+}
+Get-ChildItem -Path $InstallDir -Filter 'sandbox_*' -Directory | ForEach-Object {
+  & icacls $_.FullName /grant "*S-1-5-11:(OI)(CI)F" /T /C /Q | Out-Null
 }
 Write-Ok 'AppContainer ACLs applied'
 if (-not $SkipFirewall) {
