@@ -6,7 +6,8 @@ param(
   [string]$AssetsDir = '',
   [string]$InstallDir = '',
   [switch]$SkipFirewall,
-  [switch]$SkipSelfTest
+  [switch]$SkipSelfTest,
+  [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -153,6 +154,21 @@ Write-Host '============================================================' -Foreg
 Write-Host '            GTermBoxServer Installer                         ' -ForegroundColor Cyan
 Write-Host '============================================================' -ForegroundColor Cyan
 Write-Host "Install directory: $InstallDir"
+Write-Host ''
+Write-Host ' [WARNING] This installer configures system-wide security settings:' -ForegroundColor DarkYellow
+Write-Host '   - Generates and imports TLS server and client certificates into system stores' -ForegroundColor DarkYellow
+Write-Host '   - Cleans old development/test certificates from system stores' -ForegroundColor DarkYellow
+Write-Host '   - Configures local AppContainer permissions and Windows Firewall rules' -ForegroundColor DarkYellow
+Write-Host "   - Initializes server accounts and configuration in: $InstallDir" -ForegroundColor DarkYellow
+Write-Host ''
+
+if (-not $Force) {
+  $confirm = Read-Host "Do you want to proceed with installation in '$InstallDir'? (y/N)"
+  if ($confirm -notmatch '^(y|yes)$') {
+    Write-Host 'Installation cancelled by user.' -ForegroundColor Yellow
+    exit 0
+  }
+}
 
 Write-Step '[1/9] Checking prerequisites and clearing old certificates...'
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -209,14 +225,15 @@ if ($PurgedCount -gt 0) {
 Write-Ok ("PowerShell {0}, Administrator, executables present" -f $PSVersionTable.PSVersion)
 Write-Ok "Server endpoint: https://${BindIp}:$Port"
 
-Write-Step '[2/9] Checking management scripts and deploying runtime dependencies...'
+Write-Step '[2/9] Checking management scripts and runtime dependencies...'
 $RequiredScripts = @(
   'Add-App.ps1',
   'Add-User.ps1',
   'Bind-ClientCertificate.ps1',
   'Install-ClientCertificate.ps1',
   'Install-ServerCertificate.ps1',
-  'remove_certs.ps1'
+  'remove_certs.ps1',
+  'gen_w3c_wt_cert.ps1'
 )
 foreach ($scriptName in $RequiredScripts) {
   $destScript = Join-Path $InstallDir $scriptName
@@ -226,70 +243,55 @@ foreach ($scriptName in $RequiredScripts) {
 }
 Write-Ok 'All required helper ps1 scripts present in directory'
 
-$SearchRoots = New-Object System.Collections.Generic.List[string]
-if ($AssetsDir) { $SearchRoots.Add((Resolve-Path $AssetsDir).Path) }
-$dir = Split-Path -Parent $InstallDir
-while ($dir) {
-  $SearchRoots.Add($dir)
-  $parent = Split-Path -Parent $dir
-  if (-not $parent -or $parent -eq $dir) { break }
-  $dir = $parent
-}
-$SubDirs = @('', 'GTermBox\Win64\Debug', 'GTermBox\Win64\Release', 'GTermBox', 'Win64\Debug', 'Win64\Release')
-
-function Find-Asset([string]$RelativePath) {
-  foreach ($root in $SearchRoots) {
-    foreach ($sub in $SubDirs) {
-      $base = $root
-      if ($sub) { $base = Join-Path $root $sub }
-      $candidate = Join-Path $base $RelativePath
-      if (Test-Path $candidate -PathType Leaf) {
-        $full = (Resolve-Path $candidate).Path
-        if (-not $full.StartsWith($InstallDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $full }
+$MsQuicDest = Join-Path $InstallDir 'msquic.dll'
+if (-not (Test-Path $MsQuicDest)) {
+  Write-Host ''
+  Write-Host "  [!] Missing library: msquic.dll" -ForegroundColor Yellow
+  Write-Host "      Official secure source: https://github.com/microsoft/msquic/releases (Official Microsoft QUIC repository)" -ForegroundColor Cyan
+  Write-Host "      Target directory: $InstallDir" -ForegroundColor DarkGray
+  $dlConfirm = Read-Host "  Do you want to download msquic.dll from its official release repository? (y/N)"
+  if ($dlConfirm -match '^(y|yes)$') {
+    $msquicUrl = 'https://github.com/microsoft/msquic/releases/download/v2.2.2/msquic_windows_x64_Release_openssl.zip'
+    $tmpZip = Join-Path $env:TEMP 'msquic_download.zip'
+    $tmpExtract = Join-Path $env:TEMP "msquic_extract_$([System.Guid]::NewGuid().ToString('N'))"
+    try {
+      Write-Info "Downloading msquic from $msquicUrl..."
+      [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+      Invoke-WebRequest -Uri $msquicUrl -OutFile $tmpZip -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      Expand-Archive -Path $tmpZip -DestinationPath $tmpExtract -Force
+      $extractedDll = Get-ChildItem -Path $tmpExtract -Filter 'msquic.dll' -Recurse | Select-Object -First 1
+      if ($extractedDll) {
+        Copy-Item $extractedDll.FullName $MsQuicDest -Force
+        Write-Ok "msquic.dll successfully downloaded and placed in $MsQuicDest"
+      } else {
+        Stop-Install "Failed to locate msquic.dll inside the downloaded archive."
       }
+    } catch {
+      Stop-Install "Download of msquic.dll failed: $($_.Exception.Message)"
+    } finally {
+      if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue }
+      if (Test-Path $tmpExtract) { Remove-Item $tmpExtract -Recurse -Force -ErrorAction SilentlyContinue }
     }
+  } else {
+    Stop-Install "Missing required library in server directory: msquic.dll"
   }
-  return $null
 }
+if (-not (Test-Path $MsQuicDest)) {
+  Stop-Install "Missing required library in server directory: msquic.dll"
+}
+Write-Ok "msquic.dll present in directory"
 
-foreach ($dll in @('msquic.dll', 'ls-qpack.dll')) {
-  $dest = Join-Path $InstallDir $dll
-  if (Test-Path $dest) { Write-Info "$dll already present"; continue }
-  $src = Find-Asset $dll
-  if (-not $src) { Stop-Install "$dll not found. Place it next to the installer or pass -AssetsDir <folder>." }
-  Copy-Item $src $dest -Force
-  Write-Ok "$dll <- $src"
+$LsQpackDest = Join-Path $InstallDir 'ls-qpack.dll'
+if (-not (Test-Path $LsQpackDest)) {
+  Stop-Install "Missing required library in server directory: ls-qpack.dll"
 }
-if (-not (Test-Path (Join-Path $InstallDir 'gen_w3c_wt_cert.ps1'))) {
-  $srcGen = Find-Asset 'gen_w3c_wt_cert.ps1'
-  if ($srcGen) {
-    Copy-Item $srcGen (Join-Path $InstallDir 'gen_w3c_wt_cert.ps1') -Force
-    Write-Ok "gen_w3c_wt_cert.ps1 <- $srcGen"
-  }
-}
+Write-Ok "ls-qpack.dll present in directory"
+
 $WebDir = Join-Path $InstallDir 'web'
-if (Test-Path (Join-Path $WebDir 'index.html')) {
-  Write-Info 'web\index.html already present'
-} else {
-  $idx = Find-Asset 'web\index.html'
-  if (-not $idx) { Stop-Install 'web\index.html not found. Place the web folder next to the installer or pass -AssetsDir <folder>.' }
-  $srcWeb = Split-Path -Parent $idx
-  New-Item -ItemType Directory -Path $WebDir -Force | Out-Null
-  Copy-Item (Join-Path $srcWeb '*') $WebDir -Recurse -Force
-  Write-Ok "web <- $srcWeb"
+if (-not (Test-Path (Join-Path $WebDir 'index.html'))) {
+  Stop-Install 'Missing web assets in server directory: web\index.html not found'
 }
-$PyTuiDir = Join-Path $InstallDir 'PyTui'
-if (Test-Path (Join-Path $PyTuiDir 'run.cmd')) {
-  Write-Info 'PyTui\run.cmd already present'
-} else {
-  $pyIdx = Find-Asset 'PyTui\run.cmd'
-  if ($pyIdx) {
-    $srcPyTui = Split-Path -Parent $pyIdx
-    New-Item -ItemType Directory -Path $PyTuiDir -Force | Out-Null
-    Copy-Item (Join-Path $srcPyTui '*') $PyTuiDir -Recurse -Force
-    Write-Ok "PyTui <- $srcPyTui"
-  }
-}
+Write-Ok 'web\index.html present in directory'
 
 Write-Step '[3/9] Initializing directory structure and configuration...'
 Invoke-Manage @('init-env', $InstallDir) | Out-Null
@@ -378,8 +380,9 @@ if (Test-Path $genScript) {
     if ($ecdsaKey -and $ecdsaKey.Key -and $ecdsaKey.Key.UniqueName) {
       $keyPath = "$env:ProgramData\Microsoft\Crypto\Keys\" + $ecdsaKey.Key.UniqueName
       if (Test-Path $keyPath) {
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
         & icacls.exe $keyPath /remove "*S-1-1-0" /Q | Out-Null
-        & icacls.exe $keyPath /grant "*S-1-5-18:(R)" "*S-1-5-32-544:(R)" /Q | Out-Null
+        & icacls.exe $keyPath /grant "*S-1-5-18:(R)" "*S-1-5-32-544:(R)" "*$($currentUser.Value):(R)" /Q | Out-Null
         $acl = Get-Acl -Path $keyPath
         $rulesToRemove = @($acl.Access | Where-Object { $_.IdentityReference.Value -match 'S-1-1-0|Everyone|Wszyscy' })
         foreach ($r in $rulesToRemove) {
@@ -389,6 +392,9 @@ if (Test-Path $genScript) {
         $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem, 'Read', 'Allow')))
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins, 'Read', 'Allow')))
+        if ($currentUser) {
+          $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, 'Read', 'Allow')))
+        }
         Set-Acl -Path $keyPath -AclObject $acl
       }
     }
@@ -429,7 +435,15 @@ Write-Ok "Valid: $($ServerCert.NotBefore) to $($ServerCert.NotAfter)"
 
 Write-Step '[7/9] Generating mTLS client certificates (admin, usr1)...'
 $Now = Get-Date
-$ClientPasswords = @{ 'admin' = 'PasswordAdmin!'; 'usr1' = 'PasswordUsr1!' }
+function New-RandomClientPassword {
+  $bytes = New-Object byte[] 18
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  return [Convert]::ToBase64String($bytes).Replace('+', 'A').Replace('/', 'B').Replace('=', 'C') + '!9'
+}
+$ClientPasswords = @{
+  'admin' = (New-RandomClientPassword);
+  'usr1'  = (New-RandomClientPassword)
+}
 $MyStore = Open-CertStore 'My' 'CurrentUser'
 try {
   foreach ($u in @('admin', 'usr1')) {

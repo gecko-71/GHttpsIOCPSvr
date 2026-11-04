@@ -1,29 +1,23 @@
-# ==============================================================================
-# Script generating ECDSA P-256 certificate 100% compliant with W3C WebTransport
-# specification (Section 3.3 serverCertificateHashes).
-#
-# W3C Specification Requirements:
-# 1. Key Algorithm: ECDSA P-256 (secp256r1) - RSA is explicitly forbidden by W3C!
-# 2. Validity Period: MUST NOT EXCEED 14 DAYS (2 weeks)!
-# 3. Hash Algorithm: SHA-256
-#
-# NOTE: Must be executed in PowerShell as Administrator!
-# This script ONLY generates the certificate and configures key store permissions.
-# It does NOT modify any project source files.
-# ==============================================================================
+param(
+    [string]$ServerIp = $env:TEST_SERVER_BIND_IP
+)
 
 Write-Host "--- Generating W3C WebTransport Certificate (ECDSA P-256, 14 days) ---" -ForegroundColor Cyan
 
-$primaryIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet' -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1).IPAddress
-if (-not $primaryIp) { $primaryIp = '127.0.0.1' }
-$dnsNames = @($primaryIp, 'localhost', '127.0.0.1')
+$detectedIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+    Select-Object -ExpandProperty IPAddress)
 
-# 1. Clean up old GHttpsIOCPSvr certificates
+$dnsNames = @('localhost', '127.0.0.1')
+if ($detectedIps) { $dnsNames += $detectedIps }
+if ($ServerIp) { $dnsNames += $ServerIp }
+$dnsNames = @($dnsNames | Select-Object -Unique)
+$primaryIp = if ($ServerIp) { $ServerIp } elseif ($detectedIps.Count -gt 0) { $detectedIps[0] } else { '127.0.0.1' }
+
 Get-ChildItem Cert:\LocalMachine\GHttpsIOCPSvr -ErrorAction SilentlyContinue |
     Where-Object { $_.Subject -like "*CN=$primaryIp*" -or $_.Subject -like "*CN=localhost*" -or $_.FriendlyName -eq "GHttpsIOCPSvr" } |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
-# 2. Create new ECDSA P-256 certificate valid for exactly 14 days
 $notBefore = (Get-Date).AddDays(-1)
 $notAfter  = (Get-Date).AddDays(13)
 
@@ -43,33 +37,39 @@ if (-not $cert) {
     Exit 1
 }
 
-# 3. Copy certificate to LocalMachine\GHttpsIOCPSvr store
 $destStoreLM = New-Object System.Security.Cryptography.X509Certificates.X509Store('GHttpsIOCPSvr', 'LocalMachine')
 $destStoreLM.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
 $destStoreLM.Add($cert)
 $destStoreLM.Close()
 
-# 4. Grant read permissions on CNG private key file to Everyone using universal SID (S-1-1-0)
 try {
     $ecdsaKey = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($cert)
     if ($ecdsaKey -and $ecdsaKey.Key -and $ecdsaKey.Key.UniqueName) {
         $keyPath = "$env:ProgramData\Microsoft\Crypto\Keys\" + $ecdsaKey.Key.UniqueName
         if (Test-Path $keyPath) {
-            # Use language-neutral Well-Known SID S-1-1-0 (Everyone / Wszyscy)
-            $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'Read', 'Allow')
+            $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            & icacls.exe $keyPath /remove "*S-1-1-0" /Q | Out-Null
+            & icacls.exe $keyPath /grant "*S-1-5-18:(R)" "*S-1-5-32-544:(R)" "*$($currentUser.Value):(R)" /Q | Out-Null
             $acl = Get-Acl -Path $keyPath
-            $acl.AddAccessRule($rule)
+            $rulesToRemove = @($acl.Access | Where-Object { $_.IdentityReference.Value -match 'S-1-1-0|Everyone|Wszyscy' })
+            foreach ($r in $rulesToRemove) {
+                [void]$acl.RemoveAccessRule($r)
+            }
+            $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+            $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem, 'Read', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins, 'Read', 'Allow')))
+            if ($currentUser) {
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, 'Read', 'Allow')))
+            }
             Set-Acl -Path $keyPath -AclObject $acl
-            & icacls.exe $keyPath /grant "*S-1-1-0:(R)" | Out-Null
-            Write-Host "CNG private key permissions successfully configured (Everyone / S-1-1-0)." -ForegroundColor Green
+            Write-Host "CNG private key permissions successfully configured (SYSTEM, Administrators and installing user $env:USERNAME)." -ForegroundColor Green
         }
     }
 } catch {
     Write-Warning "Key ACL configuration note: $_"
 }
 
-# 5. Compute SHA-256 hash of the DER raw certificate
 $sha256 = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
 $hashArrayStr = '[' + (($sha256 | ForEach-Object { $_.ToString() }) -join ', ') + ']'
 $hashHexStr = [System.BitConverter]::ToString($sha256).Replace('-', '')

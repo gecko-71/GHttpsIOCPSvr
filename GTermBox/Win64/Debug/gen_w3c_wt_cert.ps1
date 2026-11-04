@@ -47,8 +47,9 @@ try {
     if ($ecdsaKey -and $ecdsaKey.Key -and $ecdsaKey.Key.UniqueName) {
         $keyPath = "$env:ProgramData\Microsoft\Crypto\Keys\" + $ecdsaKey.Key.UniqueName
         if (Test-Path $keyPath) {
-            & icacls.exe $keyPath /remove "*S-1-1-0" | Out-Null
-            & icacls.exe $keyPath /grant "*S-1-5-18:(R)" "*S-1-5-32-544:(R)" | Out-Null
+            $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            & icacls.exe $keyPath /remove "*S-1-1-0" /Q | Out-Null
+            & icacls.exe $keyPath /grant "*S-1-5-18:(R)" "*S-1-5-32-544:(R)" "*$($currentUser.Value):(R)" /Q | Out-Null
             $acl = Get-Acl -Path $keyPath
             $rulesToRemove = @($acl.Access | Where-Object { $_.IdentityReference.Value -match 'S-1-1-0|Everyone|Wszyscy' })
             foreach ($r in $rulesToRemove) {
@@ -58,8 +59,11 @@ try {
             $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
             $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem, 'Read', 'Allow')))
             $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins, 'Read', 'Allow')))
+            if ($currentUser) {
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, 'Read', 'Allow')))
+            }
             Set-Acl -Path $keyPath -AclObject $acl
-            Write-Host "CNG private key permissions successfully configured (SYSTEM and Administrators only)." -ForegroundColor Green
+            Write-Host "CNG private key permissions successfully configured (SYSTEM, Administrators and installing user $env:USERNAME)." -ForegroundColor Green
         }
     }
 } catch {

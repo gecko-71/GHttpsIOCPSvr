@@ -1415,7 +1415,7 @@ begin
 
         if not HasKey then
         begin
-          AErrorDetail := Format('Server process cannot access CNG private key for certificate in store "%s" (Win32 Error: 0x%x). The process lacks read permissions to the key file in ProgramData\Microsoft\Crypto\Keys. Run .\gen_w3c_wt_cert.ps1 as Administrator to grant permissions (Everyone / S-1-1-0).', [AStoreName, KeyErr]);
+          AErrorDetail := Format('Server process cannot access CNG private key for certificate in store "%s" (Win32 Error: 0x%x). The process lacks read permissions to the key file in ProgramData\Microsoft\Crypto\Keys. Run Start-GTermBox.cmd as Administrator (elevated) or grant read permissions on the key file to the running user account.', [AStoreName, KeyErr]);
           PrevCtx := CertCtx;
           Continue;
         end;
