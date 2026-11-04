@@ -685,7 +685,7 @@ end;
 
 const
   SANDBOX_DESKTOP_NAME = 'GTermBoxSandbox';
-  SANDBOX_DESKTOP_SDDL = 'D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;AC)';
+  SANDBOX_DESKTOP_SDDL = 'D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)(A;;GA;;;AC)';
 
 var
   GSandboxDesktopLock: TCriticalSection = nil;
@@ -1529,13 +1529,9 @@ begin
       SiEx.StartupInfo.hStdError := 0;
       SiEx.lpAttributeList := AttrList;
 
-      DesktopPath := '';
-      if UseAppContainer then
-      begin
-        DesktopPath := GetSandboxDesktopPath;
-        if DesktopPath <> '' then
-          SiEx.StartupInfo.lpDesktop := PWideChar(DesktopPath);
-      end;
+      DesktopPath := GetSandboxDesktopPath;
+      if DesktopPath <> '' then
+        SiEx.StartupInfo.lpDesktop := PWideChar(DesktopPath);
 
       StringToWideChar(ACommandLine, CmdLineBuf, Length(CmdLineBuf));
 
