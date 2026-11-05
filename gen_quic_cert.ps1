@@ -2,7 +2,7 @@ $detectedIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyConti
     Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
     Select-Object -ExpandProperty IPAddress)
 
-$dnsNames = @('localhost', '127.0.0.1')
+$dnsNames = @('localhost', '127.0.0.1') 
 if ($detectedIps) { $dnsNames += $detectedIps }
 $dnsNames = @($dnsNames | Select-Object -Unique)
 
