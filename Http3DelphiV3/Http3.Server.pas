@@ -1,4 +1,4 @@
-﻿{
+{
   MIT License
 
   Copyright (c) 2026 GECKO-71
@@ -837,6 +837,7 @@ begin
                 end
                 else
                 begin
+                  Logger.Warn('[H3] CONNECT rejected: missing :protocol header for path "%s"', [ReqPath]);
                   SendResponse(H3State, StreamState, ConnCtx, 400, 'text/plain', TEncoding.UTF8.GetBytes('Bad Request'));
                   Exit;
                 end;

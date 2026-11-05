@@ -5783,7 +5783,10 @@ var
 begin
   Result := False;
   if not IsWebTransportOriginAllowed(Info.Origin, Info.Authority) then
+  begin
+    Logger.Warn('[WT] WebTransportSessionRequest rejected: Origin "%s" or Authority "%s" not allowed', [Info.Origin, Info.Authority]);
     Exit;
+  end;
   PurePath := LowerCase(Info.Path);
   var QMark := Pos('?', PurePath);
   if QMark > 0 then
@@ -5792,10 +5795,11 @@ begin
   FLock.Enter;
   try
     Result := FWebTransportRoutes.TryGetValue(PurePath, Item);
+    if not Result then
+      Logger.Warn('[WT] WebTransportSessionRequest rejected: Route not found for "%s"', [PurePath]);
   finally
     FLock.Leave;
   end;
-
 end;
 
 procedure TGHttpsServerIOCP.WebTransportSessionReady(Sender: TObject; Session: PWTSessionContext);
@@ -5906,7 +5910,11 @@ var
 begin
   Result := False;
   if (not FRunning) or (FRejectNewConnections = 1) or (FActiveConnections >= FMaxConnections) then
+  begin
+    Logger.Warn('[QUIC] HandleQuicBeforeAcceptConnection rejected: Server state (running=%d, active=%d/%d)',
+      [Ord(FRunning), FActiveConnections, FMaxConnections]);
     Exit;
+  end;
   if ARemoteIP <> '' then
   begin
     NowTick := GetTickCount64;
@@ -5915,14 +5923,26 @@ begin
       if FIPTracker.TryGetValue(ARemoteIP, Info) then
       begin
         if (Info.BlockedUntilTick > 0) and (NowTick < Info.BlockedUntilTick) then
+        begin
+          Logger.Warn('[QUIC] HandleQuicBeforeAcceptConnection rejected: IP %s blocked until tick %d (now %d)',
+            [ARemoteIP, Info.BlockedUntilTick, NowTick]);
           Exit;
+        end;
+        if Info.BlockedUntilTick <= NowTick then
+        begin
+          Info.FailureCount := 0;
+          Info.BlockedUntilTick := 0;
+        end;
       end;
     finally
       FIPTrackerLock.Leave;
     end;
   end;
   if not TrackIPConnect(ARemoteIP) then
+  begin
+    Logger.Warn('[QUIC] HandleQuicBeforeAcceptConnection rejected: TrackIPConnect failed for %s', [ARemoteIP]);
     Exit;
+  end;
   TInterlocked.Increment(FRequestsPerSecondCounter);
   InterlockedIncrement64(FActiveConnections);
   Result := True;
@@ -5952,10 +5972,20 @@ begin
       FIPTracker.Add(ARemoteIP, Info);
     end;
     Inc(Info.FailureCount);
-    ShiftVal := Info.FailureCount;
-    if ShiftVal > 6 then
-      ShiftVal := 6;
-    Info.BlockedUntilTick := NowTick + UInt64(1000 shl ShiftVal);
+    if Info.FailureCount >= 5 then
+    begin
+      ShiftVal := Info.FailureCount - 4;
+      if ShiftVal > 6 then
+        ShiftVal := 6;
+      Info.BlockedUntilTick := NowTick + UInt64(1000 shl ShiftVal);
+      Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d, BlockedUntilTick=%d)',
+        [ARemoteIP, Info.FailureCount, Info.BlockedUntilTick]);
+    end
+    else
+    begin
+      Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d/5)',
+        [ARemoteIP, Info.FailureCount]);
+    end;
   finally
     FIPTrackerLock.Leave;
   end;

@@ -171,6 +171,7 @@ begin
   FRows := FProfile.DefaultRows;
   FConPty := TGTermConPty.Create(FProfile.DefaultCols, FProfile.DefaultRows);
   FConPty.SandboxMode := FProfile.Sandbox;
+  FConPty.Username := FUsername;
   FSessionLock := TCriticalSection.Create;
 
   FConPty.OnDataReceived := HandlePtyDataReceived;

@@ -12,17 +12,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if (-not $Password) {
-  switch ($Username) {
-    'usr1' { $Password = 'PasswordUsr1!' }
-    'usr2' { $Password = 'PasswordUsr2!' }
-    'usr3' { $Password = 'PasswordUsr3!' }
-    'admin' { $Password = 'PasswordAdmin!' }
-    'mallory' { $Password = 'PasswordMallory!' }
-    default { $Password = "Password$Username!" }
-  }
-}
-
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 if (-not $PfxPath) {
@@ -36,6 +25,14 @@ if (-not $PfxPath) {
       break
     }
   }
+}
+
+if (-not $Password) {
+  $rngBytes = New-Object byte[] 18
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  $rng.GetBytes($rngBytes)
+  $Password = [System.Convert]::ToBase64String($rngBytes).Replace('+', 'A').Replace('/', 'B').TrimEnd('=') + '!9a'
+  Write-Host "Generated random PFX password for '$Username': $Password" -ForegroundColor Yellow
 }
 
 if (-not $PfxPath -or -not (Test-Path $PfxPath)) {

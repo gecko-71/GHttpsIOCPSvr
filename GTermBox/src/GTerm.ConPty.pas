@@ -27,7 +27,7 @@ interface
 
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.StrUtils, System.IOUtils,
-  System.SyncObjs, System.Hash, Quick.Logger, GTerm.ConPty.Loader, GTerm.Types;
+  System.SyncObjs, System.Hash, System.Generics.Collections, Quick.Logger, GTerm.ConPty.Loader, GTerm.Types;
 
 const
   PROC_THREAD_ATTRIBUTE_HANDLE_LIST          = $00020002;
@@ -119,6 +119,7 @@ type
     FStopping: Integer;
     FStopEvent: THandle;
     FGrantedDirs: TArray<string>;
+    FUsername: string;
     procedure CreatePipes;
     procedure ClosePipes;
     procedure SetupJobSandbox;
@@ -144,6 +145,7 @@ type
     property OnDataReceived: TDataReceivedEvent read FOnDataReceived write FOnDataReceived;
     property OnProcessTerminated: TProcessTerminatedEvent read FOnProcessTerminated write FOnProcessTerminated;
     property SandboxMode: TSandboxMode read FSandboxMode write FSandboxMode;
+    property Username: string read FUsername write FUsername;
   end;
 
 function InitializeProcThreadAttributeList(
@@ -230,6 +232,15 @@ type
     JobMemoryLimit: SIZE_T;
     PeakProcessMemoryUsed: SIZE_T;
     PeakJobMemoryUsed: SIZE_T;
+  end;
+
+const
+  JOB_OBJECT_UILIMIT_HANDLES = $00000001;
+  JOB_OBJECT_UILIMIT_DESKTOP = $00000040;
+
+type
+  JOBOBJECT_BASIC_UI_RESTRICTIONS = record
+    UIRestrictionsClass: DWORD;
   end;
 
 function CreateJobObjectW(lpJobAttributes: Pointer; lpName: PWideChar): THandle;
@@ -681,6 +692,12 @@ begin
   CpuInfo.ControlFlags := JOB_OBJECT_CPU_RATE_CONTROL_ENABLE or JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
   CpuInfo.CpuRate := 5000;
   SetInformationJobObject(FJobHandle, 6, @CpuInfo, SizeOf(CpuInfo));
+
+  var UiInfo: JOBOBJECT_BASIC_UI_RESTRICTIONS;
+  FillChar(UiInfo, SizeOf(UiInfo), 0);
+  UiInfo.UIRestrictionsClass := JOB_OBJECT_UILIMIT_DESKTOP or JOB_OBJECT_UILIMIT_HANDLES;
+  if not SetInformationJobObject(FJobHandle, 4, @UiInfo, SizeOf(UiInfo)) then
+    Logger.Warn(Format('[ConPTY] SetInformationJobObject (UI limits) failed: %d', [GetLastError]));
 end;
 
 const
@@ -689,8 +706,8 @@ const
 
 var
   GSandboxDesktopLock: TCriticalSection = nil;
-  GSandboxDesktop: HDESK = 0;
-  GSandboxDesktopPath: string = '';
+  GUserDesktops: TDictionary<string, THandle> = nil;
+  GUserDesktopPaths: TDictionary<string, string> = nil;
 
 procedure TGTermConPty.GrantDirAccessToAppContainer(const ADir: string; AFullAccess: Boolean);
 var
@@ -856,19 +873,26 @@ begin
   end;
 end;
 
-function GetSandboxDesktopPath: string;
+function GetSandboxDesktopPath(const AUsername: string = ''): string;
 var
   Sd: Pointer;
   Sa: TSecurityAttributes;
   WinStaName: array[0..255] of WideChar;
   Needed: DWORD;
+  CleanUser: string;
+  DeskName: string;
+  HDesk: THandle;
 begin
   Result := '';
+  CleanUser := Trim(AUsername);
+  if CleanUser = '' then CleanUser := 'default';
+  DeskName := 'GTermBox_' + CleanUser;
+
   if GSandboxDesktopLock = nil then Exit;
   GSandboxDesktopLock.Enter;
   try
-    if GSandboxDesktop <> 0 then
-      Exit(GSandboxDesktopPath);
+    if (GUserDesktopPaths <> nil) and GUserDesktopPaths.TryGetValue(CleanUser, Result) and (Result <> '') then
+      Exit;
 
     FillChar(WinStaName, SizeOf(WinStaName), 0);
     Needed := 0;
@@ -889,20 +913,23 @@ begin
       Sa.nLength := SizeOf(Sa);
       Sa.lpSecurityDescriptor := Sd;
       Sa.bInheritHandle := False;
-      GSandboxDesktop := CreateDesktopW(PWideChar(SANDBOX_DESKTOP_NAME), nil, nil, 0, GENERIC_ALL, @Sa);
+      HDesk := CreateDesktopW(PWideChar(DeskName), nil, nil, 0, GENERIC_ALL, @Sa);
     finally
       LocalFree(HLOCAL(Sd));
     end;
 
-    if GSandboxDesktop = 0 then
+    if HDesk = 0 then
     begin
-      Logger.Warn(Format('[ConPTY] CreateDesktop failed: %d', [GetLastError]));
+      Logger.Warn(Format('[ConPTY] CreateDesktop failed for "%s": %d', [DeskName, GetLastError]));
       Exit;
     end;
 
-    GSandboxDesktopPath := string(PWideChar(@WinStaName[0])) + '\' + SANDBOX_DESKTOP_NAME;
-    Logger.Info(Format('[ConPTY] Sandbox desktop ready: %s', [GSandboxDesktopPath]));
-    Result := GSandboxDesktopPath;
+    Result := string(PWideChar(@WinStaName[0])) + '\' + DeskName;
+    if GUserDesktops <> nil then
+      GUserDesktops.AddOrSetValue(CleanUser, HDesk);
+    if GUserDesktopPaths <> nil then
+      GUserDesktopPaths.AddOrSetValue(CleanUser, Result);
+    Logger.Info(Format('[ConPTY] User sandbox desktop ready: %s', [Result]));
   finally
     GSandboxDesktopLock.Leave;
   end;
@@ -1197,6 +1224,28 @@ const
                        '  if ([System.IO.Directory]::GetCurrentDirectory() -ne $env:USERPROFILE) { [System.IO.Directory]::SetCurrentDirectory($env:USERPROFILE) }' + #13#10 +
                        '  "PS $($executionContext.SessionState.Path.CurrentLocation)$(''>'' * ($nestedPromptLevel + 1)) "' + #13#10 +
                        '} | Out-Null' + #13#10;
+  PS_GUI_BLOCKER     = '$ExecutionContext.InvokeCommand.PostCommandLookupAction = {' + #13#10 +
+                       '  param($cmdName, $cmdArgs)' + #13#10 +
+                       '  if ($cmdArgs.Command -and ($cmdArgs.Command.CommandType -eq ''Application'')) {' + #13#10 +
+                       '    $p = $cmdArgs.Command.Path' + #13#10 +
+                       '    if ($p -and [System.IO.File]::Exists($p)) {' + #13#10 +
+                       '      try {' + #13#10 +
+                       '        $fs = [System.IO.File]::OpenRead($p)' + #13#10 +
+                       '        $buf = [byte[]]::new(1024)' + #13#10 +
+                       '        $null = $fs.Read($buf, 0, 1024)' + #13#10 +
+                       '        $fs.Close()' + #13#10 +
+                       '        if ($buf[0] -eq 0x4D -and $buf[1] -eq 0x5A) {' + #13#10 +
+                       '          $peOff = [System.BitConverter]::ToInt32($buf, 0x3C)' + #13#10 +
+                       '          if ($peOff -gt 0 -and ($peOff + 94) -lt $buf.Length) {' + #13#10 +
+                       '            if ([System.BitConverter]::ToUInt16($buf, $peOff + 24 + 68) -eq 2) {' + #13#10 +
+                       '              [Console]::WriteLine("[GTermBox Warning] ''" + $cmdName + "'' is a graphical (GUI) application. GUI windows are isolated on the background sandbox desktop.")' + #13#10 +
+                       '            }' + #13#10 +
+                       '          }' + #13#10 +
+                       '        }' + #13#10 +
+                       '      } catch {}' + #13#10 +
+                       '    }' + #13#10 +
+                       '  }' + #13#10 +
+                       '}' + #13#10;
 var
   ProfileDir5: string;
   ProfileFile5: string;
@@ -1205,6 +1254,7 @@ var
   SL: TStringList;
   MustRestrict: Boolean;
   EnvVar: string;
+  ProfileContent: string;
 begin
   ProfileDir5  := TPath.Combine(AWorkingDir, 'Documents\WindowsPowerShell');
   ProfileFile5 := TPath.Combine(ProfileDir5,  'Microsoft.PowerShell_profile.ps1');
@@ -1224,21 +1274,6 @@ begin
       end;
   end;
 
-  if not MustRestrict then
-  begin
-    if FileExists(ProfileFile5) and TFile.ReadAllText(ProfileFile5).Contains('New-PSDrive') then
-    begin
-      SetFileAttributesW(PWideChar(ProfileFile5), FILE_ATTRIBUTE_NORMAL);
-      TFile.Delete(ProfileFile5);
-    end;
-    if FileExists(ProfileFile7) and TFile.ReadAllText(ProfileFile7).Contains('New-PSDrive') then
-    begin
-      SetFileAttributesW(PWideChar(ProfileFile7), FILE_ATTRIBUTE_NORMAL);
-      TFile.Delete(ProfileFile7);
-    end;
-    Exit;
-  end;
-
   ForceDirectories(ProfileDir5);
   ForceDirectories(ProfileDir7);
 
@@ -1250,17 +1285,21 @@ begin
   if (Attr7 <> INVALID_FILE_ATTRIBUTES) and ((Attr7 and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
     Exit;
 
+  ProfileContent := PS_GUI_BLOCKER;
+  if MustRestrict then
+    ProfileContent := ProfileContent + PS_PROFILE_CONTENT;
+
   SL := TStringList.Create;
   try
-    SL.Text := PS_PROFILE_CONTENT;
-    if (not FileExists(ProfileFile5)) or (TFile.ReadAllText(ProfileFile5, TEncoding.UTF8) <> PS_PROFILE_CONTENT) then
+    SL.Text := ProfileContent;
+    if (not FileExists(ProfileFile5)) or (TFile.ReadAllText(ProfileFile5, TEncoding.UTF8) <> ProfileContent) then
     begin
       SetFileAttributesW(PWideChar(ProfileFile5), FILE_ATTRIBUTE_NORMAL);
       SL.SaveToFile(ProfileFile5, TEncoding.UTF8);
       Logger.Info(Format('[ConPTY] PS profile updated: %s', [ProfileFile5]));
     end;
     SetFileAttributesW(PWideChar(ProfileFile5), FILE_ATTRIBUTE_READONLY);
-    if (not FileExists(ProfileFile7)) or (TFile.ReadAllText(ProfileFile7, TEncoding.UTF8) <> PS_PROFILE_CONTENT) then
+    if (not FileExists(ProfileFile7)) or (TFile.ReadAllText(ProfileFile7, TEncoding.UTF8) <> ProfileContent) then
     begin
       SetFileAttributesW(PWideChar(ProfileFile7), FILE_ATTRIBUTE_NORMAL);
       SL.SaveToFile(ProfileFile7, TEncoding.UTF8);
@@ -1529,7 +1568,7 @@ begin
       SiEx.StartupInfo.hStdError := 0;
       SiEx.lpAttributeList := AttrList;
 
-      DesktopPath := GetSandboxDesktopPath;
+      DesktopPath := GetSandboxDesktopPath(FUsername);
       if DesktopPath <> '' then
         SiEx.StartupInfo.lpDesktop := PWideChar(DesktopPath);
 
@@ -1739,13 +1778,18 @@ end;
 
 initialization
   GSandboxDesktopLock := TCriticalSection.Create;
+  GUserDesktops := TDictionary<string, THandle>.Create;
+  GUserDesktopPaths := TDictionary<string, string>.Create;
 
 finalization
-  if GSandboxDesktop <> 0 then
+  if GUserDesktops <> nil then
   begin
-    CloseDesktop(GSandboxDesktop);
-    GSandboxDesktop := 0;
+    for var D in GUserDesktops.Values do
+      if D <> 0 then CloseDesktop(D);
+    FreeAndNil(GUserDesktops);
   end;
+  if GUserDesktopPaths <> nil then
+    FreeAndNil(GUserDesktopPaths);
   FreeAndNil(GSandboxDesktopLock);
 
 end.

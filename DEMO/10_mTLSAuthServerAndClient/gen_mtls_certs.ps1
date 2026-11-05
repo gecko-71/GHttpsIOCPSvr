@@ -5,6 +5,13 @@ param(
     [switch]$InstallLocalhostCert
 )
 
+if ($PSVersionTable.PSEdition -ne 'Desktop') {
+    $relaunchArgs = @("-ExecutionPolicy", "Bypass", "-NoProfile", "-File", $MyInvocation.MyCommand.Path, "-ServerDir", $ServerDir, "-ClientDir", $ClientDir, "-Password", $Password)
+    if ($InstallLocalhostCert) { $relaunchArgs += "-InstallLocalhostCert" }
+    & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" @relaunchArgs
+    exit $LASTEXITCODE
+}
+
 $ErrorActionPreference = "Stop"
 
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -157,17 +164,33 @@ try {
     Write-Host "  -> Created: client_pinned.pfx in client dir, client_pinned.crt & .sha256 in server dir [SHA-256: $pinnedSha256]" -ForegroundColor Green
 
     if ($InstallLocalhostCert) {
-        Write-Host "[+] Installing standard RSA localhost server certificate..." -ForegroundColor White
-        $serverCert = New-SelfSignedCertificate `
-            -DnsName "localhost", "127.0.0.1", $env:COMPUTERNAME `
-            -FriendlyName "GHttpsIOCPSvr" `
-            -KeyUsage DigitalSignature, KeyEncipherment `
-            -KeyUsageProperty All `
-            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") `
-            -CertStoreLocation "Cert:\LocalMachine\My" `
-            -HashAlgorithm SHA256 `
-            -KeyExportPolicy Exportable
-        Write-Host "  -> Installed localhost cert in Cert:\LocalMachine\My [Thumbprint: $($serverCert.Thumbprint)]" -ForegroundColor Green
+        try {
+            $cuGhStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("GHttpsIOCPSvr", "CurrentUser")
+            $cuGhStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $toRemove = @($cuGhStore.Certificates | Where-Object { $_.Subject -like "*CN=localhost*" })
+            foreach ($oldC in $toRemove) {
+                $cuGhStore.Remove($oldC)
+            }
+            $cuGhStore.Close()
+        } catch {}
+
+        $existingLmCert = Get-ChildItem -Path "Cert:\LocalMachine\GHttpsIOCPSvr" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Subject -like "*CN=localhost*" -and
+                $_.NotAfter -gt (Get-Date).AddDays(1) -and
+                (($_.NotAfter - $_.NotBefore).TotalDays -le 14.1) -and
+                $_.PublicKey.Oid.Value -eq "1.2.840.10045.2.1"
+            } | Select-Object -First 1
+
+        if ($null -ne $existingLmCert) {
+            Write-Host "  -> Reusing valid W3C ECDSA P-256 server certificate in Cert:\LocalMachine\GHttpsIOCPSvr [Thumbprint: $($existingLmCert.Thumbprint)]" -ForegroundColor Green
+        } else {
+            $rootW3cScript = Join-Path (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path "gen_w3c_wt_cert.ps1"
+            if (Test-Path $rootW3cScript) {
+                Write-Host "[+] Installing W3C WebTransport ECDSA P-256 server certificate via gen_w3c_wt_cert.ps1..." -ForegroundColor White
+                & $rootW3cScript
+            }
+        }
     }
 
     Write-Host "------------------------------------------------------------" -ForegroundColor Cyan

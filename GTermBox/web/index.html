@@ -1161,21 +1161,24 @@
 
         try {
 
-          const res = await fetch('/api/certificate-hash');
-
-          if (res.ok) {
-
-            const data = await res.json();
-
-            if (data && data.hash && Array.isArray(data.hash) && data.hash.length === 32 && !data.is_trusted) {
-
-              wtOptions = {
-
-                serverCertificateHashes: [{ algorithm: 'sha-256', value: new Uint8Array(data.hash) }]
-
-              };
-
+          if (!window._gtermCertHashData) {
+            const res = await fetch('/api/certificate-hash');
+            if (res.ok) {
+              window._gtermCertHashData = await res.json();
             }
+          }
+
+          const data = window._gtermCertHashData;
+
+          if (data && data.hash && Array.isArray(data.hash) && data.hash.length === 32 && !data.is_trusted) {
+
+            wtOptions = {
+
+              serverCertificateHashes: [{ algorithm: 'sha-256', value: new Uint8Array(data.hash) }],
+
+              allowPooling: false
+
+            };
 
           }
 
@@ -1320,6 +1323,8 @@
 
       } catch (err) {
 
+        console.error('[GTermBox WebTransport Connect Error]', err);
+
         if (this.wt) {
 
           try { this.wt.close(); } catch (_) {}
@@ -1328,7 +1333,9 @@
 
         }
 
-        this.handleDisconnect('WebTransport connection failed (TLS certificate error or server unreachable).', 'transport_failed');
+        const errDetail = (err && err.message) ? (' (' + err.message + ')') : '';
+
+        this.handleDisconnect('WebTransport connection failed' + errDetail + '.', 'transport_failed');
 
         return false;
 
@@ -2254,6 +2261,13 @@ class TabManager {
 
       const newBtn = document.getElementById('new-tab-btn');
       this.tabsBar.insertBefore(tabEl, newBtn);
+      this.tabs.forEach(t => {
+        t.tabEl.classList.remove('active');
+        t.paneEl.classList.remove('active');
+      });
+      tabEl.classList.add('active');
+      pane.classList.add('active');
+      this.activeTabId = tabId;
 
       let instance;
       if (isFiles) {
@@ -2326,6 +2340,13 @@ class TabManager {
 
       const newBtn = document.getElementById('new-tab-btn');
       this.tabsBar.insertBefore(tabEl, newBtn);
+      this.tabs.forEach(t => {
+        t.tabEl.classList.remove('active');
+        t.paneEl.classList.remove('active');
+      });
+      tabEl.classList.add('active');
+      pane.classList.add('active');
+      this.activeTabId = tabId;
 
       const fileManager = new FileManagerPanel(pane);
       const tabObj = {

@@ -1,4 +1,4 @@
-﻿{
+{
 
   MIT License
 
@@ -624,6 +624,7 @@ begin
 
 
   LimitExceeded := False;
+  ConnSessionCount := 0;
 
   FLock.Enter;
 
@@ -636,8 +637,6 @@ begin
     else
 
     begin
-
-      ConnSessionCount := 0;
 
       for Pair in FSessions do
 
@@ -660,13 +659,10 @@ begin
 
 
   if LimitExceeded then
-
   begin
-
+    Logger.Warn('[WT-H3] HandleConnectRequest rejected: LimitExceeded (Sessions=%d, ConnSessions=%d)', [FSessions.Count, ConnSessionCount]);
     Send403(Api, ConnCtx, StreamState.Stream);
-
     Exit;
-
   end;
 
 
@@ -722,13 +718,10 @@ begin
 
 
   if not Accepted then
-
   begin
-
+    Logger.Warn('[WT-H3] HandleConnectRequest rejected: FOnSessionRequest returned False for Path="%s"', [Request.Path]);
     Send403(Api, ConnCtx, StreamState.Stream);
-
     Exit;
-
   end;
 
 
@@ -1426,8 +1419,9 @@ var
 begin
 
   if (Api = nil) or (ConnectStream = nil) or (ConnCtx = nil) then
-
      Exit;
+
+  Logger.Warn('[WT-H3] Sending 403 Forbidden to ConnectStream %p', [ConnectStream]);
 
 
 

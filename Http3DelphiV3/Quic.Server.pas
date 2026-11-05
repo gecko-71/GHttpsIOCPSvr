@@ -298,6 +298,7 @@ begin
 
   if TInterlocked.CompareExchange(FActiveConnCount, 0, 0) >= 4096 then
   begin
+    Logger.Warn('[QUIC] Rejecting connection: active connections limit reached (4096)');
     TInterlocked.Increment(FRejectedConnCount);
     AcceptConnection := False;
     Exit;
@@ -305,6 +306,8 @@ begin
 
   if TInterlocked.Increment(FHandshakesInFlight) > FMaxHandshakesInFlight then
   begin
+    Logger.Warn('[QUIC] Rejecting connection: handshakes in flight exceeded (%d > %d)',
+      [FHandshakesInFlight, FMaxHandshakesInFlight]);
     TInterlocked.Decrement(FHandshakesInFlight);
     TInterlocked.Increment(FRejectedConnCount);
     AcceptConnection := False;
@@ -316,12 +319,14 @@ begin
   begin
     if not FOnBeforeAcceptConnection(Self, RemoteIP) then
     begin
+      Logger.Warn('[QUIC] Rejecting connection from %s: OnBeforeAcceptConnection returned False', [RemoteIP]);
       TInterlocked.Decrement(FHandshakesInFlight);
       TInterlocked.Increment(FRejectedConnCount);
       AcceptConnection := False;
       Exit;
     end;
   end;
+  Logger.Info('[QUIC] Incoming connection from %s accepted', [RemoteIP]);
 
   New(ConnCtx);
   ConnCtx.Server := Self;
