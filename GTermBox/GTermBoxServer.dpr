@@ -2514,10 +2514,11 @@ begin
           end;
 
           try
+            var HasUser: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, FoundUser);
             UserRole := JWT.GetClaim('role');
             if UserRole = '' then
             begin
-              if TGTermUserConfig.Instance.FindUser(JWT.Subject, FoundUser) then
+              if HasUser then
                 UserRole := FoundUser.Role
               else
                 UserRole := 'user';
@@ -2527,54 +2528,50 @@ begin
             JsonRes := TJSONObject.Create;
             try
               JsonArr := TJSONArray.Create;
-              for I := 0 to TGTermAppConfig.Instance.AppCount - 1 do
+              var AppsList := TGTermAppConfig.Instance.GetAllApps;
+              for I := 0 to High(AppsList) do
               begin
-                if TGTermAppConfig.Instance.FindByIndex(I, Entry) then
+                Entry := AppsList[I];
+                if Entry.CanRoleAccess(UserRole) and (not HasUser or FoundUser.HasApp(Entry.Id)) then
                 begin
-                  if TGTermAppConfig.Instance.CanRoleAccessApp(UserRole, Entry.Id) and
-                     TGTermUserConfig.Instance.CanAccessApp(JWT.Subject, Entry.Id) then
-                  begin
-                    case Entry.Sandbox of
-                      smStandard: SandboxStr := 'standard';
-                      smJobOnly:  SandboxStr := 'job-only';
-                    else
-                      SandboxStr := 'none';
-                    end;
-                    AppObj := TJSONObject.Create;
-                    AppObj.AddPair('id',      Entry.Id);
-                    AppObj.AddPair('name',    Entry.Name);
-                    AppObj.AddPair('sandbox', SandboxStr);
-                    AppObj.AddPair('network', TJSONBool.Create(Entry.Network));
-                    AppObj.AddPair('available', Entry.IsExecutableAvailable);
-                    JsonArr.AddElement(AppObj);
+                  case Entry.Sandbox of
+                    smStandard: SandboxStr := 'standard';
+                    smJobOnly:  SandboxStr := 'job-only';
+                  else
+                    SandboxStr := 'none';
                   end;
+                  AppObj := TJSONObject.Create;
+                  AppObj.AddPair('id',      Entry.Id);
+                  AppObj.AddPair('name',    Entry.Name);
+                  AppObj.AddPair('sandbox', SandboxStr);
+                  AppObj.AddPair('network', TJSONBool.Create(Entry.Network));
+                  AppObj.AddPair('available', Entry.IsExecutableAvailable);
+                  JsonArr.AddElement(AppObj);
                 end;
               end;
 
               var CanAccessFilesApp: Boolean;
               var ClaimUp: string := JWT.GetClaim('upload');
               var ClaimDown: string := JWT.GetClaim('download');
-              var UserEntryFiles: TUserEntry;
-              var UserFoundFiles: Boolean := TGTermUserConfig.Instance.FindUser(JWT.Subject, UserEntryFiles);
               var UserCanUp: Boolean;
               var UserCanDown: Boolean;
 
               if ClaimUp <> '' then
                 UserCanUp := SameText(ClaimUp, 'true')
-              else if UserFoundFiles then
-                UserCanUp := UserEntryFiles.CanUpload
+              else if HasUser then
+                UserCanUp := FoundUser.CanUpload
               else
                 UserCanUp := True;
 
               if ClaimDown <> '' then
                 UserCanDown := SameText(ClaimDown, 'true')
-              else if UserFoundFiles then
-                UserCanDown := UserEntryFiles.CanDownload
+              else if HasUser then
+                UserCanDown := FoundUser.CanDownload
               else
                 UserCanDown := True;
 
               CanAccessFilesApp := UserCanUp or UserCanDown;
-              if CanAccessFilesApp and TGTermUserConfig.Instance.CanAccessApp(JWT.Subject, 'files') then
+              if CanAccessFilesApp and (not HasUser or FoundUser.HasApp('files')) then
               begin
                 AppObj := TJSONObject.Create;
                 AppObj.AddPair('id', 'files');

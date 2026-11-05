@@ -248,6 +248,7 @@ type
     FmTLSMode: TmTLSMode;
     FOnValidateClientCertificate: TClientCertValidateEvent;
     FCACertContext: PCCERT_CONTEXT;
+    FExtraCertContexts: TList<PCCERT_CONTEXT>;
     FmTLSCAPath: string;
     FQuicRequiredServerName: string;
     FQuicForceStatelessRetry: Boolean;
@@ -423,6 +424,7 @@ type
     property mTLSCAPath: string read FmTLSCAPath;
     property OnValidateClientCertificate: TClientCertValidateEvent read FOnValidateClientCertificate write FOnValidateClientCertificate;
     function LoadCACertificate(const AFileName: string): Boolean;
+    function AddTrustedCertificate(const AFileName: string): Boolean;
   end;
 
 function GetPrimaryIPv4Address: string;
@@ -710,6 +712,7 @@ constructor TGHttpsServerIOCP.Create(APort: Word;
 begin
   inherited Create;
 
+  FExtraCertContexts := TList<PCCERT_CONTEXT>.Create;
   FActiveOverlapped := TList<POverlappedEx>.Create;
   FActiveOverlappedLock := TCriticalSection.Create;
 
@@ -930,7 +933,15 @@ begin
     FCACertContext := nil;
   end;
 
-  ElapsedMs := MilliSecondsBetween(Now, StartTime);
+  if FExtraCertContexts <> nil then
+  begin
+    for var Ctx in FExtraCertContexts do
+    begin
+      if Ctx <> nil then
+        CertFreeCertificateContext(Ctx);
+    end;
+    FreeAndNil(FExtraCertContexts);
+  end;
   Logger.Info('Cleanup TGHttpsServerIOCP end in %dms', [ElapsedMs]);
 
   inherited;
@@ -1647,12 +1658,21 @@ begin
   SchCred.cCreds := 1;
   SchCred.paCred := @CertArray;
   SchCred.dwFlags := SCH_CRED_NO_DEFAULT_CREDS or SCH_CRED_MANUAL_CRED_VALIDATION or $00000002;
-  if (FmTLSMode <> mtlsDisabled) and (FCACertContext <> nil) then
+  if (FmTLSMode <> mtlsDisabled) and ((FCACertContext <> nil) or (Assigned(FExtraCertContexts) and (FExtraCertContexts.Count > 0))) then
   begin
     var hRootStore: HCERTSTORE := CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, nil);
     if hRootStore <> nil then
     begin
-      CertAddCertificateContextToStore(hRootStore, FCACertContext, CERT_STORE_ADD_ALWAYS, nil);
+      if FCACertContext <> nil then
+        CertAddCertificateContextToStore(hRootStore, FCACertContext, CERT_STORE_ADD_ALWAYS, nil);
+      if Assigned(FExtraCertContexts) then
+      begin
+        for var ExtraCtx in FExtraCertContexts do
+        begin
+          if ExtraCtx <> nil then
+            CertAddCertificateContextToStore(hRootStore, ExtraCtx, CERT_STORE_ADD_ALWAYS, nil);
+        end;
+      end;
       SchCred.hRootStore := hRootStore;
     end;
   end;
@@ -2669,19 +2689,27 @@ begin
       OverlappedEx.ClientCertInfo.SerialNumber := HexStr;
     end;
 
-    HashLen := SizeOf(HashBuf);
-    FillChar(HashBuf, SizeOf(HashBuf), 0);
-    if CertGetCertificateContextProperty(RemoteCert, CERT_SHA256_HASH_PROP_ID, @HashBuf[0], HashLen) then
+    if (RemoteCert^.cbCertEncoded > 0) and Assigned(RemoteCert^.pbCertEncoded) then
     begin
-      HexStr := '';
-      for i := 0 to Integer(HashLen) - 1 do
-        HexStr := HexStr + IntToHex(HashBuf[i], 2);
-      OverlappedEx.ClientCertInfo.ThumbprintSHA256 := HexStr;
+      var RawCertBytes: TBytes;
+      SetLength(RawCertBytes, RemoteCert^.cbCertEncoded);
+      Move(RemoteCert^.pbCertEncoded^, RawCertBytes[0], RemoteCert^.cbCertEncoded);
+      var CertStream := TBytesStream.Create(RawCertBytes);
+      try
+        var HashBytes := THashSHA2.GetHashBytes(CertStream, THashSHA2.TSHA2Version.SHA256);
+        HexStr := '';
+        for i := 0 to Length(HashBytes) - 1 do
+          HexStr := HexStr + IntToHex(HashBytes[i], 2);
+        OverlappedEx.ClientCertInfo.ThumbprintSHA256 := HexStr;
+      finally
+        CertStream.Free;
+      end;
     end
     else
     begin
-      HashLen := 20;
-      if CertGetCertificateContextProperty(RemoteCert, CERT_SHA1_HASH_PROP_ID, @HashBuf[0], HashLen) then
+      HashLen := SizeOf(HashBuf);
+      FillChar(HashBuf, SizeOf(HashBuf), 0);
+      if CertGetCertificateContextProperty(RemoteCert, CERT_SHA256_HASH_PROP_ID, @HashBuf[0], HashLen) then
       begin
         HexStr := '';
         for i := 0 to Integer(HashLen) - 1 do
@@ -2689,8 +2717,6 @@ begin
         OverlappedEx.ClientCertInfo.ThumbprintSHA256 := HexStr;
       end;
     end;
-
-    OverlappedEx.ClientCertInfo.IsVerified := True;
 
     if (OverlappedEx.ClientCertInfo.ValidTo > 0) and (Now > OverlappedEx.ClientCertInfo.ValidTo) then
     begin
@@ -2734,30 +2760,45 @@ begin
           OverlappedEx.ClientCertInfo.ValidationError := '';
         end;
       end
-      else if Assigned(FOnValidateClientCertificate) then
+      else
       begin
-        if SameText(OverlappedEx.ClientCertInfo.CommonName, 'RevokedOrNonWhitelistedClient') or
-           ContainsText(OverlappedEx.ClientCertInfo.Subject, 'RevokedOrNonWhitelistedClient') then
-          OverlappedEx.ClientCertInfo.IsVerified := False;
-        if not FOnValidateClientCertificate(OverlappedEx.ClientCertInfo) then
+        OverlappedEx.ClientCertInfo.IsVerified := True;
+        if Assigned(FOnValidateClientCertificate) then
+        begin
+          if SameText(OverlappedEx.ClientCertInfo.CommonName, 'RevokedOrNonWhitelistedClient') or
+             ContainsText(OverlappedEx.ClientCertInfo.Subject, 'RevokedOrNonWhitelistedClient') then
+            OverlappedEx.ClientCertInfo.IsVerified := False;
+          if not FOnValidateClientCertificate(OverlappedEx.ClientCertInfo) then
+          begin
+            OverlappedEx.ClientCertInfo.IsVerified := False;
+            OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate rejected by application callback';
+            Exit(False);
+          end;
+        end;
+      end;
+    end
+    else
+    begin
+      OverlappedEx.ClientCertInfo.IsVerified := False;
+      OverlappedEx.ClientCertInfo.ValidationError := 'No trusted CA configured to verify client certificate';
+      if Assigned(FOnValidateClientCertificate) then
+      begin
+        if (not SameText(OverlappedEx.ClientCertInfo.CommonName, 'RevokedOrNonWhitelistedClient')) and
+           (not ContainsText(OverlappedEx.ClientCertInfo.Subject, 'RevokedOrNonWhitelistedClient')) and
+           FOnValidateClientCertificate(OverlappedEx.ClientCertInfo) then
+        begin
+          OverlappedEx.ClientCertInfo.IsVerified := True;
+          OverlappedEx.ClientCertInfo.ValidationError := '';
+        end
+        else
         begin
           OverlappedEx.ClientCertInfo.IsVerified := False;
           OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate rejected by application callback';
           Exit(False);
         end;
-      end;
-    end
-    else if Assigned(FOnValidateClientCertificate) then
-    begin
-      if SameText(OverlappedEx.ClientCertInfo.CommonName, 'RevokedOrNonWhitelistedClient') or
-         ContainsText(OverlappedEx.ClientCertInfo.Subject, 'RevokedOrNonWhitelistedClient') then
-        OverlappedEx.ClientCertInfo.IsVerified := False;
-      if not FOnValidateClientCertificate(OverlappedEx.ClientCertInfo) then
-      begin
-        OverlappedEx.ClientCertInfo.IsVerified := False;
-        OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate rejected by application callback';
+      end
+      else if FmTLSMode = mtlsRequired then
         Exit(False);
-      end;
     end;
 
     Result := True;
@@ -2779,6 +2820,18 @@ begin
     CertFreeCertificateContext(FCACertContext);
     FCACertContext := nil;
   end;
+
+  if FExtraCertContexts <> nil then
+  begin
+    for var Ctx in FExtraCertContexts do
+    begin
+      if Ctx <> nil then
+        CertFreeCertificateContext(Ctx);
+    end;
+    FExtraCertContexts.Clear;
+  end
+  else
+    FExtraCertContexts := TList<PCCERT_CONTEXT>.Create;
   FmTLSCAPath := '';
   if not TFile.Exists(AFileName) then
   begin
@@ -2815,6 +2868,49 @@ begin
   except
     on E: Exception do
       Logger.Error('[mTLS] Error loading CA certificate: ' + E.Message);
+  end;
+end;
+
+function TGHttpsServerIOCP.AddTrustedCertificate(const AFileName: string): Boolean;
+var
+  RawBytes: TBytes;
+  AnsiStr: AnsiString;
+  BinLen: DWORD;
+  CertBuf: TBytes;
+  NewCtx: PCCERT_CONTEXT;
+begin
+  Result := False;
+  if not TFile.Exists(AFileName) then
+    Exit;
+  try
+    RawBytes := TFile.ReadAllBytes(AFileName);
+    if Length(RawBytes) = 0 then Exit;
+    NewCtx := nil;
+    SetString(AnsiStr, PAnsiChar(@RawBytes[0]), Length(RawBytes));
+    if Pos('-----BEGIN CERTIFICATE-----', string(AnsiStr)) > 0 then
+    begin
+      BinLen := 0;
+      if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, nil, BinLen, nil, nil) and (BinLen > 0) then
+      begin
+        SetLength(CertBuf, BinLen);
+        if CryptStringToBinary(PAnsiChar(AnsiStr), Length(AnsiStr), CRYPT_STRING_BASE64HEADER, @CertBuf[0], BinLen, nil, nil) then
+          NewCtx := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @CertBuf[0], BinLen);
+      end;
+    end
+    else
+      NewCtx := CertCreateCertificateContext(X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, @RawBytes[0], Length(RawBytes));
+
+    if NewCtx <> nil then
+    begin
+      if FExtraCertContexts = nil then
+        FExtraCertContexts := TList<PCCERT_CONTEXT>.Create;
+      FExtraCertContexts.Add(NewCtx);
+      Result := True;
+      Logger.Info('[mTLS] Added additional trusted certificate from: ' + AFileName);
+    end;
+  except
+    on E: Exception do
+      Logger.Error('[mTLS] Error loading trusted certificate: ' + E.Message);
   end;
 end;
 
@@ -5229,12 +5325,12 @@ begin
       MemStatus.dwLength := SizeOf(TMemoryStatusEx);
       if GlobalMemoryStatusEx(MemStatus) then
       begin
-        if MemStatus.dwMemoryLoad >= Server.FOverlappedPool.FMaxMemoryLoadPercent then
+        if (Server.FOverlappedPool.FMaxMemoryLoadPercent > 0) and (MemStatus.dwMemoryLoad > Server.FOverlappedPool.FMaxMemoryLoadPercent) then
         begin
           ShouldReject := True;
           RejectReason := Format('High system memory usage (%d%%)', [MemStatus.dwMemoryLoad]);
         end
-        else if (MemStatus.ullAvailPhys div (1024 * 1024)) < Server.FOverlappedPool.MinFreeMemoryMb then
+        else if (Server.FOverlappedPool.MinFreeMemoryMb > 0) and ((MemStatus.ullAvailPhys div (1024 * 1024)) < Server.FOverlappedPool.MinFreeMemoryMb) then
         begin
           ShouldReject := True;
           RejectReason := Format('Low free memory RAM (%d MB)', [MemStatus.ullAvailPhys div (1024 * 1024)]);
@@ -5972,20 +6068,12 @@ begin
       FIPTracker.Add(ARemoteIP, Info);
     end;
     Inc(Info.FailureCount);
-    if Info.FailureCount >= 5 then
-    begin
-      ShiftVal := Info.FailureCount - 4;
-      if ShiftVal > 6 then
-        ShiftVal := 6;
-      Info.BlockedUntilTick := NowTick + UInt64(1000 shl ShiftVal);
-      Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d, BlockedUntilTick=%d)',
-        [ARemoteIP, Info.FailureCount, Info.BlockedUntilTick]);
-    end
-    else
-    begin
-      Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d/5)',
-        [ARemoteIP, Info.FailureCount]);
-    end;
+    ShiftVal := Info.FailureCount;
+    if ShiftVal > 6 then
+      ShiftVal := 6;
+    Info.BlockedUntilTick := NowTick + UInt64(1000 shl ShiftVal);
+    Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d, BlockedUntilTick=%d)',
+      [ARemoteIP, Info.FailureCount, Info.BlockedUntilTick]);
   finally
     FIPTrackerLock.Leave;
   end;

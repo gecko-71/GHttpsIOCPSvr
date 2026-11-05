@@ -45,6 +45,7 @@ type
     AllowedDirsRead: TArray<string>;
     AllowedDirsWrite: TArray<string>;
     Roles: TArray<string>;
+    function CanRoleAccess(const ARole: string): Boolean;
     function ToProfile(const ASandboxDir: string = ''): TGTermAppProfile;
     function IsExecutableAvailable: Boolean;
   end;
@@ -66,6 +67,7 @@ type
     procedure LoadFromFile(const APath: string);
     function FindById(const AId: string; out AEntry: TAppEntry): Boolean;
     function FindByIndex(AIndex: Integer; out AEntry: TAppEntry): Boolean;
+    function GetAllApps: TArray<TAppEntry>;
     function AppCount: Integer;
     function GetDefaultProfile(const ASandboxDir: string = ''): TGTermAppProfile;
     function GetDefaultAppId: string;
@@ -379,21 +381,40 @@ begin
   end;
 end;
 
-function TGTermAppConfig.CanRoleAccessApp(const ARole: string; const AAppId: string): Boolean;
+function TAppEntry.CanRoleAccess(const ARole: string): Boolean;
 var
-  App: TAppEntry;
   I: Integer;
   RoleLower: string;
 begin
-  Result := False;
-  if not FindById(AAppId, App) then Exit;
-  if Length(App.Roles) = 0 then Exit(True);
+  if Length(Roles) = 0 then
+    Exit(True);
   RoleLower := LowerCase(Trim(ARole));
-  for I := 0 to High(App.Roles) do
+  for I := 0 to High(Roles) do
   begin
-    if (App.Roles[I] = '*') or (LowerCase(Trim(App.Roles[I])) = RoleLower) then
+    if (Roles[I] = '*') or (LowerCase(Trim(Roles[I])) = RoleLower) then
       Exit(True);
   end;
+  Result := False;
+end;
+
+function TGTermAppConfig.GetAllApps: TArray<TAppEntry>;
+begin
+  CheckReload;
+  FLock.Enter;
+  try
+    Result := Copy(FApps);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TGTermAppConfig.CanRoleAccessApp(const ARole: string; const AAppId: string): Boolean;
+var
+  App: TAppEntry;
+begin
+  Result := False;
+  if not FindById(AAppId, App) then Exit;
+  Result := App.CanRoleAccess(ARole);
 end;
 
 procedure DeployAppToSandbox(const ASrcDir, ADstDir: string);

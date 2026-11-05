@@ -154,7 +154,7 @@ begin
     Logger.Info('  Active mTLS Level:   %s', [mTLSModeStr]);
     Logger.Info('============================================================');
 
-    Server := TGHttpsServerIOCP.Create(HttpsPortParam, GetPrimaryIPv4Address,
+    Server := TGHttpsServerIOCP.Create(HttpsPortParam, '0.0.0.0',
                                        CertStoreNameParam,
                                       'SuperSecretDemo10MtlsKey1234567890!',
                                       2000, 1000000,
@@ -162,7 +162,7 @@ begin
                                       DEFAULT_MAX_REQUEST_SIZE,
                                       DEFAULT_MAX_RESPONSE_SIZE,
                                       DEFAULT_CHUNK_SIZE,
-                                      50, 85, True, True, HttpPortParam,
+                                      50, 95, True, True, HttpPortParam,
                                       haServeNormally);
     try
       Server.SetSSLShutdownOptions(True, 200);
@@ -176,6 +176,17 @@ begin
       end
       else
         Logger.Warn('Trusted CA certificate file not found: %s', [CaCertFile]);
+
+      var PinnedCertFile := TPath.Combine(ServerCertsDir, 'client_pinned.crt');
+      if FileExists(PinnedCertFile) then
+      begin
+        if Server.AddTrustedCertificate(PinnedCertFile) then
+          Logger.Info('Loaded direct trust pinned certificate from: %s', [PinnedCertFile])
+        else
+          Logger.Warn('Failed to add pinned certificate: %s', [PinnedCertFile]);
+      end
+      else
+        Logger.Warn('Pinned certificate file not found: %s', [PinnedCertFile]);
 
       Server.OnValidateClientCertificate :=
         function(const CertInfo: TGClientCertInfo): Boolean

@@ -608,65 +608,82 @@ var
   I: Integer;
   CalculatedHash: string;
   Matched: Boolean;
-  FoundIndex: Integer;
-  MigratePassword: Boolean;
+  Found: Boolean;
+  TargetUser: TUserEntry;
 begin
   CheckReload;
   if (AUsername = '') or (APassword = '') then
     Exit(False);
 
-  FoundIndex := -1;
-  MigratePassword := False;
-
+  Found := False;
   FLock.Enter;
   try
     for I := 0 to High(FUsers) do
     begin
       if SameText(FUsers[I].Username, AUsername) then
       begin
-        if (FUsers[I].PasswordHash = '') or StartsText('DISABLED_NO_PASSWORD_', FUsers[I].PasswordHash) then
-          Exit(False);
-
-        if StartsText('PBKDF2$', FUsers[I].PasswordHash) then
-        begin
-          CalculatedHash := HashPasswordWithSalt(APassword, FUsers[I].Salt);
-          Matched := ConstantTimeCompare(FUsers[I].PasswordHash, CalculatedHash);
-        end
-        else
-        begin
-          if FUsers[I].Salt <> '' then
-            CalculatedHash := LowerCase(THashSHA2.GetHashString(FUsers[I].Salt + ':' + APassword, THashSHA2.TSHA2Version.SHA256))
-          else
-            CalculatedHash := LowerCase(THashSHA2.GetHashString(APassword, THashSHA2.TSHA2Version.SHA256));
-
-          Matched := ConstantTimeCompare(FUsers[I].PasswordHash, CalculatedHash);
-          if Matched then
-          begin
-            FUsers[I].Salt := GenerateSalt;
-            FUsers[I].PasswordHash := HashPasswordWithSalt(APassword, FUsers[I].Salt);
-            MigratePassword := True;
-          end;
-        end;
-
-        if Matched then
-        begin
-          AUser := FUsers[I];
-          FoundIndex := I;
-          Break;
-        end;
+        TargetUser := FUsers[I];
+        Found := True;
+        Break;
       end;
     end;
   finally
     FLock.Leave;
   end;
 
-  if (FoundIndex >= 0) and MigratePassword and (FConfigPath <> '') then
-  try
-    SaveToFile(FConfigPath);
-  except
+  if not Found then
+    Exit(False);
+
+  if (TargetUser.PasswordHash = '') or StartsText('DISABLED_NO_PASSWORD_', TargetUser.PasswordHash) then
+    Exit(False);
+
+  Matched := False;
+  if StartsText('PBKDF2$', TargetUser.PasswordHash) then
+  begin
+    CalculatedHash := HashPasswordWithSalt(APassword, TargetUser.Salt);
+    Matched := ConstantTimeCompare(TargetUser.PasswordHash, CalculatedHash);
+  end
+  else
+  begin
+    if TargetUser.Salt <> '' then
+      CalculatedHash := LowerCase(THashSHA2.GetHashString(TargetUser.Salt + ':' + APassword, THashSHA2.TSHA2Version.SHA256))
+    else
+      CalculatedHash := LowerCase(THashSHA2.GetHashString(APassword, THashSHA2.TSHA2Version.SHA256));
+
+    Matched := ConstantTimeCompare(TargetUser.PasswordHash, CalculatedHash);
+    if Matched then
+    begin
+      TargetUser.Salt := GenerateSalt;
+      TargetUser.PasswordHash := HashPasswordWithSalt(APassword, TargetUser.Salt);
+      FLock.Enter;
+      try
+        for I := 0 to High(FUsers) do
+        begin
+          if SameText(FUsers[I].Username, TargetUser.Username) then
+          begin
+            FUsers[I].Salt := TargetUser.Salt;
+            FUsers[I].PasswordHash := TargetUser.PasswordHash;
+            Break;
+          end;
+        end;
+      finally
+        FLock.Leave;
+      end;
+      if FConfigPath <> '' then
+      try
+        SaveToFile(FConfigPath);
+      except
+      end;
+    end;
   end;
 
-  Result := (FoundIndex >= 0);
+  if Matched then
+  begin
+    AUser := TargetUser;
+    Exit(True);
+  end;
+
+  Result := False;
 end;
 
 function TGTermUserConfig.CanAccessApp(const AUsername, AAppId: string): Boolean;

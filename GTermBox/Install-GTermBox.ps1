@@ -310,9 +310,9 @@ foreach ($app in @($AppsJson.apps)) {
 }
 $CurrentAppIds = @((Get-Content (Join-Path $InstallDir 'apps.json') -Raw | ConvertFrom-Json).apps | ForEach-Object { $_.id })
 if ($CurrentAppIds -notcontains 'powershell') {
-  Invoke-Manage @('add-app', 'powershell', 'PowerShell', 'powershell.exe', '--sandbox=standard', '--args=-NoExit,-NoLogo,-ExecutionPolicy,Bypass', '--roles=user,admin', '--no-network') | Out-Null
+  Invoke-Manage @('add-app', 'powershell', 'PowerShell', 'powershell.exe', '--sandbox=standard', '--args=-NoExit,-NoLogo,-ExecutionPolicy,RemoteSigned', '--roles=user,admin', '--no-network') | Out-Null
 } else {
-  Invoke-Manage @('edit-app', 'powershell', '--args=-NoExit,-NoLogo,-ExecutionPolicy,Bypass') | Out-Null
+  Invoke-Manage @('edit-app', 'powershell', '--args=-NoExit,-NoLogo,-ExecutionPolicy,RemoteSigned') | Out-Null
 }
 if ($CurrentAppIds -notcontains 'pytui') {
   Invoke-Manage @('add-app', 'pytui', 'Python TUI', 'PyTui\run.cmd', '--cols=120', '--rows=30', '--sandbox=job-only', '--roles=admin', '--env=TERM=xterm-256color,COLORTERM=truecolor,PYTHONIOENCODING=utf-8,PYTHONUTF8=1', '--no-network') | Out-Null

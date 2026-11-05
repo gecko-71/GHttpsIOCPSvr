@@ -1697,7 +1697,7 @@ begin
     ArgsArr.Add('-NoExit');
     ArgsArr.Add('-NoLogo');
     ArgsArr.Add('-ExecutionPolicy');
-    ArgsArr.Add('Bypass');
+    ArgsArr.Add('RemoteSigned');
     App.AddPair('args', ArgsArr);
     EnvArr := TJSONArray.Create;
     EnvArr.Add('TERM=xterm-256color');
@@ -1723,7 +1723,7 @@ begin
     ArgsArr.Add('-NoExit');
     ArgsArr.Add('-NoLogo');
     ArgsArr.Add('-ExecutionPolicy');
-    ArgsArr.Add('Bypass');
+    ArgsArr.Add('RemoteSigned');
     App.AddPair('args', ArgsArr);
     EnvArr := TJSONArray.Create;
     EnvArr.Add('TERM=xterm-256color');
