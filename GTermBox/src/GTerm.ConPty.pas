@@ -69,6 +69,7 @@ type
 
   TDataReceivedEvent = procedure(const AData: TBytes; ACount: Integer) of object;
   TProcessTerminatedEvent = procedure(AExitCode: DWORD) of object;
+  TJobGuiDetectedEvent = procedure(const AExeName: string; APid: DWORD; ABlocked: Boolean) of object;
 
   TPtyReaderThread = class(TThread)
   private
@@ -97,6 +98,21 @@ type
     procedure ClearHandler;
   end;
 
+  TJobMonitorThread = class(TThread)
+  private
+    FIocp: THandle;
+    FRootPid: DWORD;
+    FBlockGuiApps: Boolean;
+    FOnGuiDetected: TJobGuiDetectedEvent;
+    FLock: TCriticalSection;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AIocp: THandle; ARootPid: DWORD; ABlockGuiApps: Boolean; AOnGuiDetected: TJobGuiDetectedEvent);
+    destructor Destroy; override;
+    procedure ClearHandler;
+  end;
+
   TGTermConPty = class
   private
     FHPty: HPCON;
@@ -107,6 +123,7 @@ type
     FProcessInfo: TProcessInformation;
     FReaderThread: TPtyReaderThread;
     FWatcherThread: TProcessWatcherThread;
+    FJobMonitorThread: TJobMonitorThread;
     FCols: Integer;
     FRows: Integer;
     FRunning: Boolean;
@@ -114,15 +131,23 @@ type
     FOnProcessTerminated: TProcessTerminatedEvent;
     FSandboxMode: TSandboxMode;
     FJobHandle: THandle;
+    FJobIocp: THandle;
     FAppContainerSid: PSID;
     FAppContainerName: string;
+    FAcquiredDesktopKey: string;
+    FBlockGuiApps: Boolean;
+    FWarnGuiApps: Boolean;
+    FExtendedUiLimits: Boolean;
     FStopping: Integer;
     FStopEvent: THandle;
     FGrantedDirs: TArray<string>;
     FUsername: string;
+    FLastWarnedGuiExe: string;
+    FLastWarnedGuiTick: UInt64;
     procedure CreatePipes;
     procedure ClosePipes;
     procedure SetupJobSandbox;
+    procedure HandleJobGuiDetected(const AExeName: string; APid: DWORD; ABlocked: Boolean);
     function SetupAppContainer(const AWorkingDir: string; const AExeDir: string = ''; const AAllowedDirsRead: TArray<string> = nil; const AAllowedDirsWrite: TArray<string> = nil; const ANetworkCaps: TArray<SID_AND_ATTRIBUTES> = nil): Boolean;
     procedure CleanupSandbox;
     procedure GrantDirAccessToAppContainer(const ADir: string; AFullAccess: Boolean = True);
@@ -137,6 +162,9 @@ type
     function Resize(ACols, ARows: Integer): Boolean;
     function WriteInput(const AData: TBytes): Integer; overload;
     function WriteInput(const AStr: string): Integer; overload;
+    class function BuildSafeDesktopName(const AUsername: string): string;
+    class procedure PurgeIdleDesktops(AMaxIdleMs: UInt64 = 0);
+    class function GetActiveDesktopCount: Integer;
     property Running: Boolean read FRunning;
     property Cols: Integer read FCols;
     property Rows: Integer read FRows;
@@ -146,6 +174,8 @@ type
     property OnProcessTerminated: TProcessTerminatedEvent read FOnProcessTerminated write FOnProcessTerminated;
     property SandboxMode: TSandboxMode read FSandboxMode write FSandboxMode;
     property Username: string read FUsername write FUsername;
+    property BlockGuiApps: Boolean read FBlockGuiApps write FBlockGuiApps;
+    property ExtendedUiLimits: Boolean read FExtendedUiLimits write FExtendedUiLimits;
   end;
 
 function InitializeProcThreadAttributeList(
@@ -235,12 +265,55 @@ type
   end;
 
 const
-  JOB_OBJECT_UILIMIT_HANDLES = $00000001;
-  JOB_OBJECT_UILIMIT_DESKTOP = $00000040;
+  JobObjectBasicUIRestrictions                = 4;
+  JobObjectAssociateCompletionPortInformation = 7;
+  JobObjectExtendedLimitInformation           = 9;
+  JobObjectCpuRateControlInformation          = 15;
+
+  JOB_OBJECT_UILIMIT_HANDLES          = $00000001;
+  JOB_OBJECT_UILIMIT_READCLIPBOARD    = $00000002;
+  JOB_OBJECT_UILIMIT_WRITECLIPBOARD   = $00000004;
+  JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS = $00000008;
+  JOB_OBJECT_UILIMIT_DISPLAYSETTINGS  = $00000010;
+  JOB_OBJECT_UILIMIT_GLOBALATOMS      = $00000020;
+  JOB_OBJECT_UILIMIT_DESKTOP          = $00000040;
+  JOB_OBJECT_UILIMIT_EXITWINDOWS      = $00000080;
+
+  JOB_OBJECT_MSG_NEW_PROCESS          = 6;
+  DESKTOP_ALL_ACCESS                  = $000F01FF;
+  DESKTOP_APPCONTAINER_ACCESS         = $000200C7;
+  WINSTA_ALL_ACCESS                   = $0000037F;
+  WINSTA_APPCONTAINER_ACCESS          = $00020123;
+  WRITE_OWNER                         = $00080000;
+  SE_WINDOW_OBJECT                    = 7;
+  LABEL_SECURITY_INFORMATION          = $00000010;
+  SECURITY_DESCRIPTOR_REVISION        = 1;
+  STARTF_FORCEOFFFEEDBACK             = $00000080;
+  PROCESS_QUERY_LIMITED_INFORMATION   = $00001000;
+  PROCESS_VM_READ                     = $00000010;
+  ProcessBasicInformation             = 0;
+  ProcessWow64Information             = 26;
+  IMAGE_SUBSYSTEM_WINDOWS_GUI         = 2;
+  MAX_CACHED_DESKTOPS                 = 24;
+  DESKTOP_IDLE_TTL_MS                 = 120000;
+
+type
+  PROCESS_BASIC_INFORMATION = record
+    Reserved1: Pointer;
+    PebBaseAddress: Pointer;
+    Reserved2: array[0..1] of Pointer;
+    UniqueProcessId: ULONG_PTR;
+    Reserved3: Pointer;
+  end;
 
 type
   JOBOBJECT_BASIC_UI_RESTRICTIONS = record
     UIRestrictionsClass: DWORD;
+  end;
+
+  JOBOBJECT_ASSOCIATE_COMPLETION_PORT = record
+    CompletionKey: Pointer;
+    CompletionPort: THandle;
   end;
 
 function CreateJobObjectW(lpJobAttributes: Pointer; lpName: PWideChar): THandle;
@@ -252,6 +325,10 @@ function AssignProcessToJobObject(hJob, hProcess: THandle): BOOL;
 function SetInformationJobObject(hJob: THandle; JobObjectInfoClass: DWORD;
   lpJobObjectInfo: Pointer; cbJobObjectInfoLength: DWORD): BOOL;
   stdcall; external kernel32 name 'SetInformationJobObject';
+
+function QueryFullProcessImageNameW(hProcess: THandle; dwFlags: DWORD;
+  lpExeName: PWideChar; var lpdwSize: DWORD): BOOL;
+  stdcall; external kernel32 name 'QueryFullProcessImageNameW';
 
 function CreateAppContainerProfile(
   pszAppContainerName: PWideChar;
@@ -334,7 +411,76 @@ function AddAccessAllowedAceEx(
   pSid: PSID
 ): BOOL; stdcall; external advapi32 name 'AddAccessAllowedAceEx';
 
+function SetSecurityInfo(
+  handle: THandle;
+  ObjectType: DWORD;
+  SecurityInfo: DWORD;
+  psidOwner: PSID;
+  psidGroup: PSID;
+  pDacl: Pointer;
+  pSacl: Pointer
+): DWORD; stdcall; external advapi32 name 'SetSecurityInfo';
+
+function GetSecurityDescriptorSacl(
+  pSecurityDescriptor: Pointer;
+  var lpbSaclPresent: BOOL;
+  var pSacl: Pointer;
+  var lpbSaclDefaulted: BOOL
+): BOOL; stdcall; external advapi32 name 'GetSecurityDescriptorSacl';
+
+function GetSecurityDescriptorDacl(
+  pSecurityDescriptor: Pointer;
+  var lpbDaclPresent: BOOL;
+  var pDacl: Pointer;
+  var lpbDaclDefaulted: BOOL
+): BOOL; stdcall; external advapi32 name 'GetSecurityDescriptorDacl';
+
+function InitializeSecurityDescriptor(
+  pSecurityDescriptor: Pointer;
+  dwRevision: DWORD
+): BOOL; stdcall; external advapi32 name 'InitializeSecurityDescriptor';
+
+function SetSecurityDescriptorDacl(
+  pSecurityDescriptor: Pointer;
+  bDaclPresent: BOOL;
+  pDacl: Pointer;
+  bDaclDefaulted: BOOL
+): BOOL; stdcall; external advapi32 name 'SetSecurityDescriptorDacl';
+
+function GetUserObjectSecurity(
+  hObj: THandle;
+  var pSIRequested: DWORD;
+  pSID: Pointer;
+  nLength: DWORD;
+  var lpnLengthNeeded: DWORD
+): BOOL; stdcall; external user32 name 'GetUserObjectSecurity';
+
+function SetUserObjectSecurity(
+  hObj: THandle;
+  var pSIRequested: DWORD;
+  pSID: Pointer
+): BOOL; stdcall; external user32 name 'SetUserObjectSecurity';
+
+function UserHandleGrantAccess(
+  hUserHandle: THandle;
+  hJob: THandle;
+  bGrant: BOOL
+): BOOL; stdcall; external user32 name 'UserHandleGrantAccess';
+
 function ResumeThread(hThread: THandle): DWORD; stdcall; external kernel32 name 'ResumeThread';
+
+function GetSystemWindowsDirectoryW(
+  lpBuffer: PWideChar;
+  uSize: UINT
+): UINT; stdcall; external kernel32 name 'GetSystemWindowsDirectoryW';
+
+function NtQueryInformationProcess(
+  ProcessHandle: THandle;
+  ProcessInformationClass: DWORD;
+  ProcessInformation: Pointer;
+  ProcessInformationLength: ULONG;
+  ReturnLength: PULONG
+): Integer; stdcall; external 'ntdll.dll' name 'NtQueryInformationProcess';
 
 const
   SE_FILE_OBJECT               = 1;
@@ -546,6 +692,283 @@ begin
   end;
 end;
 
+function GetCanonicalWindowsDirectory: string;
+var
+  WinBuf: array[0..MAX_PATH] of WideChar;
+  Len: UINT;
+begin
+  FillChar(WinBuf, SizeOf(WinBuf), 0);
+  Len := GetSystemWindowsDirectoryW(@WinBuf[0], MAX_PATH);
+  if Len > 0 then
+    Result := ExcludeTrailingPathDelimiter(LowerCase(string(PWideChar(@WinBuf[0]))))
+  else
+    Result := 'c:\windows';
+end;
+
+function IsAllowedGuiBinary(const AFullPath: string): Boolean;
+var
+  LFull, LName, LDir, WinDir: string;
+  IsNameMatch: Boolean;
+begin
+  Result := False;
+  if AFullPath = '' then Exit;
+  LFull := LowerCase(AFullPath);
+  if StartsText('\\?\', LFull) then
+    Delete(LFull, 1, 4);
+  LName := ExtractFileName(LFull);
+  IsNameMatch := (LName = 'conhost.exe') or
+                 (LName = 'openconsole.exe') or
+                 (LName = 'msiexec.exe') or
+                 (LName = 'regedit.exe') or
+                 (LName = 'rundll32.exe') or
+                 (LName = 'dllhost.exe') or
+                 (LName = 'werfault.exe') or
+                 (LName = 'consent.exe');
+  if not IsNameMatch then Exit;
+  LDir := ExcludeTrailingPathDelimiter(ExtractFilePath(LFull));
+  WinDir := GetCanonicalWindowsDirectory;
+  Result := (LDir = WinDir + '\system32') or
+            (LDir = WinDir + '\syswow64') or
+            (LDir = WinDir);
+end;
+
+function ParsePeGuiSubsystemBuffer(const ABuf: array of Byte; ABytesRead: Integer): Boolean;
+var
+  PeOffset: Integer;
+  PeSig: DWORD;
+  Subsystem: Word;
+begin
+  Result := False;
+  if ABytesRead < 128 then Exit;
+  if (ABuf[0] <> $4D) or (ABuf[1] <> $5A) then Exit;
+  Move(ABuf[$3C], PeOffset, SizeOf(PeOffset));
+  if (PeOffset < 64) or ((PeOffset + 94) >= ABytesRead) then Exit;
+  Move(ABuf[PeOffset], PeSig, SizeOf(PeSig));
+  if PeSig <> $00004550 then Exit;
+  Move(ABuf[PeOffset + 24 + 68], Subsystem, SizeOf(Subsystem));
+  Result := (Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI);
+end;
+
+function IsGuiSubsystemBinary(const AFilePath: string): Boolean;
+var
+  HFile: THandle;
+  DosBuf: array[0..63] of Byte;
+  PeBuf: array[0..255] of Byte;
+  BytesRead: DWORD;
+  PeOffset: Integer;
+  PeSig: DWORD;
+  Subsystem: Word;
+begin
+  Result := False;
+  if (AFilePath = '') or not FileExists(AFilePath) then Exit;
+  HFile := CreateFileW(
+    PWideChar(AFilePath),
+    GENERIC_READ,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+    nil,
+    OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL,
+    0
+  );
+  if HFile = INVALID_HANDLE_VALUE then Exit;
+  try
+    BytesRead := 0;
+    FillChar(DosBuf, SizeOf(DosBuf), 0);
+    if not ReadFile(HFile, DosBuf[0], SizeOf(DosBuf), BytesRead, nil) then Exit;
+    if BytesRead < 64 then Exit;
+    if (DosBuf[0] <> $4D) or (DosBuf[1] <> $5A) then Exit;
+    Move(DosBuf[$3C], PeOffset, SizeOf(PeOffset));
+    if (PeOffset < 64) or (PeOffset > $100000) then Exit;
+    if SetFilePointer(HFile, PeOffset, nil, FILE_BEGIN) = DWORD(-1) then Exit;
+    BytesRead := 0;
+    FillChar(PeBuf, SizeOf(PeBuf), 0);
+    if not ReadFile(HFile, PeBuf[0], 128, BytesRead, nil) then Exit;
+    if BytesRead < 96 then Exit;
+    Move(PeBuf[0], PeSig, SizeOf(PeSig));
+    if PeSig <> $00004550 then Exit;
+    Move(PeBuf[24 + 68], Subsystem, SizeOf(Subsystem));
+    Result := (Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI);
+  finally
+    CloseHandle(HFile);
+  end;
+end;
+
+function ReadPeGuiSubsystemFromImageBase(AProcHandle: THandle; AImageBase: Pointer; out AChecked: Boolean): Boolean;
+var
+  DosBuf: array[0..63] of Byte;
+  PeBuf: array[0..255] of Byte;
+  BytesRead: SIZE_T;
+  PeOffset: Integer;
+  PeSig: DWORD;
+  Subsystem: Word;
+begin
+  Result := False;
+  AChecked := False;
+  if (AProcHandle = 0) or (AImageBase = nil) then Exit;
+  FillChar(DosBuf, SizeOf(DosBuf), 0);
+  BytesRead := 0;
+  if not ReadProcessMemory(AProcHandle, AImageBase, @DosBuf[0], SizeOf(DosBuf), BytesRead) or (BytesRead < 64) then Exit;
+  if (DosBuf[0] <> $4D) or (DosBuf[1] <> $5A) then Exit;
+  Move(DosBuf[$3C], PeOffset, SizeOf(PeOffset));
+  if (PeOffset < 64) or (PeOffset > $100000) then Exit;
+  FillChar(PeBuf, SizeOf(PeBuf), 0);
+  BytesRead := 0;
+  if not ReadProcessMemory(AProcHandle, PByte(AImageBase) + PeOffset, @PeBuf[0], 128, BytesRead) or (BytesRead < 96) then Exit;
+  Move(PeBuf[0], PeSig, SizeOf(PeSig));
+  if PeSig <> $00004550 then Exit;
+  AChecked := True;
+  Move(PeBuf[24 + 68], Subsystem, SizeOf(Subsystem));
+  Result := (Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI);
+end;
+
+function IsGuiSubsystemProcess(AProcHandle: THandle; const AFilePath: string): Boolean;
+var
+  Pbi: PROCESS_BASIC_INFORMATION;
+  Wow64Peb: ULONG_PTR;
+  RetLen: ULONG;
+  ImageBase: Pointer;
+  ImageBase32: DWORD;
+  BytesRead: SIZE_T;
+  CheckedInMem: Boolean;
+begin
+  CheckedInMem := False;
+  if AProcHandle <> 0 then
+  begin
+    Wow64Peb := 0;
+    RetLen := 0;
+    if (NtQueryInformationProcess(AProcHandle, ProcessWow64Information, @Wow64Peb, SizeOf(Wow64Peb), @RetLen) = 0) and
+       (Wow64Peb <> 0) then
+    begin
+      ImageBase32 := 0;
+      BytesRead := 0;
+      if ReadProcessMemory(AProcHandle, Pointer(Wow64Peb + 8), @ImageBase32, SizeOf(ImageBase32), BytesRead) and
+         (ImageBase32 <> 0) then
+      begin
+        Result := ReadPeGuiSubsystemFromImageBase(AProcHandle, Pointer(NativeUInt(ImageBase32)), CheckedInMem);
+        if CheckedInMem then Exit;
+      end;
+    end;
+
+    FillChar(Pbi, SizeOf(Pbi), 0);
+    RetLen := 0;
+    if (NtQueryInformationProcess(AProcHandle, ProcessBasicInformation, @Pbi, SizeOf(Pbi), @RetLen) = 0) and
+       (Pbi.PebBaseAddress <> nil) then
+    begin
+      ImageBase := nil;
+      BytesRead := 0;
+      if ReadProcessMemory(AProcHandle, PByte(Pbi.PebBaseAddress) + $10, @ImageBase, SizeOf(ImageBase), BytesRead) and
+         (ImageBase <> nil) then
+      begin
+        Result := ReadPeGuiSubsystemFromImageBase(AProcHandle, ImageBase, CheckedInMem);
+        if CheckedInMem then Exit;
+      end;
+    end;
+  end;
+  Result := IsGuiSubsystemBinary(AFilePath);
+end;
+
+constructor TJobMonitorThread.Create(AIocp: THandle; ARootPid: DWORD; ABlockGuiApps: Boolean; AOnGuiDetected: TJobGuiDetectedEvent);
+begin
+  inherited Create(False);
+  FreeOnTerminate := False;
+  FLock := TCriticalSection.Create;
+  FIocp := AIocp;
+  FRootPid := ARootPid;
+  FBlockGuiApps := ABlockGuiApps;
+  FOnGuiDetected := AOnGuiDetected;
+end;
+
+destructor TJobMonitorThread.Destroy;
+begin
+  ClearHandler;
+  FreeAndNil(FLock);
+  inherited Destroy;
+end;
+
+procedure TJobMonitorThread.ClearHandler;
+begin
+  if Assigned(FLock) then
+  begin
+    FLock.Enter;
+    try
+      FOnGuiDetected := nil;
+    finally
+      FLock.Leave;
+    end;
+  end;
+end;
+
+procedure TJobMonitorThread.Execute;
+var
+  MsgId: DWORD;
+  CompKey: ULONG_PTR;
+  Overlapped: POverlapped;
+  NewPid: DWORD;
+  HProc: THandle;
+  ImgBuf: array[0..1023] of WideChar;
+  ImgLen: DWORD;
+  FullPath, ExeName: string;
+  Handler: TJobGuiDetectedEvent;
+begin
+  while not Terminated do
+  begin
+    if FIocp = 0 then Exit;
+    MsgId := 0;
+    CompKey := 0;
+    Overlapped := nil;
+    if not GetQueuedCompletionStatus(FIocp, MsgId, CompKey, Overlapped, INFINITE) then
+      Break;
+    if Terminated or ((MsgId = 0) and (CompKey = 0) and (Overlapped = nil)) then
+      Break;
+    if MsgId = JOB_OBJECT_MSG_NEW_PROCESS then
+    begin
+      NewPid := DWORD(NativeUInt(Overlapped));
+      if (NewPid <> 0) and (NewPid <> FRootPid) then
+      begin
+        HProc := OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION or PROCESS_VM_READ or PROCESS_TERMINATE, False, NewPid);
+        if HProc = 0 then
+          HProc := OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION or PROCESS_TERMINATE, False, NewPid);
+        if HProc <> 0 then
+        begin
+          try
+            FillChar(ImgBuf, SizeOf(ImgBuf), 0);
+            ImgLen := Length(ImgBuf);
+            if QueryFullProcessImageNameW(HProc, 0, @ImgBuf[0], ImgLen) then
+            begin
+              FullPath := string(PWideChar(@ImgBuf[0]));
+              ExeName := ExtractFileName(FullPath);
+              if (not IsAllowedGuiBinary(FullPath)) and IsGuiSubsystemProcess(HProc, FullPath) then
+              begin
+                if FBlockGuiApps then
+                  TerminateProcess(HProc, 1);
+                Handler := nil;
+                if Assigned(FLock) then
+                begin
+                  FLock.Enter;
+                  try
+                    Handler := FOnGuiDetected;
+                  finally
+                    FLock.Leave;
+                  end;
+                end;
+                if (not Terminated) and Assigned(Handler) then
+                begin
+                  try
+                    Handler(ExeName, NewPid, FBlockGuiApps);
+                  except
+                  end;
+                end;
+              end;
+            end;
+          finally
+            CloseHandle(HProc);
+          end;
+        end;
+      end;
+    end;
+  end;
+end;
+
 constructor TGTermConPty.Create(ACols: Integer; ARows: Integer);
 begin
   inherited Create;
@@ -562,8 +985,48 @@ begin
   FStopEvent := CreateEvent(nil, True, False, nil);
   FSandboxMode := smNone;
   FJobHandle := 0;
+  FJobIocp := 0;
+  FJobMonitorThread := nil;
   FAppContainerSid := nil;
   FAppContainerName := '';
+  FAcquiredDesktopKey := '';
+  FBlockGuiApps := True;
+  FWarnGuiApps := True;
+  var PolicyVal := LowerCase(Trim(GetEnvironmentVariable('GTERM_GUI_POLICY')));
+  if PolicyVal <> '' then
+  begin
+    if PolicyVal = 'allow' then
+    begin
+      FBlockGuiApps := False;
+      FWarnGuiApps := False;
+    end
+    else if PolicyVal = 'warn' then
+    begin
+      FBlockGuiApps := False;
+      FWarnGuiApps := True;
+    end
+    else
+    begin
+      FBlockGuiApps := True;
+      FWarnGuiApps := True;
+    end;
+  end
+  else
+  begin
+    if SameText(GetEnvironmentVariable('GTERM_ALLOW_GUI'), '1') then
+    begin
+      FBlockGuiApps := False;
+      FWarnGuiApps := False;
+    end
+    else if SameText(GetEnvironmentVariable('GTERM_BLOCK_GUI'), '0') then
+    begin
+      FBlockGuiApps := False;
+      FWarnGuiApps := True;
+    end;
+  end;
+  FExtendedUiLimits := not SameText(GetEnvironmentVariable('GTERM_EXTENDED_UI_LIMITS'), '0');
+  FLastWarnedGuiExe := '';
+  FLastWarnedGuiTick := 0;
 end;
 
 destructor TGTermConPty.Destroy;
@@ -660,10 +1123,18 @@ begin
   if FOutputRead <> 0 then begin CloseHandle(FOutputRead); FOutputRead := 0; end;
 end;
 
+procedure TGTermConPty.HandleJobGuiDetected(const AExeName: string; APid: DWORD; ABlocked: Boolean);
+begin
+  Logger.Warn(Format('[ConPTY] Job Object detected GUI process "%s" (PID: %d, Blocked=%s)',
+    [AExeName, APid, IfThen(ABlocked, 'true', 'false')]));
+end;
+
 procedure TGTermConPty.SetupJobSandbox;
 var
   JobInfo: JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
   CpuInfo: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION;
+  UiInfo: JOBOBJECT_BASIC_UI_RESTRICTIONS;
+  AssocInfo: JOBOBJECT_ASSOCIATE_COMPLETION_PORT;
 begin
   FJobHandle := CreateJobObjectW(nil, nil);
   if FJobHandle = 0 then
@@ -683,7 +1154,7 @@ begin
   JobInfo.ProcessMemoryLimit := SIZE_T(512) * 1024 * 1024;
   JobInfo.JobMemoryLimit := SIZE_T(512) * 1024 * 1024;
 
-  if not SetInformationJobObject(FJobHandle, 9, @JobInfo, SizeOf(JobInfo)) then
+  if not SetInformationJobObject(FJobHandle, JobObjectExtendedLimitInformation, @JobInfo, SizeOf(JobInfo)) then
     Logger.Warn(Format('[ConPTY] SetInformationJobObject (memory) failed: %d', [GetLastError]))
   else
     Logger.Info('[ConPTY] Job Object sandbox created (kill-on-close, max 30 procs, 512MB RAM limit)');
@@ -691,23 +1162,56 @@ begin
   FillChar(CpuInfo, SizeOf(CpuInfo), 0);
   CpuInfo.ControlFlags := JOB_OBJECT_CPU_RATE_CONTROL_ENABLE or JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
   CpuInfo.CpuRate := 5000;
-  SetInformationJobObject(FJobHandle, 6, @CpuInfo, SizeOf(CpuInfo));
+  SetInformationJobObject(FJobHandle, JobObjectCpuRateControlInformation, @CpuInfo, SizeOf(CpuInfo));
 
-  var UiInfo: JOBOBJECT_BASIC_UI_RESTRICTIONS;
   FillChar(UiInfo, SizeOf(UiInfo), 0);
   UiInfo.UIRestrictionsClass := JOB_OBJECT_UILIMIT_DESKTOP or JOB_OBJECT_UILIMIT_HANDLES;
-  if not SetInformationJobObject(FJobHandle, 4, @UiInfo, SizeOf(UiInfo)) then
+  if FExtendedUiLimits or SameText(GetEnvironmentVariable('GTERM_EXTENDED_UI_LIMITS'), '1') then
+    UiInfo.UIRestrictionsClass := UiInfo.UIRestrictionsClass or
+      JOB_OBJECT_UILIMIT_READCLIPBOARD or
+      JOB_OBJECT_UILIMIT_WRITECLIPBOARD or
+      JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS or
+      JOB_OBJECT_UILIMIT_DISPLAYSETTINGS or
+      JOB_OBJECT_UILIMIT_GLOBALATOMS or
+      JOB_OBJECT_UILIMIT_EXITWINDOWS;
+  if not SetInformationJobObject(FJobHandle, JobObjectBasicUIRestrictions, @UiInfo, SizeOf(UiInfo)) then
     Logger.Warn(Format('[ConPTY] SetInformationJobObject (UI limits) failed: %d', [GetLastError]));
+
+  FJobIocp := CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 1);
+  if FJobIocp <> 0 then
+  begin
+    FillChar(AssocInfo, SizeOf(AssocInfo), 0);
+    AssocInfo.CompletionKey := Pointer(Self);
+    AssocInfo.CompletionPort := FJobIocp;
+    if not SetInformationJobObject(FJobHandle, JobObjectAssociateCompletionPortInformation, @AssocInfo, SizeOf(AssocInfo)) then
+    begin
+      Logger.Warn(Format('[ConPTY] SetInformationJobObject (CompletionPort) failed: %d', [GetLastError]));
+      CloseHandle(FJobIocp);
+      FJobIocp := 0;
+    end;
+  end;
 end;
 
 const
   SANDBOX_DESKTOP_NAME = 'GTermBoxSandbox';
-  SANDBOX_DESKTOP_SDDL = 'D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)(A;;GA;;;AC)';
+  SANDBOX_DESKTOP_BASE_SDDL = 'D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)';
+  SANDBOX_DESKTOP_SDDL = 'D:(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x000200c7;;;AC)';
+
+type
+  TSandboxDesktopEntry = record
+    DeskKey: string;
+    DeskName: string;
+    FullPath: string;
+    Handle: THandle;
+    RefCount: Integer;
+    LastUsedTick: UInt64;
+  end;
 
 var
   GSandboxDesktopLock: TCriticalSection = nil;
-  GUserDesktops: TDictionary<string, THandle> = nil;
-  GUserDesktopPaths: TDictionary<string, string> = nil;
+  GUserDesktops: TDictionary<string, TSandboxDesktopEntry> = nil;
+  GAltWinStaHandle: HWINSTA = 0;
+  GAltWinStaName: string = '';
 
 procedure TGTermConPty.GrantDirAccessToAppContainer(const ADir: string; AFullAccess: Boolean);
 var
@@ -725,7 +1229,7 @@ var
 begin
   if ADir = '' then Exit;
 
-  WinDir := ExcludeTrailingPathDelimiter(LowerCase(GetEnvironmentVariable('SystemRoot')));
+  WinDir := GetCanonicalWindowsDirectory;
   CleanDir := ExcludeTrailingPathDelimiter(LowerCase(ADir));
   if (WinDir <> '') and ((CleanDir = WinDir) or StartsText(WinDir + '\', CleanDir)) then
     Exit;
@@ -873,47 +1377,352 @@ begin
   end;
 end;
 
-function GetSandboxDesktopPath(const AUsername: string = ''): string;
+class function TGTermConPty.BuildSafeDesktopName(const AUsername: string): string;
+var
+  RawUser, CleanPart, HashSuffix: string;
+  Ch: Char;
+  NeedsHash: Boolean;
+begin
+  RawUser := Trim(AUsername);
+  if RawUser = '' then
+    Exit('GTermBox_default');
+  CleanPart := '';
+  NeedsHash := False;
+  for Ch in RawUser do
+  begin
+    if CharInSet(Ch, ['a'..'z', '0'..'9']) then
+      CleanPart := CleanPart + Ch
+    else if CharInSet(Ch, ['A'..'Z']) then
+    begin
+      CleanPart := CleanPart + LowerCase(Ch);
+      NeedsHash := True;
+    end
+    else
+    begin
+      CleanPart := CleanPart + '_';
+      NeedsHash := True;
+    end;
+  end;
+  if CleanPart = '' then
+  begin
+    CleanPart := 'user';
+    NeedsHash := True;
+  end;
+  if Length(CleanPart) > 24 then
+  begin
+    CleanPart := Copy(CleanPart, 1, 24);
+    NeedsHash := True;
+  end;
+  if NeedsHash then
+  begin
+    HashSuffix := LowerCase(Copy(THashSHA2.GetHashString(RawUser), 1, 8));
+    Result := 'GTermBox_' + CleanPart + '_' + HashSuffix;
+  end
+  else
+    Result := 'GTermBox_' + CleanPart;
+end;
+
+procedure EvictIdleDesktopsLocked(AMaxIdleMs: UInt64; AForceEvictOne: Boolean);
+var
+  KeysToRemove: TList<string>;
+  Pair: TPair<string, TSandboxDesktopEntry>;
+  NowTick: UInt64;
+  OldestKey: string;
+  OldestTick: UInt64;
+  Entry: TSandboxDesktopEntry;
+begin
+  if GUserDesktops = nil then Exit;
+  NowTick := GetTickCount64;
+  KeysToRemove := TList<string>.Create;
+  try
+    OldestKey := '';
+    OldestTick := High(UInt64);
+    for Pair in GUserDesktops do
+    begin
+      if Pair.Value.RefCount <= 0 then
+      begin
+        if (AMaxIdleMs = 0) or ((NowTick - Pair.Value.LastUsedTick) >= AMaxIdleMs) then
+          KeysToRemove.Add(Pair.Key)
+        else if Pair.Value.LastUsedTick < OldestTick then
+        begin
+          OldestTick := Pair.Value.LastUsedTick;
+          OldestKey := Pair.Key;
+        end;
+      end;
+    end;
+    if AForceEvictOne and (KeysToRemove.Count = 0) and (OldestKey <> '') then
+      KeysToRemove.Add(OldestKey);
+    for var K in KeysToRemove do
+    begin
+      if GUserDesktops.TryGetValue(K, Entry) then
+      begin
+        if Entry.Handle <> 0 then
+          CloseDesktop(Entry.Handle);
+        GUserDesktops.Remove(K);
+        Logger.Info(Format('[ConPTY] Closed idle sandbox desktop: %s', [Entry.FullPath]));
+      end;
+    end;
+  finally
+    KeysToRemove.Free;
+  end;
+end;
+
+class procedure TGTermConPty.PurgeIdleDesktops(AMaxIdleMs: UInt64);
+begin
+  if GSandboxDesktopLock = nil then Exit;
+  GSandboxDesktopLock.Enter;
+  try
+    EvictIdleDesktopsLocked(AMaxIdleMs, False);
+  finally
+    GSandboxDesktopLock.Leave;
+  end;
+end;
+
+class function TGTermConPty.GetActiveDesktopCount: Integer;
+begin
+  Result := 0;
+  if GSandboxDesktopLock = nil then Exit;
+  GSandboxDesktopLock.Enter;
+  try
+    if GUserDesktops <> nil then
+      Result := GUserDesktops.Count;
+  finally
+    GSandboxDesktopLock.Leave;
+  end;
+end;
+
+procedure ApplyLowIntegrityToWindowObject(AHandle: THandle);
+var
+  LabelSd: Pointer;
+  Sacl: Pointer;
+  SaclPresent, SaclDefaulted: BOOL;
+begin
+  if AHandle = 0 then Exit;
+  LabelSd := nil;
+  Sacl := nil;
+  SaclPresent := False;
+  SaclDefaulted := False;
+  if ConvertStringSecurityDescriptorToSecurityDescriptorW(PWideChar('S:(ML;;NW;;;LW)'), 1, LabelSd, nil) then
+  begin
+    try
+      if GetSecurityDescriptorSacl(LabelSd, SaclPresent, Sacl, SaclDefaulted) and (Sacl <> nil) then
+        SetSecurityInfo(AHandle, SE_WINDOW_OBJECT, LABEL_SECURITY_INFORMATION, nil, nil, nil, Sacl);
+    finally
+      LocalFree(HLOCAL(LabelSd));
+    end;
+  end;
+end;
+
+function GrantSidToWindowObject(AObj: THandle; ASid: PSID; AAccessMask: DWORD): Boolean;
+var
+  Si: DWORD;
+  Needed, SdNewSize: DWORD;
+  SdOld, SdNew: Pointer;
+  DaclPresent, DaclDefaulted: BOOL;
+  OldDacl, NewDacl: Pointer;
+  AclInfo: TACL_SIZE_INFORMATION;
+  NewAclSize, AceMask: DWORD;
+  AcePtr: Pointer;
+  I: DWORD;
+begin
+  Result := False;
+  if (AObj = 0) or (ASid = nil) then Exit;
+  Si := DACL_SECURITY_INFORMATION;
+  Needed := 0;
+  GetUserObjectSecurity(AObj, Si, nil, 0, Needed);
+  if Needed = 0 then Exit;
+  SdNewSize := Needed + 64;
+  GetMem(SdOld, Needed);
+  GetMem(SdNew, SdNewSize);
+  try
+    FillChar(SdOld^, Needed, 0);
+    FillChar(SdNew^, SdNewSize, 0);
+    if not GetUserObjectSecurity(AObj, Si, SdOld, Needed, Needed) then Exit;
+    if not InitializeSecurityDescriptor(SdNew, SECURITY_DESCRIPTOR_REVISION) then Exit;
+    DaclPresent := False;
+    DaclDefaulted := False;
+    OldDacl := nil;
+    if not GetSecurityDescriptorDacl(SdOld, DaclPresent, OldDacl, DaclDefaulted) then Exit;
+    FillChar(AclInfo, SizeOf(AclInfo), 0);
+    AclInfo.AclBytesInUse := 8;
+    if DaclPresent and (OldDacl <> nil) then
+      if not GetAclInformation(OldDacl, @AclInfo, SizeOf(AclInfo), AclSizeInformation) then Exit;
+    if DaclPresent and (OldDacl <> nil) and (AclInfo.AceCount > 0) then
+    begin
+      for I := 0 to AclInfo.AceCount - 1 do
+        if GetAce(OldDacl, I, AcePtr) then
+          if (PByte(AcePtr)^ = 0) and EqualSid(PSID(PByte(AcePtr) + 8), ASid) then
+          begin
+            AceMask := PDWORD(PByte(AcePtr) + 4)^;
+            if ((AceMask and GENERIC_ALL) <> 0) or ((AceMask and AAccessMask) = AAccessMask) then
+              Exit(True);
+          end;
+    end;
+    NewAclSize := AclInfo.AclBytesInUse + ACCESS_ALLOWED_ACE_HEADER_SIZE + GetLengthSid(ASid) + 32;
+    GetMem(NewDacl, NewAclSize);
+    try
+      if not InitializeAcl(NewDacl, NewAclSize, ACL_REVISION) then Exit;
+      if DaclPresent and (OldDacl <> nil) and (AclInfo.AceCount > 0) then
+        for I := 0 to AclInfo.AceCount - 1 do
+          if GetAce(OldDacl, I, AcePtr) then
+            if (PByte(AcePtr)^ <> 0) or (not EqualSid(PSID(PByte(AcePtr) + 8), ASid)) then
+              AddAce(NewDacl, ACL_REVISION, MAXDWORD, AcePtr, PDWORD(AcePtr)^ shr 16);
+      if not AddAccessAllowedAceEx(NewDacl, ACL_REVISION, 0, AAccessMask, ASid) then Exit;
+      if not SetSecurityDescriptorDacl(SdNew, True, NewDacl, False) then Exit;
+      Result := SetUserObjectSecurity(AObj, Si, SdNew);
+    finally
+      FreeMem(NewDacl);
+    end;
+  finally
+    FreeMem(SdOld);
+    FreeMem(SdNew);
+  end;
+end;
+
+function AcquireSandboxDesktop(const AUsername: string; AAppContainerSid: PSID; out ADesktopKey: string): string;
 var
   Sd: Pointer;
   Sa: TSecurityAttributes;
   WinStaName: array[0..255] of WideChar;
   Needed: DWORD;
-  CleanUser: string;
   DeskName: string;
+  DeskKey: string;
   HDesk: THandle;
+  Entry: TSandboxDesktopEntry;
+  SddlStr: string;
+  StrSid: LPWSTR;
+  CurWinSta: HWINSTA;
+  UseAltWinSta: Boolean;
+  ActiveWinStaName: string;
 begin
   Result := '';
-  CleanUser := Trim(AUsername);
-  if CleanUser = '' then CleanUser := 'default';
-  DeskName := 'GTermBox_' + CleanUser;
+  ADesktopKey := '';
+  if SameText(GetEnvironmentVariable('GTERM_DISABLE_SANDBOX_DESKTOP'), '1') then
+    Exit;
+
+  DeskName := TGTermConPty.BuildSafeDesktopName(AUsername);
+  DeskKey := LowerCase(DeskName);
 
   if GSandboxDesktopLock = nil then Exit;
   GSandboxDesktopLock.Enter;
   try
-    if (GUserDesktopPaths <> nil) and GUserDesktopPaths.TryGetValue(CleanUser, Result) and (Result <> '') then
+    if GUserDesktops = nil then Exit;
+
+    if GUserDesktops.TryGetValue(DeskKey, Entry) and (Entry.Handle <> 0) and (Entry.FullPath <> '') then
+    begin
+      if (AAppContainerSid <> nil) and (GAltWinStaHandle <> 0) then
+        GrantSidToWindowObject(GAltWinStaHandle, AAppContainerSid, WINSTA_APPCONTAINER_ACCESS);
+      if AAppContainerSid <> nil then
+        GrantSidToWindowObject(Entry.Handle, AAppContainerSid, DESKTOP_APPCONTAINER_ACCESS);
+      Inc(Entry.RefCount);
+      Entry.LastUsedTick := GetTickCount64;
+      GUserDesktops.AddOrSetValue(DeskKey, Entry);
+      ADesktopKey := DeskKey;
+      Result := Entry.FullPath;
       Exit;
+    end;
+
+    if GUserDesktops.Count >= MAX_CACHED_DESKTOPS then
+      EvictIdleDesktopsLocked(DESKTOP_IDLE_TTL_MS, True);
 
     FillChar(WinStaName, SizeOf(WinStaName), 0);
     Needed := 0;
-    if not GetUserObjectInformationW(GetProcessWindowStation, UOI_NAME, @WinStaName[0], SizeOf(WinStaName), Needed) then
+    CurWinSta := GetProcessWindowStation;
+    if not GetUserObjectInformationW(CurWinSta, UOI_NAME, @WinStaName[0], SizeOf(WinStaName), Needed) then
     begin
       Logger.Warn(Format('[ConPTY] GetUserObjectInformation failed: %d', [GetLastError]));
       Exit;
     end;
+    ActiveWinStaName := string(PWideChar(@WinStaName[0]));
+    UseAltWinSta := SameText(GetEnvironmentVariable('GTERM_ALTERNATE_WINSTA'), '1') or
+      StartsText('Service-0x', ActiveWinStaName);
+
+    SddlStr := SANDBOX_DESKTOP_BASE_SDDL;
+    if AAppContainerSid <> nil then
+    begin
+      StrSid := nil;
+      if ConvertSidToStringSidW(AAppContainerSid, StrSid) and (StrSid <> nil) then
+      begin
+        try
+          SddlStr := Format('%s(A;;0x000200c7;;;%s)', [SANDBOX_DESKTOP_BASE_SDDL, string(StrSid)]);
+        finally
+          LocalFree(HLOCAL(StrSid));
+        end;
+      end
+      else
+        SddlStr := SANDBOX_DESKTOP_SDDL;
+    end;
 
     Sd := nil;
-    if not ConvertStringSecurityDescriptorToSecurityDescriptorW(PWideChar(SANDBOX_DESKTOP_SDDL), 1, Sd, nil) then
+    if not ConvertStringSecurityDescriptorToSecurityDescriptorW(PWideChar(SddlStr), 1, Sd, nil) then
     begin
-      Logger.Warn(Format('[ConPTY] Sandbox desktop SDDL conversion failed: %d', [GetLastError]));
-      Exit;
+      if not ConvertStringSecurityDescriptorToSecurityDescriptorW(PWideChar(SANDBOX_DESKTOP_SDDL), 1, Sd, nil) then
+      begin
+        Logger.Warn(Format('[ConPTY] Sandbox desktop SDDL conversion failed: %d', [GetLastError]));
+        Exit;
+      end;
     end;
     try
       FillChar(Sa, SizeOf(Sa), 0);
       Sa.nLength := SizeOf(Sa);
       Sa.lpSecurityDescriptor := Sd;
       Sa.bInheritHandle := False;
-      HDesk := CreateDesktopW(PWideChar(DeskName), nil, nil, 0, GENERIC_ALL, @Sa);
+
+      if UseAltWinSta then
+      begin
+        if GAltWinStaHandle = 0 then
+        begin
+          GAltWinStaName := 'GTermBox_WinSta_' + IntToStr(GetCurrentProcessId);
+          GAltWinStaHandle := CreateWindowStationW(PWideChar(GAltWinStaName), 0, WINSTA_ALL_ACCESS, @Sa);
+          if GAltWinStaHandle <> 0 then
+          begin
+            ApplyLowIntegrityToWindowObject(GAltWinStaHandle);
+            SetProcessWindowStation(GAltWinStaHandle);
+          end;
+        end;
+        if GAltWinStaHandle <> 0 then
+        begin
+          if AAppContainerSid <> nil then
+            GrantSidToWindowObject(GAltWinStaHandle, AAppContainerSid, WINSTA_APPCONTAINER_ACCESS);
+          ActiveWinStaName := GAltWinStaName;
+        end;
+      end;
+
+      if SameText(GetEnvironmentVariable('GTERM_SIMULATE_DESKTOP_FAIL'), '1') then
+      begin
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        HDesk := 0;
+      end
+      else
+        HDesk := CreateDesktopW(PWideChar(DeskName), nil, nil, 0, DESKTOP_ALL_ACCESS, @Sa);
+      if HDesk = 0 then
+      begin
+        Logger.Error(Format('[ConPTY] CreateDesktopW failed for user desktop "%s" (LastError: %d)', [DeskName, GetLastError]));
+        if SameText(GetEnvironmentVariable('GTERM_DESKTOP_FAIL_CLOSED'), '1') then
+          Exit;
+        if (AAppContainerSid <> nil) and (not SameText(GetEnvironmentVariable('GTERM_DESKTOP_FAIL_OPEN'), '1')) then
+          Exit;
+        DeskName := SANDBOX_DESKTOP_NAME;
+        DeskKey := LowerCase(DeskName);
+        if GUserDesktops.TryGetValue(DeskKey, Entry) and (Entry.Handle <> 0) then
+        begin
+          if AAppContainerSid <> nil then
+            GrantSidToWindowObject(Entry.Handle, AAppContainerSid, DESKTOP_APPCONTAINER_ACCESS);
+          Inc(Entry.RefCount);
+          Entry.LastUsedTick := GetTickCount64;
+          GUserDesktops.AddOrSetValue(DeskKey, Entry);
+          ADesktopKey := DeskKey;
+          Result := Entry.FullPath;
+          Exit;
+        end;
+        HDesk := CreateDesktopW(PWideChar(DeskName), nil, nil, 0, DESKTOP_ALL_ACCESS, @Sa);
+      end;
+      if HDesk <> 0 then
+      begin
+        ApplyLowIntegrityToWindowObject(HDesk);
+        if AAppContainerSid <> nil then
+          GrantSidToWindowObject(HDesk, AAppContainerSid, DESKTOP_APPCONTAINER_ACCESS);
+      end;
     finally
       LocalFree(HLOCAL(Sd));
     end;
@@ -924,12 +1733,39 @@ begin
       Exit;
     end;
 
-    Result := string(PWideChar(@WinStaName[0])) + '\' + DeskName;
-    if GUserDesktops <> nil then
-      GUserDesktops.AddOrSetValue(CleanUser, HDesk);
-    if GUserDesktopPaths <> nil then
-      GUserDesktopPaths.AddOrSetValue(CleanUser, Result);
+    Result := ActiveWinStaName + '\' + DeskName;
+    Entry.DeskKey := DeskKey;
+    Entry.DeskName := DeskName;
+    Entry.FullPath := Result;
+    Entry.Handle := HDesk;
+    Entry.RefCount := 1;
+    Entry.LastUsedTick := GetTickCount64;
+    GUserDesktops.AddOrSetValue(DeskKey, Entry);
+    ADesktopKey := DeskKey;
     Logger.Info(Format('[ConPTY] User sandbox desktop ready: %s', [Result]));
+  finally
+    GSandboxDesktopLock.Leave;
+  end;
+end;
+
+procedure ReleaseSandboxDesktop(var ADesktopKey: string);
+var
+  Entry: TSandboxDesktopEntry;
+begin
+  if (ADesktopKey = '') or (GSandboxDesktopLock = nil) then Exit;
+  GSandboxDesktopLock.Enter;
+  try
+    if (GUserDesktops <> nil) and GUserDesktops.TryGetValue(ADesktopKey, Entry) then
+    begin
+      Dec(Entry.RefCount);
+      if Entry.RefCount < 0 then
+        Entry.RefCount := 0;
+      Entry.LastUsedTick := GetTickCount64;
+      GUserDesktops.AddOrSetValue(ADesktopKey, Entry);
+      if GUserDesktops.Count > MAX_CACHED_DESKTOPS then
+        EvictIdleDesktopsLocked(DESKTOP_IDLE_TTL_MS, True);
+    end;
+    ADesktopKey := '';
   finally
     GSandboxDesktopLock.Leave;
   end;
@@ -1069,12 +1905,42 @@ end;
 procedure TGTermConPty.CleanupSandbox;
 var
   D: string;
+  JobMonToFree: TJobMonitorThread;
 begin
+  if Assigned(FJobMonitorThread) then
+  begin
+    JobMonToFree := FJobMonitorThread;
+    FJobMonitorThread := nil;
+    JobMonToFree.ClearHandler;
+    JobMonToFree.Terminate;
+    if FJobIocp <> 0 then
+      PostQueuedCompletionStatus(FJobIocp, 0, 0, nil);
+    if JobMonToFree.ThreadID <> GetCurrentThreadId then
+    begin
+      try
+        JobMonToFree.WaitFor;
+      except
+      end;
+      JobMonToFree.Free;
+    end
+    else
+      JobMonToFree.FreeOnTerminate := True;
+  end;
+
   if FJobHandle <> 0 then
   begin
     CloseHandle(FJobHandle);
     FJobHandle := 0;
   end;
+
+  if FJobIocp <> 0 then
+  begin
+    CloseHandle(FJobIocp);
+    FJobIocp := 0;
+  end;
+
+  if FAcquiredDesktopKey <> '' then
+    ReleaseSandboxDesktop(FAcquiredDesktopKey);
 
   if FAppContainerSid <> nil then
   begin
@@ -1224,25 +2090,58 @@ const
                        '  if ([System.IO.Directory]::GetCurrentDirectory() -ne $env:USERPROFILE) { [System.IO.Directory]::SetCurrentDirectory($env:USERPROFILE) }' + #13#10 +
                        '  "PS $($executionContext.SessionState.Path.CurrentLocation)$(''>'' * ($nestedPromptLevel + 1)) "' + #13#10 +
                        '} | Out-Null' + #13#10;
-  PS_GUI_BLOCKER     = '$ExecutionContext.InvokeCommand.PostCommandLookupAction = {' + #13#10 +
+  PS_GUI_BLOCKER     = '$global:__GTermPeCache = @{}' + #13#10 +
+                       '$global:__GTermGuiAllow = @(''msiexec.exe'',''regedit.exe'',''rundll32.exe'',''conhost.exe'',''openconsole.exe'',''dllhost.exe'',''werfault.exe'',''consent.exe'')' + #13#10 +
+                       '$global:__GTermStoreGuiAliases = @(''notepad.exe'',''mspaint.exe'',''calc.exe'',''win32calc.exe'',''snippingtool.exe'')' + #13#10 +
+                       '$ExecutionContext.InvokeCommand.PostCommandLookupAction = {' + #13#10 +
                        '  param($cmdName, $cmdArgs)' + #13#10 +
                        '  if ($cmdArgs.Command -and ($cmdArgs.Command.CommandType -eq ''Application'')) {' + #13#10 +
                        '    $p = $cmdArgs.Command.Path' + #13#10 +
                        '    if ($p -and [System.IO.File]::Exists($p)) {' + #13#10 +
+                       '      $fullP = [System.IO.Path]::GetFullPath($p)' + #13#10 +
+                       '      $leaf = [System.IO.Path]::GetFileName($fullP).ToLowerInvariant()' + #13#10 +
+                       '      $dirP = [System.IO.Path]::GetDirectoryName($fullP).TrimEnd(''\'').ToLowerInvariant()' + #13#10 +
+                       '      $sys32P = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System).TrimEnd(''\'').ToLowerInvariant()' + #13#10 +
+                       '      $winP = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Windows).TrimEnd(''\'').ToLowerInvariant()' + #13#10 +
+                       '      if (($global:__GTermGuiAllow -contains $leaf) -and (($dirP -eq $sys32P) -or ($dirP -eq ($winP + ''\syswow64'')) -or ($dirP -eq $winP))) { return }' + #13#10 +
+                       '      $isGui = $false' + #13#10 +
                        '      try {' + #13#10 +
-                       '        $fs = [System.IO.File]::OpenRead($p)' + #13#10 +
-                       '        $buf = [byte[]]::new(1024)' + #13#10 +
-                       '        $null = $fs.Read($buf, 0, 1024)' + #13#10 +
-                       '        $fs.Close()' + #13#10 +
-                       '        if ($buf[0] -eq 0x4D -and $buf[1] -eq 0x5A) {' + #13#10 +
-                       '          $peOff = [System.BitConverter]::ToInt32($buf, 0x3C)' + #13#10 +
-                       '          if ($peOff -gt 0 -and ($peOff + 94) -lt $buf.Length) {' + #13#10 +
-                       '            if ([System.BitConverter]::ToUInt16($buf, $peOff + 24 + 68) -eq 2) {' + #13#10 +
-                       '              [Console]::WriteLine("[GTermBox Warning] ''" + $cmdName + "'' is a graphical (GUI) application. GUI windows are isolated on the background sandbox desktop.")' + #13#10 +
+                       '        $fi = [System.IO.FileInfo]::new($fullP)' + #13#10 +
+                       '        $cacheKey = $fullP.ToLowerInvariant() + ''|'' + $fi.LastWriteTimeUtc.Ticks' + #13#10 +
+                       '        if ($global:__GTermPeCache.ContainsKey($cacheKey)) {' + #13#10 +
+                       '          $isGui = $global:__GTermPeCache[$cacheKey]' + #13#10 +
+                       '        } else {' + #13#10 +
+                       '          $fs = [System.IO.File]::Open($fullP, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)' + #13#10 +
+                       '          try {' + #13#10 +
+                       '            $dosBuf = [byte[]]::new(64)' + #13#10 +
+                       '            $readDos = $fs.Read($dosBuf, 0, 64)' + #13#10 +
+                       '            if ($readDos -eq 64 -and $dosBuf[0] -eq 0x4D -and $dosBuf[1] -eq 0x5A) {' + #13#10 +
+                       '              $peOff = [System.BitConverter]::ToInt32($dosBuf, 0x3C)' + #13#10 +
+                       '              if ($peOff -ge 64 -and $peOff -le 0x100000 -and ($peOff + 96) -le $fs.Length) {' + #13#10 +
+                       '                [void]$fs.Seek($peOff, [System.IO.SeekOrigin]::Begin)' + #13#10 +
+                       '                $peBuf = [byte[]]::new(128)' + #13#10 +
+                       '                $readPe = $fs.Read($peBuf, 0, 128)' + #13#10 +
+                       '                if ($readPe -ge 96) {' + #13#10 +
+                       '                  $peSig = [System.BitConverter]::ToUInt32($peBuf, 0)' + #13#10 +
+                       '                  if ($peSig -eq 0x00004550) {' + #13#10 +
+                       '                    $subsys = [System.BitConverter]::ToUInt16($peBuf, 24 + 68)' + #13#10 +
+                       '                    $isGui = ($subsys -eq 2)' + #13#10 +
+                       '                  }' + #13#10 +
+                       '                }' + #13#10 +
+                       '              }' + #13#10 +
                        '            }' + #13#10 +
+                       '          } finally {' + #13#10 +
+                       '            $fs.Close()' + #13#10 +
                        '          }' + #13#10 +
+                       '          if ($global:__GTermPeCache.Count -gt 512) { $global:__GTermPeCache.Clear() }' + #13#10 +
+                       '          $global:__GTermPeCache[$cacheKey] = $isGui' + #13#10 +
                        '        }' + #13#10 +
-                       '      } catch {}' + #13#10 +
+                       '      } catch {' + #13#10 +
+                       '        if ($global:__GTermStoreGuiAliases -contains $leaf) { $isGui = $true }' + #13#10 +
+                       '      }' + #13#10 +
+                       '      if ($isGui -and ($env:GTERM_GUI_POLICY -eq ''warn'')) {' + #13#10 +
+                       '        [Console]::WriteLine("[GTermBox Warning] ''" + $cmdName + "'' is a graphical (GUI) application. GUI windows are isolated on the background sandbox desktop.")' + #13#10 +
+                       '      }' + #13#10 +
                        '    }' + #13#10 +
                        '  }' + #13#10 +
                        '}' + #13#10;
@@ -1383,7 +2282,13 @@ begin
       EnvMap.Values['TEMP']         := TempVal;
       EnvMap.Values['TMP']          := TempVal;
       EnvMap.Values['PATH']         := PathVal + ';' + AWorkingDir;
-      EnvMap.Values['PSModulePath'] := GetEnvironmentVariable('SystemRoot') +
+      if FBlockGuiApps then
+        EnvMap.Values['GTERM_GUI_POLICY'] := 'block'
+      else if FWarnGuiApps then
+        EnvMap.Values['GTERM_GUI_POLICY'] := 'warn'
+      else
+        EnvMap.Values['GTERM_GUI_POLICY'] := 'allow';
+      EnvMap.Values['PSModulePath'] := GetCanonicalWindowsDirectory +
                                        '\System32\WindowsPowerShell\v1.0\Modules';
       if TDirectory.Exists(TPath.Combine(AWorkingDir, 'apps\python')) then
       begin
@@ -1562,13 +2467,21 @@ begin
 
       FillChar(SiEx, SizeOf(SiEx), 0);
       SiEx.StartupInfo.cb := SizeOf(TStartupInfoExW);
-      SiEx.StartupInfo.dwFlags := STARTF_USESTDHANDLES;
+      SiEx.StartupInfo.dwFlags := STARTF_USESTDHANDLES or STARTF_FORCEOFFFEEDBACK;
       SiEx.StartupInfo.hStdInput := 0;
       SiEx.StartupInfo.hStdOutput := 0;
       SiEx.StartupInfo.hStdError := 0;
       SiEx.lpAttributeList := AttrList;
 
-      DesktopPath := GetSandboxDesktopPath(FUsername);
+      DesktopPath := AcquireSandboxDesktop(FUsername, FAppContainerSid, FAcquiredDesktopKey);
+      if (DesktopPath = '') and ((FSandboxMode = smStandard) or SameText(GetEnvironmentVariable('GTERM_DESKTOP_FAIL_CLOSED'), '1')) and
+         (not SameText(GetEnvironmentVariable('GTERM_DISABLE_SANDBOX_DESKTOP'), '1')) and
+         (not SameText(GetEnvironmentVariable('GTERM_DESKTOP_FAIL_OPEN'), '1')) then
+      begin
+        Logger.Error('[ConPTY] AcquireSandboxDesktop failed in fail-closed mode. Aborting process creation.');
+        ClosePipes;
+        Exit(False);
+      end;
       if DesktopPath <> '' then
         SiEx.StartupInfo.lpDesktop := PWideChar(DesktopPath);
 
@@ -1629,6 +2542,8 @@ begin
     if (FSandboxMode = smStandard) or (FSandboxMode = smJobOnly) then
     begin
       SetupJobSandbox;
+      if FJobIocp <> 0 then
+        FJobMonitorThread := TJobMonitorThread.Create(FJobIocp, FProcessInfo.dwProcessId, FBlockGuiApps, HandleJobGuiDetected);
       if (FJobHandle = 0) or not AssignProcessToJobObject(FJobHandle, FProcessInfo.hProcess) then
       begin
         Logger.Error(Format('[ConPTY] Failed to assign process to Job Object (LastError: %d). Terminating.', [GetLastError]));
@@ -1644,8 +2559,11 @@ begin
 
     ResumeThread(FProcessInfo.hThread);
 
-    if FInputRead <> 0 then begin CloseHandle(FInputRead); FInputRead := 0; end;
-    if FOutputWrite <> 0 then begin CloseHandle(FOutputWrite); FOutputWrite := 0; end;
+    if FInputRead <> 0 then
+      CloseHandle(FInputRead); FInputRead := 0;
+
+    if FOutputWrite <> 0 then
+      CloseHandle(FOutputWrite); FOutputWrite := 0;
 
     FReaderThread := TPtyReaderThread.Create(FOutputRead, FStopEvent, FOnDataReceived);
     FWatcherThread := TProcessWatcherThread.Create(FProcessInfo.hProcess, FOnProcessTerminated);
@@ -1778,18 +2696,20 @@ end;
 
 initialization
   GSandboxDesktopLock := TCriticalSection.Create;
-  GUserDesktops := TDictionary<string, THandle>.Create;
-  GUserDesktopPaths := TDictionary<string, string>.Create;
+  GUserDesktops := TDictionary<string, TSandboxDesktopEntry>.Create;
 
 finalization
   if GUserDesktops <> nil then
   begin
     for var D in GUserDesktops.Values do
-      if D <> 0 then CloseDesktop(D);
+      if D.Handle <> 0 then CloseDesktop(D.Handle);
     FreeAndNil(GUserDesktops);
   end;
-  if GUserDesktopPaths <> nil then
-    FreeAndNil(GUserDesktopPaths);
+  if GAltWinStaHandle <> 0 then
+  begin
+    CloseWindowStation(GAltWinStaHandle);
+    GAltWinStaHandle := 0;
+  end;
   FreeAndNil(GSandboxDesktopLock);
 
 end.

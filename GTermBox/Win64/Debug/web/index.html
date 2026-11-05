@@ -1232,7 +1232,7 @@
             if (typeof this.onLaunchFailed === 'function') {
               this.onLaunchFailed(errMsg);
             }
-            this.destroy();
+            this.handleDisconnect(errMsg, 'app_unavailable');
             return false;
           }
           if (sRes.ok) {
@@ -1245,7 +1245,7 @@
             if (typeof this.onLaunchFailed === 'function') {
               this.onLaunchFailed(errMsg);
             }
-            this.destroy();
+            this.handleDisconnect(errMsg, 'disconnected');
             return false;
           }
 
@@ -1401,6 +1401,16 @@
 
                 return;
 
+              }
+
+              if (str.includes('"type":"toast"')) {
+                try {
+                  const msg = JSON.parse(str.trim());
+                  if (msg.message) {
+                    showToast(msg.message, msg.level || 'warning');
+                    continue;
+                  }
+                } catch (_) {}
               }
 
               if (str.includes('"type":"app_error"')) {
@@ -2275,12 +2285,9 @@ class TabManager {
       } else {
         instance = new GTermBox(pane, appName);
         instance.onLaunchFailed = (err) => {
-          this.closeTab(tabId);
-          if (this.tabs.length === 0) {
-            const fallback = (window.serverApps || []).find(a => a.available !== false && a.id !== appName);
-            if (fallback) {
-              this.createTab(fallback.id);
-            }
+          const tSpan = tabEl.querySelector('span');
+          if (tSpan) {
+            tSpan.textContent = `[Failed] ${displayName} (#${this.counter})`;
           }
         };
       }
@@ -2522,7 +2529,7 @@ class TabManager {
 
     if (newTabBtn) {
       newTabBtn.addEventListener('click', () => {
-        const app = appSelector && appSelector.value ? appSelector.value : (currentApp || 'powershell');
+        const app = (appSelector && appSelector.value) ? appSelector.value : (currentApp || (window.serverApps && window.serverApps[0] ? window.serverApps[0].id : 'powershell'));
         const appInfo = (window.serverApps || []).find(a => a.id === app);
         if (appInfo && appInfo.available === false) {
           showToast(`Application "${appInfo.name || app}" is not available on this server.`, 'warning');
@@ -3075,6 +3082,8 @@ class TabManager {
                 active.instance = new GTermBox(active.paneEl, currentApp);
               }
               tabManager.setActiveTab(active.id);
+            } else {
+              tabManager.createTab(currentApp);
             }
           };
         }
