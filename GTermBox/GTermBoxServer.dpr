@@ -121,6 +121,7 @@ var
   GBindAddress: string = '';
   GHttpsBindAddress: string = '';
   GHttp3BindAddress: string = '';
+  GIdleTimeoutSeconds: Integer = 300;
   GTrustedClients: TDictionary<string, string> = nil;
   HStdIn: THandle;
   ConsoleMode: DWORD;
@@ -1687,6 +1688,11 @@ begin
       else if SameText(Arg, '--allow-test-ca') then
       begin
         GAllowTestCA := True;
+      end
+      else if SameText(Arg, '--idle-timeout') and (IParam < ParamCount) then
+      begin
+        Inc(IParam);
+        GIdleTimeoutSeconds := StrToIntDef(ParamStr(IParam), 300);
       end;
       Inc(IParam);
     end;
@@ -1749,7 +1755,10 @@ begin
     WTFileStreams := nil;
 
     try
-      SessionManager := TGTermSessionManager.Create;
+      if GIdleTimeoutSeconds <= 0 then
+        SessionManager := TGTermSessionManager.Create(0)
+      else
+        SessionManager := TGTermSessionManager.Create(Cardinal(GIdleTimeoutSeconds) * 1000);
       PendingSessionsLock := TCriticalSection.Create;
       PendingSessions := TDictionary<string, TPendingSession>.Create;
       LoginRateLock := TCriticalSection.Create;
@@ -2292,24 +2301,6 @@ begin
                 Exit;
               end;
             end;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
             if (Username = '') or not TGTermUserConfig.Instance.ValidateUser(Username, Password, UserEntry) then
             begin
@@ -3360,35 +3351,6 @@ begin
               Exit;
             end;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
             var BaseDir: string;
             if (Scope = 'server') and IsAdmin then
               BaseDir := ServerRoot
@@ -4261,7 +4223,8 @@ begin
         begin
           var CleanLogPath := Session^.Path;
           var QPos := Pos('?', CleanLogPath);
-          if QPos > 0 then CleanLogPath := Copy(CleanLogPath, 1, QPos - 1);
+          if QPos > 0 then 
+		    CleanLogPath := Copy(CleanLogPath, 1, QPos - 1);
           Logger.Info(Format('[WT] Client connected (SessionId: %d, Path: %s)', [Session^.SessionId, CleanLogPath]));
 
           QuicPeerIP := GetWTSessionPeerIP(Session);
@@ -5196,16 +5159,23 @@ begin
       Logger.Info(Format('  Server listening on HTTPS:        https://%s:%d', [DisplayHost, HttpsPortParam]));
       Logger.Info(Format('  Server listening on WebTransport: https://%s:%d/wt/terminal', [DisplayHost, HttpsPortParam]));
       Logger.Info(Format('  Server listening on WebTransport Files: https://%s:%d/wt/files', [DisplayHost, HttpsPortParam]));
+	  
       if GServerCertIsTrusted then
         Logger.Info('  TLS Trust Mode:                   TRUSTED (System Root CA - Web PKI)')
       else
         Logger.Info('  TLS Trust Mode:                   Self-Signed W3C WebTransport (serverCertificateHashes)');
+		
       case GmTLSMode of
         mtlsRequired: Logger.Info('  mTLS Client Authentication:       REQUIRED (Strict Mutual TLS)');
         mtlsOptional: Logger.Info('  mTLS Client Authentication:       OPTIONAL (Verify Client Cert If Given)');
       else
         Logger.Info('  mTLS Client Authentication:       DISABLED (Standard TLS)');
       end;
+      if GIdleTimeoutSeconds <= 0 then
+        Logger.Info('  Session Idle Timeout:             DISABLED (no timeout)')
+      else
+        Logger.Info(Format('  Session Idle Timeout:             %d seconds', [GIdleTimeoutSeconds]));
+	  
       if GmTLSCaCertPath <> '' then
         Logger.Info('  mTLS CA Certificate:              ' + GmTLSCaCertPath)
       else if GmTLSMode <> mtlsDisabled then
@@ -5214,6 +5184,7 @@ begin
         Logger.Info('  mTLS Pinned Direct Trust:         ' + GmTLSPinnedThumbprint);
       if Assigned(GTrustedClients) and (GTrustedClients.Count > 0) then
         Logger.Info(Format('  mTLS Trusted Clients Whitelist:   %d certs loaded (%s)', [GTrustedClients.Count, GTrustedClientsDir]));
+		
       Logger.Info('  Press Enter to stop the server.');
       Logger.Info('================================================================');
 
