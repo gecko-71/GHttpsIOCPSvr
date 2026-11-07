@@ -6040,6 +6040,16 @@ begin
     Logger.Warn('[QUIC] HandleQuicBeforeAcceptConnection rejected: TrackIPConnect failed for %s', [ARemoteIP]);
     Exit;
   end;
+  if ARemoteIP <> '' then
+  begin
+    FIPTrackerLock.Enter;
+    try
+      if FIPTracker.TryGetValue(ARemoteIP, Info) and (Info.BlockedUntilTick = 0) then
+        Info.FailureCount := 0;
+    finally
+      FIPTrackerLock.Leave;
+    end;
+  end;
   TInterlocked.Increment(FRequestsPerSecondCounter);
   InterlockedIncrement64(FActiveConnections);
   Result := True;
@@ -6069,12 +6079,20 @@ begin
       FIPTracker.Add(ARemoteIP, Info);
     end;
     Inc(Info.FailureCount);
-    ShiftVal := Info.FailureCount;
-    if ShiftVal > 6 then
-      ShiftVal := 6;
-    Info.BlockedUntilTick := NowTick + UInt64(1000 shl ShiftVal);
-    Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d, BlockedUntilTick=%d)',
-      [ARemoteIP, Info.FailureCount, Info.BlockedUntilTick]);
+    if (FmTLSMode = mtlsRequired) or (Info.FailureCount >= 5) then
+    begin
+      ShiftVal := Info.FailureCount;
+      if ShiftVal > 6 then
+        ShiftVal := 6;
+      Info.BlockedUntilTick := NowTick + UInt64(1000 shl ShiftVal);
+      Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d, BlockedUntilTick=%d)',
+        [ARemoteIP, Info.FailureCount, Info.BlockedUntilTick]);
+    end
+    else
+    begin
+      Logger.Warn('[QUIC] Handshake failed from %s (Failures=%d/5, not blocked)',
+        [ARemoteIP, Info.FailureCount]);
+    end;
   finally
     FIPTrackerLock.Leave;
   end;
