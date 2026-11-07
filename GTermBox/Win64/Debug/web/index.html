@@ -3303,6 +3303,10 @@ class TabManager {
           hideLogin();
           loadApps();
           return;
+        } else if (resp.status === 409) {
+          const errData = await resp.json().catch(() => ({}));
+          showLogin(errData.error || 'A user with this certificate is already logged in in another session.');
+          return;
         }
       } catch (_) {}
       if (isLoggingIn) return;
