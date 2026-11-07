@@ -574,22 +574,14 @@ end;
 procedure TGTermUserConfig.CheckReload;
 var
   CurrTime: TDateTime;
-  NowTick: UInt64;
   ShouldReload: Boolean;
 begin
   if FConfigPath = '' then Exit;
-  NowTick := GetTickCount64;
-  if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
-    Exit;
 
   ShouldReload := False;
   FLock.Enter;
   try
-    NowTick := GetTickCount64;
-    if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
-      Exit;
-    FLastCheckTick := NowTick;
-
+    FLastCheckTick := GetTickCount64;
     if FileExists(FConfigPath) then
     begin
       if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
@@ -631,13 +623,32 @@ begin
     FLock.Leave;
   end;
 
+  if not Found and (FConfigPath <> '') then
+  begin
+    LoadFromFile(FConfigPath);
+    FLock.Enter;
+    try
+      for I := 0 to High(FUsers) do
+      begin
+        if SameText(FUsers[I].Username, AUsername) then
+        begin
+          TargetUser := FUsers[I];
+          Found := True;
+          Break;
+        end;
+      end;
+    finally
+      FLock.Leave;
+    end;
+  end;
+
   if not Found then
     Exit(False);
 
   if (TargetUser.PasswordHash = '') or StartsText('DISABLED_NO_PASSWORD_', TargetUser.PasswordHash) then
     Exit(False);
 
-  Matched := False;
+  //Matched := False;
   if StartsText('PBKDF2$', TargetUser.PasswordHash) then
   begin
     CalculatedHash := HashPasswordWithSalt(APassword, TargetUser.Salt);

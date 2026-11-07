@@ -117,22 +117,14 @@ end;
 procedure TGTermAppConfig.CheckReload;
 var
   CurrTime: TDateTime;
-  NowTick: UInt64;
   ShouldReload: Boolean;
 begin
   if FConfigPath = '' then Exit;
-  NowTick := GetTickCount64;
-  if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
-    Exit;
 
   ShouldReload := False;
   FLock.Enter;
   try
-    NowTick := GetTickCount64;
-    if (FLastCheckTick <> 0) and (NowTick - FLastCheckTick < 500) then
-      Exit;
-    FLastCheckTick := NowTick;
-
+    FLastCheckTick := GetTickCount64;
     if FileExists(FConfigPath) then
     begin
       if FileAge(FConfigPath, CurrTime) and (CurrTime <> FLastWriteTime) then
@@ -459,8 +451,8 @@ var
   Arg: string;
   ArgsStr: string;
   ActualSandbox: string;
-  MasterAppDir: string;
-  SandboxAppDir: string;
+  //MasterAppDir: string;
+  //SandboxAppDir: string;
 begin
   ExeDir := ExtractFilePath(ParamStr(0));
 
@@ -488,17 +480,7 @@ begin
   if not TPath.IsPathRooted(FullCmd) then
   begin
     if FileExists(TPath.Combine(ExeDir, FullCmd)) or DirectoryExists(TPath.Combine(ExeDir, FullCmd)) then
-    begin
-      MasterAppDir := ExtractFilePath(TPath.Combine(ExeDir, FullCmd));
-      if (ActualSandbox <> '') and DirectoryExists(MasterAppDir) then
-      begin
-        SandboxAppDir := TPath.Combine(FullWorkDir, 'apps\' + LowerCase(Id));
-        DeployAppToSandbox(MasterAppDir, SandboxAppDir);
-        FullCmd := TPath.Combine(SandboxAppDir, ExtractFileName(FullCmd));
-      end
-      else
-        FullCmd := TPath.Combine(ExeDir, FullCmd);
-    end
+      FullCmd := TPath.Combine(ExeDir, FullCmd)
     else
     begin
       var SBuf: array[0..MAX_PATH] of Char;
@@ -511,19 +493,7 @@ begin
   if SameText(Id, 'pytui') then
   begin
     var LocalPyDir := TPath.Combine(ExeDir, 'Python');
-    if (ActualSandbox <> '') and DirectoryExists(LocalPyDir) then
-    begin
-      var SandboxPyDir := TPath.Combine(FullWorkDir, 'apps\python');
-      DeployAppToSandbox(LocalPyDir, SandboxPyDir);
-      var SandboxPyExe := TPath.Combine(SandboxPyDir, 'python.exe');
-      var SandboxAppPy := TPath.Combine(ExtractFilePath(FullCmd), 'app.py');
-      if FileExists(SandboxPyExe) and FileExists(SandboxAppPy) then
-      begin
-        FullCmd := SandboxPyExe;
-        ArgsStr := ' "' + SandboxAppPy + '"';
-      end;
-    end
-    else if DirectoryExists(LocalPyDir) then
+    if DirectoryExists(LocalPyDir) then
     begin
       var HostPyExe := TPath.Combine(LocalPyDir, 'python.exe');
       var HostAppPy := TPath.Combine(ExtractFilePath(FullCmd), 'app.py');

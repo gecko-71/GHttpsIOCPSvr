@@ -1141,7 +1141,7 @@
 
         const ok = await this.connectWebTransport();
 
-        if (ok) return;
+        if (ok || this.isDestroyed) return;
 
       }
 
@@ -1212,7 +1212,7 @@
 
             },
 
-            body: JSON.stringify({ app: this.appName, cols: this.term.cols || 120, rows: this.term.rows || 30 })
+            body: JSON.stringify({ app: this.appName, cols: (this.term && this.term.cols) || 120, rows: (this.term && this.term.rows) || 30 })
 
           });
 
@@ -1253,7 +1253,8 @@
 
 
 
-        let wtUrl = `https://${window.location.host}/wt/terminal?cols=${this.term.cols || 120}&rows=${this.term.rows || 30}`;
+        if (this.isDestroyed || !this.term) return false;
+        let wtUrl = `https://${window.location.host}/wt/terminal?cols=${(this.term && this.term.cols) || 120}&rows=${(this.term && this.term.rows) || 30}`;
 
         if (sessionId) {
 
@@ -3105,18 +3106,22 @@ class TabManager {
       }
     }
 
+    let isLoggingIn = false;
+
     async function showLogin(reason) {
       if (!reason) {
         const activeTok = sessionStorage.getItem('gtermbox_token');
-        if (activeTok && isTokenValid(activeTok)) {
-          hideLogin();
+        if (isLoggingIn || (activeTok && isTokenValid(activeTok))) {
+          if (activeTok && isTokenValid(activeTok)) {
+            hideLogin();
+          }
           return;
         }
       }
       if (loginOverlay) {
         loginOverlay.style.display = 'flex';
       }
-      if (loginPassword) loginPassword.value = '';
+      if (reason && loginPassword) loginPassword.value = '';
       if (loginError) {
         if (reason) {
           loginError.textContent = reason;
@@ -3136,6 +3141,9 @@ class TabManager {
 
       try {
         const mStatus = await fetch('/api/mtls/status').then(r => r.json()).catch(() => null);
+        if (isLoggingIn || isTokenValid(sessionStorage.getItem('gtermbox_token'))) {
+          return;
+        }
         let mtlsBox = document.getElementById('mtls-login-box');
         if (mStatus && mStatus.has_client_cert && mStatus.verified) {
           if (!mtlsBox) {
@@ -3160,7 +3168,9 @@ class TabManager {
         }
       } catch (_) {}
 
-      if (loginUsername) loginUsername.focus();
+      if (loginUsername && document.activeElement !== loginUsername && document.activeElement !== loginPassword) {
+        loginUsername.focus();
+      }
     }
 
     window.showLoginGlobal = showLogin;
@@ -3195,6 +3205,8 @@ class TabManager {
 
         currentApp = '';
 
+        if (loginPassword) loginPassword.value = '';
+
         showLogin();
 
       });
@@ -3208,6 +3220,8 @@ class TabManager {
       loginForm.addEventListener('submit', async (e) => {
 
         e.preventDefault();
+
+        isLoggingIn = true;
 
         loginError.style.display = 'none';
 
@@ -3260,6 +3274,10 @@ class TabManager {
 
           loginError.style.display = 'block';
 
+        } finally {
+
+          isLoggingIn = false;
+
         }
 
       });
@@ -3287,6 +3305,7 @@ class TabManager {
           return;
         }
       } catch (_) {}
+      if (isLoggingIn) return;
       const activeTok = sessionStorage.getItem('gtermbox_token');
       if (!activeTok || !isTokenValid(activeTok)) {
         showLogin(currentToken ? 'Session expired. Please sign in again.' : '');

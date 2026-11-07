@@ -942,6 +942,7 @@ begin
     end;
     FreeAndNil(FExtraCertContexts);
   end;
+  ElapsedMs := Round((Now - StartTime) * 86400000);
   Logger.Info('Cleanup TGHttpsServerIOCP end in %dms', [ElapsedMs]);
 
   inherited;

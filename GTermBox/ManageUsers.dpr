@@ -1,4 +1,4 @@
-{
+﻿{
   MIT License
 
   Copyright (c) (c) 2026 GECKO-71
@@ -2022,11 +2022,10 @@ begin
     Writeln('9. Edit application parameters');
     Writeln('10. Delete application');
     Writeln('11. Show application details');
-    Writeln('12. Display help documentation');
-    Writeln('13. Initialize complete GTermBox environment');
+    Writeln('12. Initialize complete GTermBox environment');
     Writeln('0. Exit');
     Writeln;
-    Write('Select option [0-13]: ');
+    Write('Select option [0-12]: ');
     Readln(Choice);
     Choice := Trim(Choice);
 
@@ -2363,8 +2362,6 @@ begin
         ShowApp(Trim(AppId));
     end
     else if Choice = '12' then
-      PrintHelp
-    else if Choice = '13' then
       InitializeEnvironment('');
     Writeln;
   end;

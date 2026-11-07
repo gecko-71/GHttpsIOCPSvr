@@ -528,12 +528,6 @@ begin
         end;
         if FileExists(FullCmd) then
         begin
-          var MasterDir := ExtractFilePath(FullCmd);
-          if SameText(ExcludeTrailingPathDelimiter(ExtractFilePath(MasterDir)), ExcludeTrailingPathDelimiter(BaseDir)) or SameText(ExcludeTrailingPathDelimiter(MasterDir), ExcludeTrailingPathDelimiter(BaseDir)) then
-          begin
-            var DstAppDir := TPath.Combine(FullSandbox, 'apps\' + LowerCase(AppId));
-            DeployAppToSandbox(MasterDir, DstAppDir);
-          end;
           ArgsStr := '';
           for I := 0 to High(AppEntry.Args) do
           begin
@@ -1534,8 +1528,9 @@ end;
 
 begin
   ConfigureFastMM;
+  GTrustedClients := TDictionary<string, string>.Create;
   try
-    GTrustedClients := TDictionary<string, string>.Create;
+    try
     Logger.WaitForFlushBeforeExit := 60;
     Logger.Providers.Add(GlobalLogFileProvider);
     Logger.Providers.Add(GlobalLogConsoleProvider);
@@ -1636,6 +1631,17 @@ begin
         if TGTermAppConfig.Instance.FindById(DeployAppId, DeployEntry) then
         begin
           DeployEntry.ToProfile(DeploySandbox);
+          var ExeDir := ExtractFilePath(ParamStr(0));
+          var RelDir := ExcludeTrailingPathDelimiter(ExtractFilePath(DeployEntry.Command));
+          if (RelDir <> '') and not TPath.IsPathRooted(DeployEntry.Command) then
+          begin
+            var SrcDir := TPath.Combine(ExeDir, RelDir);
+            var DstBase := DeploySandbox;
+            if not TPath.IsPathRooted(DstBase) then
+              DstBase := TPath.Combine(ExeDir, DstBase);
+            if TDirectory.Exists(SrcDir) then
+              DeployAppToSandbox(SrcDir, TPath.Combine(DstBase, RelDir));
+          end;
           Logger.Info(Format('[INFO] Deployed app "%s" to sandbox "%s"', [DeployAppId, DeploySandbox]));
           ExitCode := 0; Exit;
         end
@@ -5248,9 +5254,13 @@ begin
         FreeAndNil(GTrustedClients);
       Logger.Info('Server stopped cleanly.');
     end;
-  except
-    on E: Exception do
-      Logger.Critical(Format('Fatal Error [%s]: %s', [E.ClassName, E.Message]));
+    except
+      on E: Exception do
+        Logger.Critical(Format('Fatal Error [%s]: %s', [E.ClassName, E.Message]));
+    end;
+  finally
+    if Assigned(GTrustedClients) then
+      FreeAndNil(GTrustedClients);
   end;
 end.
 
