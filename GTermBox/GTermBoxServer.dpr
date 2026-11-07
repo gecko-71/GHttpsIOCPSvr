@@ -1534,9 +1534,9 @@ var
   Snaps: TArray<TGTermSessionInfo>;
   I: Integer;
   NowTick: UInt64;
-  LastLoginTick: UInt64;
   PP: TPendingSession;
   HasActiveTerminalSession: Boolean;
+  WaitCount: Integer;
 begin
   Result := False;
   AErrorMsg := '';
@@ -1545,23 +1545,32 @@ begin
   HasActiveTerminalSession := False;
   if Assigned(SessionManager) then
   begin
-    Snaps := SessionManager.GetSessionSnapshots;
-    for I := 0 to High(Snaps) do
+    for WaitCount := 0 to 6 do
     begin
-      if not Snaps[I].Closed then
+      SessionManager.CheckSessions;
+      Snaps := SessionManager.GetSessionSnapshots;
+      HasActiveTerminalSession := False;
+      for I := 0 to High(Snaps) do
       begin
-        if (AUsername <> '') and SameText(Snaps[I].Username, AUsername) then
+        if not Snaps[I].Closed then
         begin
-          HasActiveTerminalSession := True;
-          Break;
+          if (AUsername <> '') and SameText(Snaps[I].Username, AUsername) then
+          begin
+            HasActiveTerminalSession := True;
+            Break;
+          end;
         end;
       end;
+      if not HasActiveTerminalSession then
+        Break;
+      if WaitCount < 6 then
+        Sleep(50);
     end;
   end;
 
   if HasActiveTerminalSession then
   begin
-    AErrorMsg := 'Użytkownik o tym loginie jest już zalogowany w innej sesji';
+    AErrorMsg := 'User with this login or certificate is already logged in in another session';
     Exit(True);
   end;
 
@@ -1579,36 +1588,6 @@ begin
       end;
     finally
       PendingSessionsLock.Leave;
-    end;
-  end;
-
-  if Assigned(GActiveLoginsLock) and Assigned(GActiveLogins) then
-  begin
-    GActiveLoginsLock.Enter;
-    try
-      if (AUsername <> '') and GActiveLogins.TryGetValue(LowerCase(AUsername), LastLoginTick) then
-      begin
-        if (NowTick - LastLoginTick < 30000) then
-        begin
-          AErrorMsg := 'Użytkownik o tym loginie jest już zalogowany w innej sesji';
-          Exit(True);
-        end
-        else
-          GActiveLogins.Remove(LowerCase(AUsername));
-      end;
-
-      if (ACertThumbprint <> '') and Assigned(GActiveLoginsCert) and GActiveLoginsCert.TryGetValue(LowerCase(ACertThumbprint), LastLoginTick) then
-      begin
-        if (NowTick - LastLoginTick < 30000) then
-        begin
-          AErrorMsg := 'Użytkownik z tym certyfikatem jest już zalogowany w innej sesji';
-          Exit(True);
-        end
-        else
-          GActiveLoginsCert.Remove(LowerCase(ACertThumbprint));
-      end;
-    finally
-      GActiveLoginsLock.Leave;
     end;
   end;
 end;
@@ -2504,16 +2483,17 @@ begin
               LoginRateLock.Leave;
             end;
 
-            var ConflictReason: string := '';
             var ClientCertThumb: string := '';
             if ARequest.ClientCertificate.HasCertificate then
               ClientCertThumb := ARequest.ClientCertificate.ThumbprintSHA256;
-            if IsUserOrCertActive(UserEntry.Username, ClientCertThumb, ConflictReason) then
+            if Assigned(SessionManager) then
             begin
-              Logger.Warn(Format('[Security] Concurrent login blocked for user "%s": %s', [UserEntry.Username, ConflictReason]));
-              AResponse.SetStatus(409);
-              AResponse.AddJSONContent('{"error":"' + ConflictReason + '"}');
-              Exit;
+              var OldSnaps := SessionManager.GetSessionSnapshots;
+              for var OSIdx := 0 to High(OldSnaps) do
+              begin
+                if SameText(OldSnaps[OSIdx].Username, UserEntry.Username) then
+                  SessionManager.TerminateSessionById(OldSnaps[OSIdx].SessionId);
+              end;
             end;
             RegisterUserLogin(UserEntry.Username, ClientCertThumb);
 

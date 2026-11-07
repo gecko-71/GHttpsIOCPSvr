@@ -807,6 +807,7 @@ var
   Key: Pointer;
   Session: TGTermSession;
   ShouldPurge: Boolean;
+  ProcExitCode: DWORD;
 begin
   NowTick := GetTickCount64;
   KeysToPurge := TList<Pointer>.Create;
@@ -824,6 +825,9 @@ begin
 
         ShouldPurge := False;
         if Session.Closed then
+          ShouldPurge := True
+        else if Assigned(Session.ConPty) and (Session.ConPty.ProcessHandle <> 0) and
+          GetExitCodeProcess(Session.ConPty.ProcessHandle, ProcExitCode) and (ProcExitCode <> STILL_ACTIVE) then
           ShouldPurge := True
         else if (Session.WTStream = nil) and ((NowTick - Session.ConnectedTick) > 15000) then
           ShouldPurge := True
