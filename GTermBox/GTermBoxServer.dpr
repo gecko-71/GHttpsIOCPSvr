@@ -109,6 +109,9 @@ var
   WTFileLock: TCriticalSection;
   WTFileSessions: TDictionary<TWTSessionId, TWTFileSessionCtx>;
   WTFileStreams: TDictionary<HQUIC, TWTFileStreamCtx>;
+  GActiveLoginsLock: TCriticalSection;
+  GActiveLogins: TDictionary<string, UInt64>;
+  GActiveLoginsCert: TDictionary<string, UInt64>;
   BaseWebDir: string;
   CertStoreName: string;
   SubjectNameParam: string;
@@ -1526,6 +1529,138 @@ begin
   end;
 end;
 
+function IsUserOrCertActive(const AUsername, ACertThumbprint: string; out AErrorMsg: string): Boolean;
+var
+  Snaps: TArray<TGTermSessionInfo>;
+  I: Integer;
+  NowTick: UInt64;
+  LastLoginTick: UInt64;
+  PP: TPendingSession;
+  HasActiveTerminalSession: Boolean;
+begin
+  Result := False;
+  AErrorMsg := '';
+  NowTick := GetTickCount64;
+
+  HasActiveTerminalSession := False;
+  if Assigned(SessionManager) then
+  begin
+    Snaps := SessionManager.GetSessionSnapshots;
+    for I := 0 to High(Snaps) do
+    begin
+      if not Snaps[I].Closed then
+      begin
+        if (AUsername <> '') and SameText(Snaps[I].Username, AUsername) then
+        begin
+          HasActiveTerminalSession := True;
+          Break;
+        end;
+      end;
+    end;
+  end;
+
+  if HasActiveTerminalSession then
+  begin
+    AErrorMsg := 'Użytkownik o tym loginie jest już zalogowany w innej sesji';
+    Exit(True);
+  end;
+
+  if Assigned(PendingSessionsLock) and Assigned(PendingSessions) then
+  begin
+    PendingSessionsLock.Enter;
+    try
+      for PP in PendingSessions.Values do
+      begin
+        if (NowTick - PP.CreatedTick <= 15000) and (AUsername <> '') and SameText(PP.Username, AUsername) then
+        begin
+          AErrorMsg := 'Użytkownik o tym loginie jest już zalogowany w innej sesji';
+          Exit(True);
+        end;
+      end;
+    finally
+      PendingSessionsLock.Leave;
+    end;
+  end;
+
+  if Assigned(GActiveLoginsLock) and Assigned(GActiveLogins) then
+  begin
+    GActiveLoginsLock.Enter;
+    try
+      if (AUsername <> '') and GActiveLogins.TryGetValue(LowerCase(AUsername), LastLoginTick) then
+      begin
+        if (NowTick - LastLoginTick < 30000) then
+        begin
+          AErrorMsg := 'Użytkownik o tym loginie jest już zalogowany w innej sesji';
+          Exit(True);
+        end
+        else
+          GActiveLogins.Remove(LowerCase(AUsername));
+      end;
+
+      if (ACertThumbprint <> '') and Assigned(GActiveLoginsCert) and GActiveLoginsCert.TryGetValue(LowerCase(ACertThumbprint), LastLoginTick) then
+      begin
+        if (NowTick - LastLoginTick < 30000) then
+        begin
+          AErrorMsg := 'Użytkownik z tym certyfikatem jest już zalogowany w innej sesji';
+          Exit(True);
+        end
+        else
+          GActiveLoginsCert.Remove(LowerCase(ACertThumbprint));
+      end;
+    finally
+      GActiveLoginsLock.Leave;
+    end;
+  end;
+end;
+
+procedure RegisterUserLogin(const AUsername, ACertThumbprint: string);
+var
+  NowTick: UInt64;
+begin
+  if (not Assigned(GActiveLoginsLock)) or (not Assigned(GActiveLogins)) then Exit;
+  NowTick := GetTickCount64;
+  GActiveLoginsLock.Enter;
+  try
+    if AUsername <> '' then
+      GActiveLogins.AddOrSetValue(LowerCase(AUsername), NowTick);
+    if (ACertThumbprint <> '') and Assigned(GActiveLoginsCert) then
+      GActiveLoginsCert.AddOrSetValue(LowerCase(ACertThumbprint), NowTick);
+  finally
+    GActiveLoginsLock.Leave;
+  end;
+end;
+
+procedure UnregisterUserLogin(const AUsername: string);
+var
+  Snaps: TArray<TGTermSessionInfo>;
+  I: Integer;
+  StillActive: Boolean;
+begin
+  if (not Assigned(GActiveLoginsLock)) or (not Assigned(GActiveLogins)) or (AUsername = '') then Exit;
+  StillActive := False;
+  if Assigned(SessionManager) then
+  begin
+    Snaps := SessionManager.GetSessionSnapshots;
+    for I := 0 to High(Snaps) do
+    begin
+      if not Snaps[I].Closed and SameText(Snaps[I].Username, AUsername) then
+      begin
+        StillActive := True;
+        Break;
+      end;
+    end;
+  end;
+  if not StillActive then
+  begin
+    GActiveLoginsLock.Enter;
+    try
+      GActiveLogins.Remove(LowerCase(AUsername));
+    finally
+      GActiveLoginsLock.Leave;
+    end;
+  end;
+end;
+
 begin
   ConfigureFastMM;
   GTrustedClients := TDictionary<string, string>.Create;
@@ -1773,6 +1908,9 @@ begin
       WTFileLock := TCriticalSection.Create;
       WTFileSessions := TDictionary<TWTSessionId, TWTFileSessionCtx>.Create;
       WTFileStreams := TDictionary<HQUIC, TWTFileStreamCtx>.Create;
+      GActiveLoginsLock := TCriticalSection.Create;
+      GActiveLogins := TDictionary<string, UInt64>.Create;
+      GActiveLoginsCert := TDictionary<string, UInt64>.Create;
 
       Logger.Info(Format('Initializing HTTPS IOCP Server on port %d (Store: %s, Subject: %s)...', [HttpsPortParam, CertStoreName, SubjectNameParam]));
       Logger.Info(Format('Serving Web Assets from: %s', [BaseWebDir]));
@@ -2118,6 +2256,15 @@ begin
           end;
 
           ClientIP := FormatSockAddrIP(ARequest.RemoteAddr);
+          var MtlsConflictReason: string := '';
+          if IsUserOrCertActive(UserEntry.Username, ARequest.ClientCertificate.ThumbprintSHA256, MtlsConflictReason) then
+          begin
+            Logger.Warn(Format('[mTLS] Concurrent login blocked for user "%s": %s', [UserEntry.Username, MtlsConflictReason]));
+            AResponse.SetStatus(409);
+            AResponse.AddJSONContent('{"error":"' + MtlsConflictReason + '"}');
+            Exit;
+          end;
+          RegisterUserLogin(UserEntry.Username, ARequest.ClientCertificate.ThumbprintSHA256);
           Claims := TJSONObject.Create;
           try
             Claims.AddPair('role', UserEntry.Role);
@@ -2357,6 +2504,19 @@ begin
               LoginRateLock.Leave;
             end;
 
+            var ConflictReason: string := '';
+            var ClientCertThumb: string := '';
+            if ARequest.ClientCertificate.HasCertificate then
+              ClientCertThumb := ARequest.ClientCertificate.ThumbprintSHA256;
+            if IsUserOrCertActive(UserEntry.Username, ClientCertThumb, ConflictReason) then
+            begin
+              Logger.Warn(Format('[Security] Concurrent login blocked for user "%s": %s', [UserEntry.Username, ConflictReason]));
+              AResponse.SetStatus(409);
+              AResponse.AddJSONContent('{"error":"' + ConflictReason + '"}');
+              Exit;
+            end;
+            RegisterUserLogin(UserEntry.Username, ClientCertThumb);
+
             var HasFilesAppClaim: Boolean;
 
             Claims := TJSONObject.Create;
@@ -2444,6 +2604,22 @@ begin
           end;
           try
             AServer.JWTManager.RevokeToken(TokenStr);
+            if Assigned(GActiveLoginsLock) and Assigned(GActiveLogins) then
+            begin
+              GActiveLoginsLock.Enter;
+              try
+                GActiveLogins.Remove(LowerCase(JWT.Subject));
+              finally
+                GActiveLoginsLock.Leave;
+              end;
+            end;
+            if Assigned(SessionManager) then
+            begin
+              var LogoutSnaps := SessionManager.GetSessionSnapshots;
+              for var LSIdx := 0 to High(LogoutSnaps) do
+                if SameText(LogoutSnaps[LSIdx].Username, JWT.Subject) then
+                  SessionManager.TerminateSessionById(LogoutSnaps[LSIdx].SessionId);
+            end;
             PendingSessionsLock.Enter;
             try
               var ToRemove := TList<string>.Create;
@@ -4378,10 +4554,22 @@ begin
           end;
         end,
         procedure(SessionId: TWTSessionId)
+        var
+          SnapTerm: TGTermSession;
+          ClosedUser: string;
         begin
+          ClosedUser := '';
+          if Assigned(SessionManager) then
+          begin
+            SnapTerm := SessionManager.FindSession(Pointer(SessionId));
+            if Assigned(SnapTerm) then
+              ClosedUser := SnapTerm.Username;
+          end;
           Logger.Info(Format('[WT] Client disconnected (SessionId: %d)', [SessionId]));
           if Assigned(SessionManager) then
             SessionManager.UnregisterAndFreeSession(Pointer(SessionId));
+          if ClosedUser <> '' then
+            UnregisterUserLogin(ClosedUser);
         end
       );
 
@@ -5250,6 +5438,9 @@ begin
         FreeAndNil(WTFileSessions);
       end;
       FreeAndNil(WTFileLock);
+      FreeAndNil(GActiveLogins);
+      FreeAndNil(GActiveLoginsCert);
+      FreeAndNil(GActiveLoginsLock);
       if Assigned(GTrustedClients) then
         FreeAndNil(GTrustedClients);
       Logger.Info('Server stopped cleanly.');
