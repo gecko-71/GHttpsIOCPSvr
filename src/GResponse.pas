@@ -500,11 +500,18 @@ begin
   begin
     FSourceFileStream.Free;
     FSourceFileStream := nil;
-    FSourceFilePath := '';
-    if (FSourceFilePath <> '') and
-        SameText(TPath.GetDirectoryName(FSourceFilePath), FResponseTempDir) and
-           TFile.Exists(FSourceFilePath) then
+  end;
+  if (FSourceFilePath <> '') and
+     SameText(ExcludeTrailingPathDelimiter(TPath.GetDirectoryName(FSourceFilePath)),
+              ExcludeTrailingPathDelimiter(FResponseTempDir)) and
+     TFile.Exists(FSourceFilePath) then
+  begin
+    try
       TFile.Delete(FSourceFilePath);
+    except
+      on E: Exception do
+        Logger.Warn(Format('Failed to delete source temp file "%s": %s', [FSourceFilePath, E.Message]));
+    end;
   end;
   FSourceFilePath := '';
   FUseSourceFile := False;
@@ -1014,6 +1021,7 @@ end;
 procedure TResponse.AddStreamContent(AContentType: string; ASourceStream: TStream);
 var
   TempFilePath: string;
+  TempFileStream: TFileStream;
 begin
   CleanupSourceFile;
   if not Assigned(ASourceStream) or (ASourceStream.Size = 0) then
@@ -1022,8 +1030,8 @@ begin
     Exit;
   end;
   try
-    TempFilePath :=   GetNewTempFilePath('.bin');
-    var TempFileStream := TFileStream.Create(TempFilePath, fmCreate);
+    TempFilePath := GetNewTempFilePath('.bin');
+    TempFileStream := TFileStream.Create(TempFilePath, fmCreate);
     try
       ASourceStream.Position := 0;
       TempFileStream.CopyFrom(ASourceStream, ASourceStream.Size);
@@ -1032,7 +1040,6 @@ begin
     end;
     FSourceFilePath := TempFilePath;
     FSourceFileStream := TFileStream.Create(FSourceFilePath, fmOpenRead or fmShareDenyWrite);
-    FSourceFilePath := TPath.GetFileName(TempFilePath);
     FSourceFileSize := FSourceFileStream.Size;
     FUseSourceFile := True;
     FStorageMode := csmFile;
@@ -1983,16 +1990,22 @@ begin
     if (FTotalContentSize < 128) or not FileExists(FTempFilePath) then
       Exit;
     try
-      CleanupTempFile;
-      RawBytes := TFile.ReadAllBytes(FTempFilePath);
+      if Assigned(FTempFileStream) then
+      begin
+        SetLength(RawBytes, FTempFileStream.Size);
+        FTempFileStream.Position := 0;
+        if Length(RawBytes) > 0 then
+          FTempFileStream.ReadBuffer(RawBytes[0], Length(RawBytes));
+      end
+      else
+        RawBytes := TFile.ReadAllBytes(FTempFilePath);
       if TargetEncoding = 'gzip' then
         Compressed := CompressBytesGzip(RawBytes)
       else
         Compressed := CompressBytesDeflate(RawBytes);
       if (Length(Compressed) > 0) and (Length(Compressed) < Length(RawBytes)) then
       begin
-        TFile.Delete(FTempFilePath);
-        FTempFilePath := '';
+        CleanupTempFile;
         FStorageMode := csmMemory;
         FContentBytes := Compressed;
         FTotalContentSize := Length(Compressed);
@@ -2014,13 +2027,18 @@ begin
           SetOrUpdateHeader('Vary', CurrentVary + ', Accept-Encoding');
         Result := True;
       end
-      else
+      else if not Assigned(FTempFileStream) then
       begin
         EnsureTempFile;
-        FTempFileStream.WriteBuffer(RawBytes[0], Length(RawBytes));
+        if Length(RawBytes) > 0 then
+          FTempFileStream.WriteBuffer(RawBytes[0], Length(RawBytes));
       end;
     except
-      Result := False;
+      on E: Exception do
+      begin
+        Logger.Error('Compression failed in file mode: ' + E.Message);
+        Result := False;
+      end;
     end;
   end;
 end;
