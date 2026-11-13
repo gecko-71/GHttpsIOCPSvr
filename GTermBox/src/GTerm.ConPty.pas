@@ -1324,7 +1324,7 @@ begin
               var SidStr := string(StrSid);
               var PermStr: string;
               if AFullAccess then PermStr := ':(OI)(CI)F' else PermStr := ':(OI)(CI)RX';
-              var IcaclsCmd := Format('icacls "%s" /grant "*%s%s" /T /Q', [ADir, SidStr, PermStr]);
+              var IcaclsCmd := Format('icacls "%s" /grant "*%s%s" /T /Q', [ExcludeTrailingPathDelimiter(ADir), SidStr, PermStr]);
               var SI: TStartupInfo;
               var PI: TProcessInformation;
               FillChar(SI, SizeOf(SI), 0);

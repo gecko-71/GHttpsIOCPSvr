@@ -63,6 +63,7 @@ type
     FIncomingBuffer: TBytes;
     FFramePayloadBuffer: TBytes;
     FCurrentOpcode: TWebSocketOpcode;
+    FFragmentInProgress: Boolean;
     FWriteQueue: TQueue<TBytes>;
     FLock: TCriticalSection;
     FLastActivityTime: UInt64;
@@ -159,8 +160,14 @@ begin
 
   if Frame.PayloadLen = 126 then
   begin
-    if Length(RawData) - LocalOffset < 2 then Exit;
+    if Length(RawData) - LocalOffset < 2 then
+      Exit;
     Frame.PayloadLen := (RawData[LocalOffset] shl 8) or RawData[LocalOffset + 1];
+    if Frame.PayloadLen < 126 then
+    begin
+      ErrorMsg := 'Non-minimal 16-bit payload length encoding (RFC 6455 5.2)';
+      Exit;
+    end;
     Inc(LocalOffset, 2);
   end
   else if Frame.PayloadLen = 127 then
@@ -177,6 +184,11 @@ begin
     for I := 0 to 7 do
       Frame.PayloadLen := (Frame.PayloadLen shl 8) or UInt64(RawData[LocalOffset + I]);
     {$IFDEF OVERFLOWCHECKS_ON}{$Q+}{$ENDIF}
+    if Frame.PayloadLen < 65536 then
+    begin
+      ErrorMsg := 'Non-minimal 64-bit payload length encoding (RFC 6455 5.2)';
+      Exit;
+    end;
     Inc(LocalOffset, 8);
   end;
 
@@ -501,17 +513,11 @@ begin
 
         Unmask(Frame);
 
-        if (Frame.Opcode = wsOpText) and not TWebSocketFrame.IsValidUTF8(Frame.Payload) then
-        begin
-          QueueSendFrame(wsOpClose, [$03, $EF]);
-          CloseConnection := True;
-          Exit;
-        end;
-
         if Frame.Opcode in [wsOpClose, wsOpPing, wsOpPong] then
         begin
           if not Frame.Fin then
           begin
+            QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
             CloseConnection := True;
             Exit;
           end;
@@ -585,8 +591,9 @@ begin
         FLastActivityTime := GetTickCount64;
         if Frame.Opcode = wsOpText then
         begin
-          if Length(FFramePayloadBuffer) > 0 then
+          if FFragmentInProgress then
           begin
+            QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
             CloseConnection := True;
             Exit;
           end;
@@ -597,12 +604,14 @@ begin
             Exit;
           end;
           FCurrentOpcode := wsOpText;
+          FFragmentInProgress := not Frame.Fin;
           FFramePayloadBuffer := Copy(Frame.Payload, 0, Length(Frame.Payload));
         end
         else if Frame.Opcode = wsOpBinary then
         begin
-          if Length(FFramePayloadBuffer) > 0 then
+          if FFragmentInProgress then
           begin
+            QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
             CloseConnection := True;
             Exit;
           end;
@@ -613,12 +622,14 @@ begin
             Exit;
           end;
           FCurrentOpcode := wsOpBinary;
+          FFragmentInProgress := not Frame.Fin;
           FFramePayloadBuffer := Copy(Frame.Payload, 0, Length(Frame.Payload));
         end
         else if Frame.Opcode = wsOpContinuation then
         begin
-          if Length(FFramePayloadBuffer) = 0 then
+          if not FFragmentInProgress then
           begin
+            QueueSendFrame(wsOpClose, TBytes.Create($03, $EA));
             CloseConnection := True;
             Exit;
           end;
@@ -636,10 +647,18 @@ begin
             SetLength(FFramePayloadBuffer, OldLen + Length(Frame.Payload));
             Move(Frame.Payload[0], FFramePayloadBuffer[OldLen], Length(Frame.Payload));
           end;
+          FFragmentInProgress := not Frame.Fin;
         end;
 
         if Frame.Fin and (Frame.Opcode in [wsOpText, wsOpBinary, wsOpContinuation]) then
         begin
+          if (FCurrentOpcode = wsOpText) and not TWebSocketFrame.IsValidUTF8(FFramePayloadBuffer) then
+          begin
+            SetLength(FFramePayloadBuffer, 0);
+            QueueSendFrame(wsOpClose, TBytes.Create($03, $EF));
+            CloseConnection := True;
+            Exit;
+          end;
           MsgList.Add(Copy(FFramePayloadBuffer, 0, Length(FFramePayloadBuffer)));
           SetLength(FFramePayloadBuffer, 0);
         end;
@@ -672,13 +691,16 @@ var
   CurrentChunk: TBytes;
   CurrentOpcode: TWebSocketOpcode;
   IsFin: Boolean;
+  Lock: TCriticalSection;
+  Remaining: Integer;
+  Len: Integer;
 begin
   ChunkSize := 8192;
 
   if Length(Payload) <= ChunkSize then
   begin
     RawFrame := TWebSocketFrame.Encode(Opcode, Payload, True);
-    var Lock := FLock;
+    Lock := FLock;
     if Assigned(Lock) then
     begin
       Lock.Acquire;
@@ -692,35 +714,34 @@ begin
   end
   else
   begin
-    Offset := 0;
-    CurrentOpcode := Opcode;
-    while Offset < Length(Payload) do
+    Lock := FLock;
+    if Assigned(Lock) then
     begin
-      var Remaining := Length(Payload) - Offset;
-      var Len := ChunkSize;
-      if Remaining < Len then
-        Len := Remaining;
+      Lock.Acquire;
+      try
+        Offset := 0;
+        CurrentOpcode := Opcode;
+        while Offset < Length(Payload) do
+        begin
+          Remaining := Length(Payload) - Offset;
+          Len := ChunkSize;
+          if Remaining < Len then
+            Len := Remaining;
 
-      SetLength(CurrentChunk, Len);
-      Move(Payload[Offset], CurrentChunk[0], Len);
+          SetLength(CurrentChunk, Len);
+          Move(Payload[Offset], CurrentChunk[0], Len);
 
-      IsFin := (Offset + Len) >= Length(Payload);
-      RawFrame := TWebSocketFrame.Encode(CurrentOpcode, CurrentChunk, IsFin);
-
-      var Lock := FLock;
-      if Assigned(Lock) then
-      begin
-        Lock.Acquire;
-        try
+          IsFin := (Offset + Len) >= Length(Payload);
+          RawFrame := TWebSocketFrame.Encode(CurrentOpcode, CurrentChunk, IsFin);
           if Assigned(FWriteQueue) then
             FWriteQueue.Enqueue(RawFrame);
-        finally
-          Lock.Leave;
-        end;
-      end;
 
-      Inc(Offset, Len);
-      CurrentOpcode := wsOpContinuation;
+          Inc(Offset, Len);
+          CurrentOpcode := wsOpContinuation;
+        end;
+      finally
+        Lock.Leave;
+      end;
     end;
   end;
 end;

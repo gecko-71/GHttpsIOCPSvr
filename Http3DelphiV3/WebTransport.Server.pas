@@ -236,6 +236,10 @@ var
 
   TrimmedOrigin: string;
 
+  OrigHost: string;
+
+  AuthHost: string;
+
 begin
 
   Result := False;
@@ -270,7 +274,7 @@ begin
 
 
 
-    var OrigHost := TrimmedOrigin;
+    OrigHost := TrimmedOrigin;
 
     if Pos('://', OrigHost) > 0 then
 
@@ -280,7 +284,7 @@ begin
 
       OrigHost := Copy(OrigHost, 1, Pos('/', OrigHost) - 1);
 
-    var AuthHost := AAuthority;
+    AuthHost := AAuthority;
 
     if (Length(AuthHost) > 0) and (AuthHost[1] = '[') then
 
@@ -412,6 +416,8 @@ var
 
   HasSession: Boolean;
 
+  Svr: TQuicServer;
+
 begin
 
   if ConnectStream = nil then Exit;
@@ -442,7 +448,7 @@ begin
 
         begin
 
-          var Svr := TQuicServer(PConnectionContext(SessCtx.ConnCtx).Server);
+          Svr := TQuicServer(PConnectionContext(SessCtx.ConnCtx).Server);
 
           if Svr.MsQuic <> nil then
 
@@ -576,6 +582,8 @@ var
 
   LimitExceeded: Boolean;
 
+  AuthorityVal: string;
+
 begin
 
   Result := False;
@@ -604,7 +612,7 @@ begin
 
   Request.TryGetHeader('origin', OriginVal);
 
-  var AuthorityVal: string := Request.Authority;
+  AuthorityVal := Request.Authority;
 
 
 
@@ -1080,7 +1088,7 @@ begin
 
 
 
-              if (Pair.Value.StreamId = SessionId) or (Pair.Value.SessionId = SessionId) then
+              if Pair.Value.StreamId = SessionId then
 
               begin
 
@@ -1108,7 +1116,7 @@ begin
 
                 if (Pair.Value.Connection = Connection) and
 
-                   ((Pair.Value.StreamId = SessionId) or (Pair.Value.SessionId = SessionId)) then
+                   (Pair.Value.StreamId = SessionId) then
 
                 begin
 
@@ -1144,7 +1152,7 @@ begin
 
             begin
 
-              if SessCtx.StreamCount >= 256 then
+              if SessCtx.StreamCount >= WT_MAX_STREAMS_PER_SESSION then
 
               begin
 
@@ -1328,7 +1336,7 @@ begin
 
       if (Pair.Value.Connection = Connection) and
 
-         ((Pair.Value.StreamId = TargetSessionId) or (Pair.Value.SessionId = TargetSessionId) or
+         ((Pair.Value.StreamId = TargetSessionId) or
 
           ((Pair.Value.StreamId shr 2) = QuarterStreamId)) then
 
@@ -1447,7 +1455,7 @@ begin
 
 
 
-  Status := Api.StreamSend(ConnectStream, @SendCtx.QuicBuffer, 1, QUIC_SEND_FLAG_NONE, SendCtx);
+  Status := Api.StreamSend(ConnectStream, @SendCtx.QuicBuffer, 1, QUIC_SEND_FLAG_FIN, SendCtx);
 
   if QuicFailed(Status) then
 

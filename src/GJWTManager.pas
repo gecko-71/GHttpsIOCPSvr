@@ -105,8 +105,8 @@ type
     FRevocationLock: TCriticalSection;
     FRevocationStorePath: string;
     function ValidateAlgorithm(const Algorithm: string): Boolean;
-    function CreateSignature(const HeaderPayload: string): string;
-    function VerifySignature(const HeaderPayload, Signature: string): Boolean;
+    function CreateSignature(const HeaderPayload: string; const Algorithm: string = 'HS256'): string;
+    function VerifySignature(const HeaderPayload, Signature: string; const Algorithm: string = 'HS256'): Boolean;
     function SecureCompare(const A, B: string): Boolean;
     function DecodeBase64Url(const Input: string): string;
     function EncodeBase64Url(const Input: TBytes): string;
@@ -288,7 +288,9 @@ end;
 function TJWTManager.IsValidSecretKey(const Key: string): Boolean;
 var
   UniqueChars: Integer;
-  CharSet: set of AnsiChar;
+  Seen: TList<Char>;
+  I: Integer;
+  C: Char;
 begin
   Result := False;
   if Length(Key) < 32 then
@@ -297,17 +299,23 @@ begin
     Exit;
 
   UniqueChars := 0;
-  CharSet := [];
-  for var C in Key do
-  begin
-    var AC: AnsiChar := AnsiChar(C);
-    if not (AC in CharSet) then
+  Seen := TList<Char>.Create;
+  try
+    for I := 1 to Length(Key) do
     begin
-      Include(CharSet, AC);
-      Inc(UniqueChars);
+      C := Key[I];
+      if not Seen.Contains(C) then
+      begin
+        Seen.Add(C);
+        Inc(UniqueChars);
+        if UniqueChars >= 16 then
+          Break;
+      end;
     end;
+    Result := UniqueChars >= 16;
+  finally
+    Seen.Free;
   end;
-  Result := UniqueChars >= 16;
 end;
 
 function TJWTManager.ValidateAlgorithm(const Algorithm: string): Boolean;
@@ -408,15 +416,34 @@ begin
   end;
 end;
 
-function TJWTManager.CreateSignature(const HeaderPayload: string): string;
-const
-  BlockSize = 64;
+function TJWTManager.CreateSignature(const HeaderPayload: string; const Algorithm: string): string;
 var
+  BlockSize: Integer;
+  ShaVer: THashSHA2.TSHA2Version;
   DataBytes, KeyBytes, PaddedKey, o_key_pad, i_key_pad, InnerHash, OuterHash, HashedKey: TBytes;
-  i: Integer;
-  KeyAnsi: AnsiString;
+  InnerData, OuterData: TBytes;
+  KeyStream, InStream, OutStream: TBytesStream;
+  I: Integer;
 begin
   Result := '';
+  if SameText(Algorithm, 'HS256') then
+  begin
+    ShaVer := THashSHA2.TSHA2Version.SHA256;
+    BlockSize := 64;
+  end
+  else if SameText(Algorithm, 'HS384') then
+  begin
+    ShaVer := THashSHA2.TSHA2Version.SHA384;
+    BlockSize := 128;
+  end
+  else if SameText(Algorithm, 'HS512') then
+  begin
+    ShaVer := THashSHA2.TSHA2Version.SHA512;
+    BlockSize := 128;
+  end
+  else
+    Exit;
+
   DataBytes := TEncoding.UTF8.GetBytes(HeaderPayload);
   KeyBytes := TEncoding.UTF8.GetBytes(FSecretKey);
   SetLength(PaddedKey, BlockSize);
@@ -424,50 +451,53 @@ begin
 
   if Length(KeyBytes) > BlockSize then
   begin
-    SetString(KeyAnsi, PAnsiChar(KeyBytes), Length(KeyBytes));
-    HashedKey := THashSHA2.GetHashBytes(string(KeyAnsi), THashSHA2.TSHA2Version.SHA256);
-    Move(HashedKey[0], PaddedKey[0], Length(HashedKey));
+    KeyStream := TBytesStream.Create(KeyBytes);
+    try
+      HashedKey := THashSHA2.GetHashBytes(KeyStream, ShaVer);
+    finally
+      KeyStream.Free;
+    end;
+    if Length(HashedKey) > 0 then
+      Move(HashedKey[0], PaddedKey[0], Min(Length(HashedKey), BlockSize));
   end
-  else
+  else if Length(KeyBytes) > 0 then
     Move(KeyBytes[0], PaddedKey[0], Length(KeyBytes));
 
   SetLength(o_key_pad, BlockSize);
   SetLength(i_key_pad, BlockSize);
-  for i := 0 to BlockSize - 1 do
+  for I := 0 to BlockSize - 1 do
   begin
-    i_key_pad[i] := PaddedKey[i] xor $36;
-    o_key_pad[i] := PaddedKey[i] xor $5C;
+    i_key_pad[I] := PaddedKey[I] xor $36;
+    o_key_pad[I] := PaddedKey[I] xor $5C;
   end;
-  var InnerData := i_key_pad + DataBytes;
-  var InStream := TBytesStream.Create(InnerData);
+  InnerData := i_key_pad + DataBytes;
+  InStream := TBytesStream.Create(InnerData);
   try
-    InnerHash := THashSHA2.GetHashBytes(InStream, THashSHA2.TSHA2Version.SHA256);
+    InnerHash := THashSHA2.GetHashBytes(InStream, ShaVer);
   finally
     InStream.Free;
   end;
 
-  var OuterData := o_key_pad + InnerHash;
-  var OutStream := TBytesStream.Create(OuterData);
+  OuterData := o_key_pad + InnerHash;
+  OutStream := TBytesStream.Create(OuterData);
   try
-    OuterHash := THashSHA2.GetHashBytes(OutStream, THashSHA2.TSHA2Version.SHA256);
+    OuterHash := THashSHA2.GetHashBytes(OutStream, ShaVer);
   finally
     OutStream.Free;
   end;
 
   Result := EncodeBase64Url(OuterHash);
-
 end;
 
-function TJWTManager.VerifySignature(const HeaderPayload, Signature: string): Boolean;
+function TJWTManager.VerifySignature(const HeaderPayload, Signature: string; const Algorithm: string): Boolean;
 var
   ExpectedSignature: string;
 begin
   try
-    ExpectedSignature := CreateSignature(HeaderPayload);
+    ExpectedSignature := CreateSignature(HeaderPayload, Algorithm);
     Result := (ExpectedSignature <> '') and SecureCompare(ExpectedSignature, Signature);
     if not Result then
       LogSecurityEvent('Invalid signature detected.');
-
   except
     on E: Exception do
     begin
@@ -482,6 +512,10 @@ var
   ExpTime, IatTime, NbfTime: Int64;
   CurrentTime: TDateTime;
   ClaimValue: string;
+  AudValue: TJSONValue;
+  AudArr: TJSONArray;
+  AudMatched: Boolean;
+  I: Integer;
 begin
   Result := False;
   Error := jeNone;
@@ -493,7 +527,8 @@ begin
     begin
       if CurrentTime > IncSecond(UnixToDateTime(ExpTime), FClockSkewTolerance) then
       begin
-        Error := jeExpiredToken; ErrorMsg := 'Token has expired';
+        Error := jeExpiredToken;
+        ErrorMsg := 'Token has expired';
         LogSecurityEvent('Expired token', Format('Exp: %s, Now: %s', [DateTimeToStr(UnixToDateTime(ExpTime)), DateTimeToStr(CurrentTime)]));
         Exit;
       end;
@@ -503,7 +538,8 @@ begin
     begin
       if UnixToDateTime(IatTime) > IncSecond(CurrentTime, FClockSkewTolerance) then
       begin
-        Error := jeTokenFromFuture; ErrorMsg := 'Token issued in the future (iat claim)';
+        Error := jeTokenFromFuture;
+        ErrorMsg := 'Token issued in the future (iat claim)';
         LogSecurityEvent('Token from future', Format('Iat: %s, Now: %s', [DateTimeToStr(UnixToDateTime(IatTime)), DateTimeToStr(CurrentTime)]));
         Exit;
       end;
@@ -513,34 +549,57 @@ begin
     begin
       if CurrentTime < IncSecond(UnixToDateTime(NbfTime), -FClockSkewTolerance) then
       begin
-        Error := jeNotYetValid; ErrorMsg := 'Token is not yet valid (nbf claim)';
+        Error := jeNotYetValid;
+        ErrorMsg := 'Token is not yet valid (nbf claim)';
         LogSecurityEvent('Token not yet valid', Format('Nbf: %s, Now: %s', [DateTimeToStr(UnixToDateTime(NbfTime)), DateTimeToStr(CurrentTime)]));
         Exit;
       end;
     end;
-    if (FIssuer <> '') and PayloadObj.TryGetValue<string>('iss', ClaimValue) then
+
+    if FIssuer <> '' then
     begin
-      if ClaimValue <> FIssuer then
+      if (not PayloadObj.TryGetValue<string>('iss', ClaimValue)) or (ClaimValue <> FIssuer) then
       begin
-        Error := jeInvalidIssuer; ErrorMsg := 'Invalid issuer';
+        Error := jeInvalidIssuer;
+        ErrorMsg := 'Invalid issuer';
         LogSecurityEvent('Invalid issuer', Format('Expected: %s, Got: %s', [FIssuer, ClaimValue]));
         Exit;
       end;
     end;
-    if (FAudience <> '') and PayloadObj.TryGetValue<string>('aud', ClaimValue) then
+
+    if FAudience <> '' then
     begin
-      if ClaimValue <> FAudience then
+      AudMatched := False;
+      AudValue := PayloadObj.GetValue('aud');
+      if AudValue is TJSONString then
+        AudMatched := (TJSONString(AudValue).Value = FAudience)
+      else if AudValue is TJSONArray then
       begin
-        Error := jeInvalidAudience; ErrorMsg := 'Invalid audience';
-        LogSecurityEvent('Invalid audience', Format('Expected: %s, Got: %s', [FAudience, ClaimValue]));
+        AudArr := TJSONArray(AudValue);
+        for I := 0 to AudArr.Count - 1 do
+        begin
+          if (AudArr.Items[I] is TJSONString) and (TJSONString(AudArr.Items[I]).Value = FAudience) then
+          begin
+            AudMatched := True;
+            Break;
+          end;
+        end;
+      end;
+      if not AudMatched then
+      begin
+        Error := jeInvalidAudience;
+        ErrorMsg := 'Invalid audience';
+        LogSecurityEvent('Invalid audience', Format('Expected: %s', [FAudience]));
         Exit;
       end;
     end;
+
     Result := True;
   except
     on E: Exception do
     begin
-      Error := jeParsingError; ErrorMsg := 'Error validating claims: ' + E.Message;
+      Error := jeParsingError;
+      ErrorMsg := 'Error validating claims: ' + E.Message;
       LogSecurityEvent('Claims validation error', E.Message);
       Result := False;
     end;
@@ -702,7 +761,8 @@ var
   Error: TJWTError;
   ErrorMsg: string;
   ExpTime, IatTime, NbfTime: Int64;
-  SubValue, IssValue, AudValue, JtiValue: string;
+  SubValue, IssValue, AudValue, JtiValue, AlgValue: string;
+  DecHeaderStr, DecPayloadStr: string;
 begin
   Result := False;
   JWT := TJWTToken.Create;
@@ -739,7 +799,7 @@ begin
       JWT.Signature := TokenParts[2];
 
 
-      var DecHeaderStr := DecodeBase64Url(JWT.Header);
+      DecHeaderStr := DecodeBase64Url(JWT.Header);
       HeaderObj := ParseJsonSafely(DecHeaderStr);
       if not Assigned(HeaderObj) then
       begin
@@ -757,7 +817,9 @@ begin
         raise Exception.Create(JWT.ErrorMessage);
       end;
 
-      if not VerifySignature(JWT.Header + '.' + JWT.Payload, JWT.Signature) then
+      AlgValue := '';
+      HeaderObj.TryGetValue<string>('alg', AlgValue);
+      if not VerifySignature(JWT.Header + '.' + JWT.Payload, JWT.Signature, AlgValue) then
       begin
         JWT.LastError := jeInvalidSignature;
         JWT.ErrorMessage := 'Invalid token signature.';
@@ -765,7 +827,7 @@ begin
         raise Exception.Create(JWT.ErrorMessage);
       end;
 
-      var DecPayloadStr := DecodeBase64Url(JWT.Payload);
+      DecPayloadStr := DecodeBase64Url(JWT.Payload);
       PayloadObj := ParseJsonSafely(DecPayloadStr);
       if not Assigned(PayloadObj) then
       begin
@@ -912,6 +974,8 @@ function TJWTManager.RefreshToken(const Token: string; out NewToken: string; con
 var
   JWT: TJWTToken;
   CustomClaims: TJSONObject;
+  Pair: TJSONPair;
+  FailReason: string;
 begin
   Result := False;
   NewToken := '';
@@ -920,12 +984,18 @@ begin
   try
     if not ValidateToken(Token, JWT, ClientId) then
     begin
-      LogSecurityEvent('Token refresh failed', 'The provided token is invalid. Reason: ' + JWT.ErrorMessage);
+      if Assigned(JWT) then
+        FailReason := JWT.ErrorMessage
+      else
+        FailReason := 'Token validation failed';
+      LogSecurityEvent('Token refresh failed', 'The provided token is invalid. Reason: ' + FailReason);
       Exit;
     end;
     CustomClaims := TJSONObject.Create;
     if Assigned(JWT.Decoded) then
-      for var Pair in JWT.Decoded do
+    begin
+      for Pair in JWT.Decoded do
+      begin
         if not (SameText(Pair.JsonString.Value, 'sub') or
                 SameText(Pair.JsonString.Value, 'iss') or
                 SameText(Pair.JsonString.Value, 'aud') or
@@ -934,6 +1004,8 @@ begin
                 SameText(Pair.JsonString.Value, 'nbf') or
                 SameText(Pair.JsonString.Value, 'jti')) then
           CustomClaims.AddPair(Pair.JsonString.Value, Pair.JsonValue.Clone as TJSONValue);
+      end;
+    end;
 
     Sleep(1);
     NewToken := CreateToken(JWT.Subject, CustomClaims);

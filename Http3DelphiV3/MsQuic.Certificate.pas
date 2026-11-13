@@ -136,10 +136,24 @@ implementation
 function TMsQuicCertificate.HexToBytes(const Hex: string): TBytes;
 var
   I: Integer;
+  ByteVal: Integer;
+  CleanHex: string;
 begin
-  SetLength(Result, Length(Hex) div 2);
-  for I := 1 to Length(Hex) div 2 do
-    Result[I - 1] := StrToInt('$' + Copy(Hex, (I - 1) * 2 + 1, 2));
+  Result := nil;
+  CleanHex := Trim(Hex);
+  if (CleanHex = '') or ((Length(CleanHex) mod 2) <> 0) then
+    Exit;
+
+  SetLength(Result, Length(CleanHex) div 2);
+  for I := 1 to Length(CleanHex) div 2 do
+  begin
+    if not TryStrToInt('$' + Copy(CleanHex, (I - 1) * 2 + 1, 2), ByteVal) then
+    begin
+      Result := nil;
+      Exit;
+    end;
+    Result[I - 1] := Byte(ByteVal);
+  end;
 end;
 
 constructor TMsQuicCertificate.Create;
@@ -224,12 +238,15 @@ begin
     if CertHashHex <> '' then
     begin
       HashData := HexToBytes(CertHashHex);
-      HashBytes.cbData := Length(HashData);
-      HashBytes.pbData := @HashData[0];
-      pSearchContext := CertFindCertificateInStore(
-        hStoreToSearch, X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, 0,
-        CERT_FIND_SHA1_HASH, @HashBytes, nil
-      );
+      if Length(HashData) > 0 then
+      begin
+        HashBytes.cbData := Length(HashData);
+        HashBytes.pbData := @HashData[0];
+        pSearchContext := CertFindCertificateInStore(
+          hStoreToSearch, X509_ASN_ENCODING or PKCS_7_ASN_ENCODING, 0,
+          CERT_FIND_SHA1_HASH, @HashBytes, nil
+        );
+      end;
     end;
 
     if pSearchContext = nil then

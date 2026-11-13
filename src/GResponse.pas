@@ -434,10 +434,26 @@ begin
   end;
 end;
 
+function StripHeaderCRLF(const S: string): string;
+begin
+  Result := StringReplace(S, #13, '', [rfReplaceAll]);
+  Result := StringReplace(Result, #10, '', [rfReplaceAll]);
+  Result := StringReplace(Result, #0, '', [rfReplaceAll]);
+end;
+
+function EscapeHtmlStr(const S: string): string;
+begin
+  Result := StringReplace(S, '&', '&amp;', [rfReplaceAll]);
+  Result := StringReplace(Result, '<', '&lt;', [rfReplaceAll]);
+  Result := StringReplace(Result, '>', '&gt;', [rfReplaceAll]);
+  Result := StringReplace(Result, '"', '&quot;', [rfReplaceAll]);
+  Result := StringReplace(Result, '''', '&#39;', [rfReplaceAll]);
+end;
+
 procedure TResponse.SetOrUpdateHeader(const Name, Value: string);
 begin
   RemoveHeader(Name);
-  FHeaders.Add(Name + ': ' + Value);
+  FHeaders.Add(StripHeaderCRLF(Name) + ': ' + StripHeaderCRLF(Value));
 end;
 
 function TResponse.HasHeader(const Name: string): Boolean;
@@ -631,7 +647,7 @@ end;
 procedure TResponse.AddHeader(const Name, Value: string);
 begin
   try
-    FHeaders.Add(Name + ': ' + Value);
+    FHeaders.Add(StripHeaderCRLF(Name) + ': ' + StripHeaderCRLF(Value));
   except
     on E: Exception do
       raise Exception.CreateFmt('Failed to add header: %s', [E.Message]);
@@ -1374,9 +1390,7 @@ begin
         if StartsText('Content-Length:', FinalHeaders[I]) then
           FinalHeaders.Delete(I);
       if (FStatus <> hsNoContent) and (FStatus <> hsNotModified) then
-        FinalHeaders.Insert(1, 'Content-Length: ' + IntToStr(FTotalContentSize))
-      else
-        FinalHeaders.Insert(1, 'Content-Length: 0');
+        FinalHeaders.Insert(1, 'Content-Length: ' + IntToStr(FTotalContentSize));
       var HasServer: Boolean := False;
       var HasDate: Boolean := False;
       var HasConnection: Boolean := False;
@@ -1583,6 +1597,7 @@ begin
     ErrorMessage := Message;
     if ErrorMessage = '' then
       ErrorMessage := StatusText;
+    ErrorMessage := EscapeHtmlStr(ErrorMessage);
 
     ErrorHTML := Format(
       '<!DOCTYPE html>'#13#10 +
@@ -1612,6 +1627,7 @@ end;
 procedure TResponse.SetRedirect(const URL: string; Permanent: Boolean = False);
 var
   RedirectHTML: string;
+  SafeURL: string;
   Status: THttpStatus;
 begin
   try
@@ -1620,6 +1636,7 @@ begin
     else
       Status := hsFound;
 
+    SafeURL := EscapeHtmlStr(StripHeaderCRLF(URL));
     RedirectHTML := Format(
       '<!DOCTYPE html>'#13#10 +
       '<html lang="en">'#13#10 +
@@ -1634,7 +1651,7 @@ begin
       '  <p>If you are not redirected automatically, <a href="%s">click here</a>.</p>'#13#10 +
       '</body>'#13#10 +
       '</html>',
-      [URL, URL]);
+      [SafeURL, SafeURL]);
 
     SetStatus(Status);
     AddHeader('Location', URL);
@@ -1673,16 +1690,12 @@ begin
   try
     if Trim(URL) = '' then
       raise Exception.Create('Redirect URL cannot be empty');
-    SafeURL := StringReplace(URL, '&', '&amp;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '<', '&lt;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '>', '&gt;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '"', '&quot;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '''', '&#39;', [rfReplaceAll]);
+    SafeURL := EscapeHtmlStr(StripHeaderCRLF(URL));
     RedirectHTML := Format(
       '<!DOCTYPE html>'#13#10 +
       '<html><head><title>See Other</title></head>'#13#10 +
       '<body><h1>See Other</h1><p>The resource has been moved to: <a href="%s">%s</a></p></body>'#13#10 +
-      '</html>', [URL, SafeURL]);
+      '</html>', [SafeURL, SafeURL]);
     SetStatus(hsSeeOther);
     AddHeader('Location', URL);
     AddHeader('Cache-Control', 'no-cache');
@@ -1701,16 +1714,12 @@ begin
   try
     if Trim(URL) = '' then
       raise Exception.Create('Redirect URL cannot be empty');
-    SafeURL := StringReplace(URL, '&', '&amp;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '<', '&lt;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '>', '&gt;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '"', '&quot;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '''', '&#39;', [rfReplaceAll]);
+    SafeURL := EscapeHtmlStr(StripHeaderCRLF(URL));
     RedirectHTML := Format(
       '<!DOCTYPE html>'#13#10 +
       '<html><head><title>Temporary Redirect</title></head>'#13#10 +
       '<body><h1>Temporary Redirect</h1><p>The resource has been temporarily moved to: <a href="%s">%s</a></p></body>'#13#10 +
-      '</html>', [URL, SafeURL]);
+      '</html>', [SafeURL, SafeURL]);
 
     SetStatus(hsTemporaryRedirect);
     AddHeader('Location', URL);
@@ -1743,16 +1752,12 @@ begin
   try
     if Trim(URL) = '' then
       raise Exception.Create('Redirect URL cannot be empty');
-    SafeURL := StringReplace(URL, '&', '&amp;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '<', '&lt;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '>', '&gt;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '"', '&quot;', [rfReplaceAll]);
-    SafeURL := StringReplace(SafeURL, '''', '&#39;', [rfReplaceAll]);
+    SafeURL := EscapeHtmlStr(StripHeaderCRLF(URL));
     RedirectHTML := Format(
       '<!DOCTYPE html>'#13#10 +
       '<html><head><title>Permanent Redirect</title></head>'#13#10 +
       '<body><h1>Permanent Redirect</h1><p>The resource has been permanently moved to: <a href="%s">%s</a></p></body>'#13#10 +
-      '</html>', [URL, SafeURL]);
+      '</html>', [SafeURL, SafeURL]);
     SetStatus(hsPermanentRedirect);
     AddHeader('Location', URL);
     AddHeader('Cache-Control', 'public, max-age=31536000');
@@ -1765,27 +1770,48 @@ end;
 
 function TResponse.GetBodyBytes: TBytes;
 var
-  Stream: TMemoryStream;
-  Buffer: array[0..65535] of Byte;
-  ReadBytes: Integer;
+  SavedPos: Int64;
 begin
   FinalizeContent;
-  FHeadersSent := True;
-  Stream := TMemoryStream.Create;
-  try
-    repeat
-      ReadBytes := ReadNextChunk(@Buffer[0], SizeOf(Buffer));
-      if ReadBytes > 0 then
-        Stream.WriteBuffer(Buffer[0], ReadBytes);
-    until ReadBytes <= 0;
-    SetLength(Result, Stream.Size);
-    if Stream.Size > 0 then
-    begin
-      Stream.Position := 0;
-      Stream.ReadBuffer(Result[0], Stream.Size);
+  SetLength(Result, 0);
+  if (FStatus = hsNoContent) or (FStatus = hsNotModified) then
+    Exit;
+  if FIsMultipart and not FMultipartBuilt then
+    BuildMultipartContent;
+  if FUseSourceFile and Assigned(FSourceFileStream) then
+  begin
+    SavedPos := FSourceFileStream.Position;
+    try
+      SetLength(Result, FSourceFileSize);
+      if FSourceFileSize > 0 then
+      begin
+        FSourceFileStream.Position := 0;
+        FSourceFileStream.ReadBuffer(Result[0], FSourceFileSize);
+      end;
+    finally
+      FSourceFileStream.Position := SavedPos;
     end;
-  finally
-    Stream.Free;
+    Exit;
+  end;
+  if FStorageMode = csmMemory then
+  begin
+    if not FContentBytesBuilt then
+      BuildContentBytes;
+    Result := Copy(FContentBytes, 0, Length(FContentBytes));
+  end
+  else if (FStorageMode = csmFile) and Assigned(FTempFileStream) then
+  begin
+    SavedPos := FTempFileStream.Position;
+    try
+      SetLength(Result, FTotalContentSize);
+      if FTotalContentSize > 0 then
+      begin
+        FTempFileStream.Position := 0;
+        FTempFileStream.ReadBuffer(Result[0], FTotalContentSize);
+      end;
+    finally
+      FTempFileStream.Position := SavedPos;
+    end;
   end;
 end;
 

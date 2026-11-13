@@ -198,17 +198,22 @@ begin
       repeat
         if (Rec.Name <> '.') and (Rec.Name <> '..') then
         begin
+          if ((Rec.FindData.dwFileAttributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) or
+             ((Rec.Attr and faSymLink) <> 0) then
+            Continue;
+
           ItemPath := Path + Rec.Name;
           ItemAttr := GetFileAttributesW(PWideChar(ItemPath));
-          if (ItemAttr <> INVALID_FILE_ATTRIBUTES) and
-             ((ItemAttr and FILE_ATTRIBUTE_REPARSE_POINT) = 0) and
-             ((Rec.Attr and faSymLink) = 0) then
-          begin
-            if ((Rec.Attr and faDirectory) <> 0) and ((ItemAttr and FILE_ATTRIBUTE_DIRECTORY) <> 0) then
-              Inc(Result, GetDirectoryTotalSize(ItemPath, ADepth + 1))
-            else if (ItemAttr and FILE_ATTRIBUTE_DIRECTORY) = 0 then
-              Inc(Result, Rec.Size);
-          end;
+          if (ItemAttr = INVALID_FILE_ATTRIBUTES) or
+             ((ItemAttr and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+            Continue;
+
+          if ((Rec.FindData.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) or
+             ((Rec.Attr and faDirectory) <> 0) or
+             ((ItemAttr and FILE_ATTRIBUTE_DIRECTORY) <> 0) then
+            Inc(Result, GetDirectoryTotalSize(ItemPath, ADepth + 1))
+          else
+            Inc(Result, Rec.Size);
         end;
       until FindNext(Rec) <> 0;
     finally
@@ -1656,9 +1661,10 @@ begin
     with GlobalLogFileProvider do
     begin
       FileName := LogDir + '\GTermBoxServer.log';
-      DailyRotate := True;
+      DailyRotate := False;
       MaxFileSizeInMB := 50;
       LogLevel := LOG_ALL;
+      AutoFlush := True;
       Enabled := True;
     end;
 
@@ -2012,6 +2018,7 @@ begin
         var
           HtmlFile: string;
         begin
+          Logger.Info('[WEB] GET /');
           HtmlFile := TPath.Combine(BaseWebDir, 'index.html');
           if TFile.Exists(HtmlFile) then
             AResponse.AddHTMLContent(TFile.ReadAllText(HtmlFile, TEncoding.UTF8))
@@ -2025,6 +2032,7 @@ begin
         var
           FilePath: string;
         begin
+          Logger.Info('[WEB] GET /lib/xterm.js');
           FilePath := TPath.Combine(BaseWebDir, 'lib' + PathDelim + 'xterm.js');
           if TFile.Exists(FilePath) then
             AResponse.AddTextContent('application/javascript; charset=utf-8', TFile.ReadAllText(FilePath, TEncoding.UTF8))
@@ -2038,6 +2046,7 @@ begin
         var
           FilePath: string;
         begin
+          Logger.Info('[WEB] GET /lib/xterm.css');
           FilePath := TPath.Combine(BaseWebDir, 'lib' + PathDelim + 'xterm.css');
           if TFile.Exists(FilePath) then
             AResponse.AddTextContent('text/css; charset=utf-8', TFile.ReadAllText(FilePath, TEncoding.UTF8))
@@ -2051,6 +2060,7 @@ begin
         var
           FilePath: string;
         begin
+          Logger.Info('[WEB] GET /lib/addon-fit.js');
           FilePath := TPath.Combine(BaseWebDir, 'lib' + PathDelim + 'addon-fit.js');
           if TFile.Exists(FilePath) then
             AResponse.AddTextContent('application/javascript; charset=utf-8', TFile.ReadAllText(FilePath, TEncoding.UTF8))

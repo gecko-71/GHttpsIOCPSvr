@@ -174,6 +174,9 @@ end;
 function THttp3RequestData.AddHeader(const AName, AValue: string): Boolean;
 var
   LowerName: string;
+  I: Integer;
+  Ch: Char;
+  Dummy: string;
 begin
   if (Length(AName) > 256) or (Length(AValue) > 4096) or (Length(AName) + Length(AValue) > 8192) then
   begin
@@ -183,7 +186,39 @@ begin
     Exit(False);
   end;
 
-  LowerName := LowerCase(Trim(AName));
+  if AName = '' then
+  begin
+    FHasInvalidHeader := True;
+    FErrorMessage := 'Empty header name';
+    FErrorCode := H3_MESSAGE_ERROR;
+    Exit(False);
+  end;
+
+  for I := 1 to Length(AName) do
+  begin
+    Ch := AName[I];
+    if ((Ch >= 'A') and (Ch <= 'Z')) or (Ord(Ch) <= 32) or (Ord(Ch) >= 127) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Invalid character in header name: ' + AName;
+      FErrorCode := H3_MESSAGE_ERROR;
+      Exit(False);
+    end;
+  end;
+
+  for I := 1 to Length(AValue) do
+  begin
+    Ch := AValue[I];
+    if (Ch = #0) or (Ch = #10) or (Ch = #13) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Invalid control character in header value';
+      FErrorCode := H3_MESSAGE_ERROR;
+      Exit(False);
+    end;
+  end;
+
+  LowerName := AName;
 
   if (LowerName = 'connection') or (LowerName = 'keep-alive') or
      (LowerName = 'proxy-connection') or (LowerName = 'transfer-encoding') or
@@ -195,7 +230,7 @@ begin
     Exit(False);
   end;
 
-  if (Length(LowerName) > 0) and (LowerName[1] = ':') then
+  if LowerName[1] = ':' then
   begin
     if FHasRegularHeaderSeen then
     begin
@@ -206,10 +241,21 @@ begin
     end;
     if not ((LowerName = ':method') or (LowerName = ':path') or
             (LowerName = ':scheme') or (LowerName = ':authority') or
-            (LowerName = ':protocol') or (LowerName = ':status')) then
+            (LowerName = ':protocol')) then
     begin
       FHasInvalidHeader := True;
-      FErrorMessage := 'Unknown pseudo-header: ' + LowerName;
+      FErrorMessage := 'Unknown or invalid request pseudo-header: ' + LowerName;
+      FErrorCode := H3_MESSAGE_ERROR;
+      Exit(False);
+    end;
+    if ((LowerName = ':method') and (FMethod <> '')) or
+       ((LowerName = ':path') and (FPath <> '')) or
+       ((LowerName = ':scheme') and (FScheme <> '')) or
+       ((LowerName = ':authority') and (FAuthority <> '')) or
+       ((LowerName = ':protocol') and TryGetHeader(':protocol', Dummy)) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Duplicate pseudo-header: ' + LowerName;
       FErrorCode := H3_MESSAGE_ERROR;
       Exit(False);
     end;
@@ -329,24 +375,9 @@ end;
 
 destructor THttp3ConnectionState.Destroy;
 begin
-  if FMsQuicApi <> nil then
-  begin
-    if FControlStream <> nil then
-    begin
-      FMsQuicApi.StreamClose(FControlStream);
-      FControlStream := nil;
-    end;
-    if FQpackEncoderStream <> nil then
-    begin
-      FMsQuicApi.StreamClose(FQpackEncoderStream);
-      FQpackEncoderStream := nil;
-    end;
-    if FQpackDecoderStream <> nil then
-    begin
-      FMsQuicApi.StreamClose(FQpackDecoderStream);
-      FQpackDecoderStream := nil;
-    end;
-  end;
+  FControlStream := nil;
+  FQpackEncoderStream := nil;
+  FQpackDecoderStream := nil;
 
   FQpackEncoder.Free;
   FQpackDecoder.Free;

@@ -1063,6 +1063,8 @@
 
               e.preventDefault();
 
+              e.stopPropagation();
+
               const code = key === 'o' ? '\x0f' : (key === 's' ? '\x13' : '\x10');
 
               this.sendInput(code);
@@ -2575,6 +2577,8 @@ class TabManager {
 
 
     window.addEventListener('keydown', (e) => {
+
+      if (e.defaultPrevented) return;
 
       if (e.ctrlKey && !e.altKey && !e.shiftKey) {
 

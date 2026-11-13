@@ -280,6 +280,8 @@ procedure TQuicServer.OnNewConnection(Sender: TObject; Connection: HQUIC; const 
 var
   ConnCtx: PConnectionContext;
   RemoteIP: string;
+  ServerNameAnsi: AnsiString;
+  ConfigStatus: QUIC_STATUS;
 begin
   AcceptConnection := True;
   if TInterlocked.CompareExchange(FShuttingDown, 0, 0) = 1 then
@@ -289,11 +291,17 @@ begin
     Exit;
   end;
 
-  if (FRequiredServerName <> '') and ((Info = nil) or (Info.ServerNameLength = 0) or (Info.ServerName = nil) or (not SameText(string(PAnsiChar(Info.ServerName)), FRequiredServerName))) then
+  if FRequiredServerName <> '' then
   begin
-    TInterlocked.Increment(FRejectedConnCount);
-    AcceptConnection := False;
-    Exit;
+    ServerNameAnsi := '';
+    if (Info <> nil) and (Info.ServerNameLength > 0) and (Info.ServerName <> nil) then
+      SetString(ServerNameAnsi, PAnsiChar(Info.ServerName), Info.ServerNameLength);
+    if not SameText(string(ServerNameAnsi), FRequiredServerName) then
+    begin
+      TInterlocked.Increment(FRejectedConnCount);
+      AcceptConnection := False;
+      Exit;
+    end;
   end;
 
   if TInterlocked.CompareExchange(FActiveConnCount, 0, 0) >= 4096 then
@@ -349,9 +357,15 @@ begin
     FConnectionsLock.Leave;
   end;
 
+  FAllConnsClosed.ResetEvent;
   TInterlocked.Increment(FActiveConnCount);
   FMsQuic.Api.SetCallbackHandler(Connection, @TQuicServer.ConnectionCallback, ConnCtx);
-  FMsQuic.Api.ConnectionSetConfiguration(Connection, FConfiguration.Handle);
+  ConfigStatus := FMsQuic.Api.ConnectionSetConfiguration(Connection, FConfiguration.Handle);
+  if QuicFailed(ConfigStatus) then
+  begin
+    Logger.Error('[QUIC] ConnectionSetConfiguration failed: 0x%x', [ConfigStatus]);
+    FMsQuic.Api.ConnectionShutdown(Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+  end;
 end;
 
 class function TQuicServer.ConnectionCallback(Connection: HQUIC; Context: Pointer; Event: PQUIC_CONNECTION_EVENT): QUIC_STATUS; cdecl;
@@ -368,6 +382,7 @@ var
   i: Integer;
   HexStr: string;
   SysTime: TSystemTime;
+  CaSigned: Boolean;
   RawBytes: TBytes;
   VerifyFlags: DWORD;
 begin
@@ -499,7 +514,7 @@ begin
                 ConnCtx.ClientCertInfo.ValidationError := 'Client certificate not yet valid';
               end;
 
-              var CaSigned: Boolean := False;
+              CaSigned := False;
               if (Server <> nil) and (Server.FCACertContext <> nil) then
               begin
                 VerifyFlags := CERT_STORE_SIGNATURE_FLAG or CERT_STORE_TIME_FLAG;
@@ -692,10 +707,7 @@ begin
       QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
         begin
           if (Server <> nil) and (Server.FMsQuic <> nil) and (Server.FMsQuic.Api <> nil) then
-          begin
-            const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
-            Server.FMsQuic.Api.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-          end;
+            Server.FMsQuic.Api.StreamShutdown(Stream, 1, 0);
         end;
 
       QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
@@ -703,18 +715,14 @@ begin
           if (Server <> nil) and (Server.FMsQuic <> nil) and (Server.FMsQuic.Api <> nil) then
           begin
             Logger.Debug('[QUIC] Stream %p aborted by client (RESET_STREAM, Error code: 0x%x)', [Pointer(Stream), Event.ErrorCode]);
-            const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
-            Server.FMsQuic.Api.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, Event.ErrorCode);
+            Server.FMsQuic.Api.StreamShutdown(Stream, 1, Event.ErrorCode);
           end;
         end;
 
       QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
         begin
           if (Server <> nil) and (Server.FMsQuic <> nil) and (Server.FMsQuic.Api <> nil) then
-          begin
-            const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = 1;
-            Server.FMsQuic.Api.StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, Event.ErrorCode);
-          end;
+            Server.FMsQuic.Api.StreamShutdown(Stream, 1, Event.ErrorCode);
         end;
 
       QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
@@ -738,6 +746,7 @@ procedure TQuicServer.Start(Port: Word);
 var
   Settings: QUIC_SETTINGS;
   MemCounters: TProcessMemoryCounters;
+  RetryPercent: UInt16;
 begin
   Logger.Info('Initializing TQuicServer (including msquic.dll loading) on port %d...', [Port]);
 
@@ -749,7 +758,7 @@ begin
 
   if FForceStatelessRetry and (FMsQuic.Api <> nil) then
   begin
-    var RetryPercent: UInt16 := 0;
+    RetryPercent := 0;
     FMsQuic.Api.SetParam(nil, $01000000, SizeOf(RetryPercent), @RetryPercent);
   end;
 
@@ -818,6 +827,8 @@ procedure TQuicServer.Stop;
 var
   MemCounters: TProcessMemoryCounters;
   ConnPtr: Pointer;
+  ConnsToShutdown: TArray<Pointer>;
+  I: Integer;
 begin
   if TInterlocked.Exchange(FShuttingDown, 1) = 1 then
     Exit;
@@ -843,15 +854,22 @@ begin
 
   FConnectionsLock.Enter;
   try
+    SetLength(ConnsToShutdown, FActiveConnections.Count);
+    I := 0;
     for ConnPtr in FActiveConnections do
     begin
-      if (FMsQuic <> nil) and (FMsQuic.Api <> nil) and (ConnPtr <> nil) then
-      begin
-        FMsQuic.Api.ConnectionShutdown(HQUIC(ConnPtr), QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-      end;
+      ConnsToShutdown[I] := ConnPtr;
+      Inc(I);
     end;
   finally
     FConnectionsLock.Leave;
+  end;
+
+  for I := 0 to Length(ConnsToShutdown) - 1 do
+  begin
+    ConnPtr := ConnsToShutdown[I];
+    if (FMsQuic <> nil) and (FMsQuic.Api <> nil) and (ConnPtr <> nil) then
+      FMsQuic.Api.ConnectionShutdown(HQUIC(ConnPtr), QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
   end;
 
   if FActiveConnCount > 0 then

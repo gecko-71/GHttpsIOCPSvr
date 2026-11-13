@@ -174,6 +174,7 @@ type
     FCurrentLength: Int64;
     FTempFilePath: string;
     FTempFileStream: TFileStream;
+    FRawBuffer: TMemoryStream;
     function DetectEncodingFromContentType(const ContentType: string): TEncoding;
     function DetectEncodingFromBOM(const Data: TBytes): TEncoding;
     procedure InitializeDiskStorage;
@@ -737,6 +738,7 @@ begin
   FCurrentLength := 0;
   FTempFilePath := '';
   FTempFileStream := nil;
+  FRawBuffer := TMemoryStream.Create;
   if FUseDiskStorage and Assigned(FDiskFileManager) then
      InitializeDiskStorage;
 end;
@@ -744,6 +746,7 @@ end;
 destructor TTextBodyPart.Destroy;
 begin
   FinalizeDiskStorage;
+  FRawBuffer.Free;
   FContent.Free;
   inherited Destroy;
 end;
@@ -786,6 +789,7 @@ procedure TTextBodyPart.Clear;
 begin
   inherited Clear;
   FContent.Clear;
+  FRawBuffer.Clear;
   FCurrentLength := 0;
   FExpectedLength := -1;
 
@@ -906,7 +910,24 @@ begin
     end
     else
     begin
-      if FContent.Count > 0 then
+      if FRawBuffer.Size > 0 then
+      begin
+        SetLength(FileContent, FRawBuffer.Size);
+        Move(FRawBuffer.Memory^, FileContent[0], FRawBuffer.Size);
+        try
+          Result := FEncoding.GetString(FileContent);
+        except
+          on E: EEncodingError do
+          begin
+            try
+              Result := TEncoding.UTF8.GetString(FileContent);
+            except
+              Result := TEncoding.ANSI.GetString(FileContent);
+            end;
+          end;
+        end;
+      end
+      else if FContent.Count > 0 then
       begin
         for var i := 0 to FContent.Count - 1 do
           Result := Result + FContent[i];
@@ -1090,7 +1111,6 @@ end;
 function TTextBodyPart.AppendData(const Data: array of Byte; Size: Integer): Boolean;
 var
   DataBytes: TBytes;
-  TextData: string;
   NewLength: Int64;
 begin
   Result := False;
@@ -1126,19 +1146,8 @@ begin
     end
     else
     begin
-      try
-        TextData := FEncoding.GetString(DataBytes);
-      except
-        on E: Exception do
-        begin
-          SetError('Failed to decode text data: ' + E.Message);
-          Exit;
-        end;
-      end;
-      if FContent.Count = 0 then
-         FContent.Add(TextData)
-      else
-         FContent[FContent.Count - 1] := FContent[FContent.Count - 1] + TextData;
+      FRawBuffer.Position := FRawBuffer.Size;
+      FRawBuffer.WriteBuffer(DataBytes[0], Size);
     end;
     FCurrentLength := NewLength;
     FSize := FCurrentLength;
@@ -1468,7 +1477,7 @@ begin
       FTempFilePath := '';
       Result := True;
     end
-    else if FStream.Size > 0 then
+    else if Assigned(FStream) then
     begin
       FStream.SaveToFile(DestFileName);
       FStream.Clear;
@@ -2048,16 +2057,30 @@ begin
       bpsWaitingData:
       begin
         BoundaryPos := FindBoundary(BufferBytes, BufferPos, IsFinalBoundary);
-        if (BoundaryPos = 0) then
+        if BoundaryPos >= 0 then
         begin
-          BufferPos := Length(FBoundaryBytes);
-          if (BufferPos + 1 < Length(BufferBytes)) and (BufferBytes[BufferPos] = 13) and (BufferBytes[BufferPos+1] = 10) then
-            Inc(BufferPos, 2);
-          FParseState := bpsParsingHeaders;
-        end else
+          BufferPos := BoundaryPos + Length(FBoundaryBytes);
+          if IsFinalBoundary then
+          begin
+            if (BufferPos + 1 < Length(BufferBytes)) and
+               (BufferBytes[BufferPos] = Ord('-')) and
+               (BufferBytes[BufferPos + 1] = Ord('-')) then
+              Inc(BufferPos, 2);
+            FParseState := bpsComplete;
+          end
+          else
+          begin
+            if (BufferPos + 1 < Length(BufferBytes)) and (BufferBytes[BufferPos] = 13) and (BufferBytes[BufferPos + 1] = 10) then
+              Inc(BufferPos, 2)
+            else if (BufferPos < Length(BufferBytes)) and (BufferBytes[BufferPos] = 10) then
+              Inc(BufferPos, 1);
+            FParseState := bpsParsingHeaders;
+          end;
+        end
+        else
         begin
-          if Length(BufferBytes) > (Length(FBoundaryBytes) + 10) then
-              SetError('Invalid multipart format: missing initial boundary at position 0');
+          if Length(BufferBytes) > (16384 + Length(FBoundaryBytes)) then
+            SetError('Invalid multipart format: missing initial boundary');
           Break;
         end;
       end;
@@ -2189,7 +2212,9 @@ var
   Line: string;
   ColonPos: Integer;
   HeaderName, HeaderValue, Disposition, PartName, Filename: string;
-  TrimmedPart: string;
+  DispIdx, DispLen: Integer;
+  ParamName, ParamVal: string;
+  Ch: Char;
 begin
   FHeaderBuffer.Clear;
   PartName := 'part_' + IntToStr(FParts.Count);
@@ -2206,14 +2231,67 @@ begin
       if HeaderName = 'content-disposition' then
       begin
         Disposition := HeaderValue;
-        var Parts := Disposition.Split([';']);
-        for var partStr in Parts do
+        DispIdx := 1;
+        DispLen := Length(Disposition);
+        while DispIdx <= DispLen do
         begin
-          TrimmedPart := Trim(partStr);
-          if TrimmedPart.StartsWith('name=') then
-            PartName := Trim(StringReplace(TrimmedPart.Substring(5), '"', '', [rfReplaceAll]))
-          else if TrimmedPart.StartsWith('filename=') then
-            Filename := Trim(StringReplace(TrimmedPart.Substring(9), '"', '', [rfReplaceAll]));
+          while (DispIdx <= DispLen) and CharInSet(Disposition[DispIdx], [' ', #9, ';']) do
+            Inc(DispIdx);
+          if DispIdx > DispLen then
+            Break;
+          ParamName := '';
+          while (DispIdx <= DispLen) and not CharInSet(Disposition[DispIdx], ['=', ';']) do
+          begin
+            ParamName := ParamName + Disposition[DispIdx];
+            Inc(DispIdx);
+          end;
+          ParamName := LowerCase(Trim(ParamName));
+          ParamVal := '';
+          if (DispIdx <= DispLen) and (Disposition[DispIdx] = '=') then
+          begin
+            Inc(DispIdx);
+            while (DispIdx <= DispLen) and CharInSet(Disposition[DispIdx], [' ', #9]) do
+              Inc(DispIdx);
+            if (DispIdx <= DispLen) and (Disposition[DispIdx] = '"') then
+            begin
+              Inc(DispIdx);
+              while DispIdx <= DispLen do
+              begin
+                Ch := Disposition[DispIdx];
+                if (Ch = '\') and (DispIdx < DispLen) then
+                begin
+                  Inc(DispIdx);
+                  ParamVal := ParamVal + Disposition[DispIdx];
+                  Inc(DispIdx);
+                end
+                else if Ch = '"' then
+                begin
+                  Inc(DispIdx);
+                  Break;
+                end
+                else
+                begin
+                  ParamVal := ParamVal + Ch;
+                  Inc(DispIdx);
+                end;
+              end;
+              while (DispIdx <= DispLen) and (Disposition[DispIdx] <> ';') do
+                Inc(DispIdx);
+            end
+            else
+            begin
+              while (DispIdx <= DispLen) and (Disposition[DispIdx] <> ';') do
+              begin
+                ParamVal := ParamVal + Disposition[DispIdx];
+                Inc(DispIdx);
+              end;
+              ParamVal := Trim(ParamVal);
+            end;
+          end;
+          if ParamName = 'name' then
+            PartName := ParamVal
+          else if ParamName = 'filename' then
+            Filename := ParamVal;
         end;
       end;
     end;
@@ -2227,17 +2305,23 @@ begin
       TBinaryBodyPart(FCurrentPart).FileName := Filename;
       if (Filename <> '') and not ValidateFilename(Filename) then
       begin
-        FCurrentPart.SetError('Disallowed file extension: ' + Filename);
+        FCurrentPart.Free;
+        FCurrentPart := nil;
         SetError('Disallowed file extension: ' + Filename);
-      end;
-      if (FCurrentPart.ContentType <> '') and not ValidateMimeType(FCurrentPart.ContentType) then
-      begin
-        FCurrentPart.SetError('Blocked MIME type: ' + FCurrentPart.ContentType);
-        SetError('Blocked MIME type: ' + FCurrentPart.ContentType);
+        Exit;
       end;
     end;
+    if (FCurrentPart.ContentType <> '') and not ValidateMimeType(FCurrentPart.ContentType) then
+    begin
+      HeaderValue := FCurrentPart.ContentType;
+      FCurrentPart.Free;
+      FCurrentPart := nil;
+      SetError('Blocked MIME type: ' + HeaderValue);
+      Exit;
+    end;
     FParts.Add(FCurrentPart);
-  end else
+  end
+  else
     SetError('Failed to create body part from headers.');
 end;
 
@@ -2254,12 +2338,18 @@ end;
 function TMultipartBodyPart.ValidateFilename(const Filename: string): Boolean;
 var
   Extension: string;
+  I: Integer;
 begin
   Result := True;
   if (Filename = '') or not Assigned(FSecuritySettings) then
     Exit;
   if Length(Filename) > FSecuritySettings.MaxFilenameLength then
     Exit(False);
+  if (Pos('..', Filename) > 0) or (Pos('/', Filename) > 0) or (Pos('\', Filename) > 0) or (Pos(':', Filename) > 0) then
+    Exit(False);
+  for I := 1 to Length(Filename) do
+    if (Ord(Filename[I]) <= 31) or (Ord(Filename[I]) = 127) then
+      Exit(False);
   if FSecuritySettings.AllowedFileExtensions.Count > 0 then
   begin
     Extension := LowerCase(ExtractFileExt(Filename));
@@ -2268,11 +2358,20 @@ begin
 end;
 
 function TMultipartBodyPart.ValidateMimeType(const MimeType: string): Boolean;
+var
+  BaseMime: string;
+  SemicolonPos: Integer;
 begin
   Result := True;
   if (MimeType = '') or not Assigned(FSecuritySettings) then
     Exit;
-  Result := FSecuritySettings.BlockedMimeTypes.IndexOf(LowerCase(MimeType)) = -1;
+  SemicolonPos := Pos(';', MimeType);
+  if SemicolonPos > 0 then
+    BaseMime := Copy(MimeType, 1, SemicolonPos - 1)
+  else
+    BaseMime := MimeType;
+  BaseMime := LowerCase(Trim(BaseMime));
+  Result := FSecuritySettings.BlockedMimeTypes.IndexOf(BaseMime) = -1;
 end;
 
 function TMultipartBodyPart.CreatePartFromHeaders: TBodyPart;
@@ -2488,31 +2587,81 @@ end;
 
 function THttpBodyParser.ExtractBoundary(const ContentTypeHeader: string): string;
 var
-  BoundaryPos: Integer;
-  BoundaryStart: Integer;
-  BoundaryEnd: Integer;
-  BoundaryValue: string;
+  I, Len: Integer;
+  ParamName, ParamVal: string;
+  Ch: Char;
 begin
   Result := '';
-  BoundaryPos := Pos('boundary=', LowerCase(ContentTypeHeader));
-  if BoundaryPos > 0 then
+  I := 1;
+  Len := Length(ContentTypeHeader);
+  while I <= Len do
   begin
-    BoundaryStart := BoundaryPos + 9;
-    if (BoundaryStart <= Length(ContentTypeHeader)) and (ContentTypeHeader[BoundaryStart] = '"') then
+    while (I <= Len) and not CharInSet(ContentTypeHeader[I], [';', '"']) do
+      Inc(I);
+    if I > Len then
+      Exit;
+    if ContentTypeHeader[I] = '"' then
     begin
-      Inc(BoundaryStart);
-      BoundaryEnd := Pos('"', ContentTypeHeader, BoundaryStart);
-      if BoundaryEnd = 0 then
-        BoundaryEnd := Length(ContentTypeHeader) + 1;
-    end
-    else
-    begin
-      BoundaryEnd := Pos(';', ContentTypeHeader, BoundaryStart);
-      if BoundaryEnd = 0 then
-        BoundaryEnd := Length(ContentTypeHeader) + 1;
+      Inc(I);
+      while I <= Len do
+      begin
+        if (ContentTypeHeader[I] = '\') and (I < Len) then
+          Inc(I, 2)
+        else if ContentTypeHeader[I] = '"' then
+        begin
+          Inc(I);
+          Break;
+        end
+        else
+          Inc(I);
+      end;
+      Continue;
     end;
-    BoundaryValue := Copy(ContentTypeHeader, BoundaryStart, BoundaryEnd - BoundaryStart);
-    Result := Trim(BoundaryValue);
+    Inc(I);
+    while (I <= Len) and CharInSet(ContentTypeHeader[I], [' ', #9]) do
+      Inc(I);
+    ParamName := '';
+    while (I <= Len) and not CharInSet(ContentTypeHeader[I], ['=', ';']) do
+    begin
+      ParamName := ParamName + ContentTypeHeader[I];
+      Inc(I);
+    end;
+    if (I <= Len) and (ContentTypeHeader[I] = '=') and SameText(ParamName, 'boundary') then
+    begin
+      Inc(I);
+      ParamVal := '';
+      if (I <= Len) and (ContentTypeHeader[I] = '"') then
+      begin
+        Inc(I);
+        while I <= Len do
+        begin
+          Ch := ContentTypeHeader[I];
+          if (Ch = '\') and (I < Len) then
+          begin
+            Inc(I);
+            ParamVal := ParamVal + ContentTypeHeader[I];
+            Inc(I);
+          end
+          else if Ch = '"' then
+            Break
+          else
+          begin
+            ParamVal := ParamVal + Ch;
+            Inc(I);
+          end;
+        end;
+      end
+      else
+      begin
+        while (I <= Len) and not CharInSet(ContentTypeHeader[I], [';', ' ', #9]) do
+        begin
+          ParamVal := ParamVal + ContentTypeHeader[I];
+          Inc(I);
+        end;
+      end;
+      Result := Trim(ParamVal);
+      Exit;
+    end;
   end;
 end;
 
@@ -2648,8 +2797,12 @@ var
   EndPtr: PByte;
 begin
   Result := False;
-  if FHasError or FIsComplete then Exit(True);
-  if Size <= 0 then Exit(True);
+  if FHasError then
+    Exit(False);
+  if FIsComplete then
+    Exit(True);
+  if Size <= 0 then
+    Exit(True);
 
   if not FIsChunked then
   begin
@@ -2753,23 +2906,59 @@ begin
         end;
         2:
         begin
-          if (EndPtr - P) >= 2 then
+          if FCurrentChunkSize = 0 then
           begin
-            if (P^ = 13) and ((P+1)^ = 10) then
+            if (EndPtr - P) >= 2 then
             begin
-              FBuffer.Position := FBuffer.Position + 2;
-              if FCurrentChunkSize = 0 then
+              if (P^ = 13) and ((P + 1)^ = 10) then
               begin
+                FBuffer.Position := FBuffer.Position + 2;
                 FIsComplete := True;
                 Break;
-              end else
-                FChunkState := 0;
-            end else
+              end
+              else
+              begin
+                LineEndPos := -1;
+                P := Pointer(IntPtr(FBuffer.Memory) + FBuffer.Position);
+                while P < (EndPtr - 1) do
+                begin
+                  if (P^ = 13) and ((P + 1)^ = 10) then
+                  begin
+                    LineEndPos := P - PByte(FBuffer.Memory);
+                    Break;
+                  end;
+                  Inc(P);
+                end;
+                if LineEndPos > -1 then
+                begin
+                  if (LineEndPos - FBuffer.Position) > 8192 then
+                  begin
+                    SetError('Chunk trailer line exceeds maximum allowed length');
+                    Exit;
+                  end;
+                  FBuffer.Position := LineEndPos + 2;
+                end
+                else
+                  Break;
+              end;
+            end
+            else
+              Break;
+          end
+          else if (EndPtr - P) >= 2 then
+          begin
+            if (P^ = 13) and ((P + 1)^ = 10) then
+            begin
+              FBuffer.Position := FBuffer.Position + 2;
+              FChunkState := 0;
+            end
+            else
             begin
               SetError('Missing CRLF after chunk data');
               Exit;
             end;
-          end else
+          end
+          else
             Break;
         end;
       end;
@@ -2962,15 +3151,27 @@ end;
 function THttpBodyParser.ValidateFilename(const Filename: string): Boolean;
 var
   Extension: string;
+  I: Integer;
 begin
   Result := True;
   if Filename = '' then
-     Exit;
+    Exit;
   if Length(Filename) > FSecuritySettings.MaxFilenameLength then
   begin
     Result := False;
     Exit;
   end;
+  if (Pos('..', Filename) > 0) or (Pos('/', Filename) > 0) or (Pos('\', Filename) > 0) or (Pos(':', Filename) > 0) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  for I := 1 to Length(Filename) do
+    if (Ord(Filename[I]) <= 31) or (Ord(Filename[I]) = 127) then
+    begin
+      Result := False;
+      Exit;
+    end;
   if FSecuritySettings.AllowedFileExtensions.Count > 0 then
   begin
     Extension := LowerCase(ExtractFileExt(Filename));
@@ -2979,11 +3180,20 @@ begin
 end;
 
 function THttpBodyParser.ValidateMimeType(const MimeType: string): Boolean;
+var
+  BaseMime: string;
+  SemicolonPos: Integer;
 begin
   Result := True;
   if MimeType = '' then
-     Exit;
-  Result := FSecuritySettings.BlockedMimeTypes.IndexOf(LowerCase(MimeType)) = -1;
+    Exit;
+  SemicolonPos := Pos(';', MimeType);
+  if SemicolonPos > 0 then
+    BaseMime := Copy(MimeType, 1, SemicolonPos - 1)
+  else
+    BaseMime := MimeType;
+  BaseMime := LowerCase(Trim(BaseMime));
+  Result := FSecuritySettings.BlockedMimeTypes.IndexOf(BaseMime) = -1;
 end;
 
 function THttpBodyParser.SanitizeFieldName(const FieldName: string): string;

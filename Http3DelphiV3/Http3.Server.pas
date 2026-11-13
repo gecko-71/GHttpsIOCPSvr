@@ -435,6 +435,18 @@ var
   ReqPath, ReqMethod, ValStr: string;
   ExtraHdrs: TArray<TPair<string, string>>;
   ReqData: THttp3RequestData;
+  SOff, GOff, MOff, J: Integer;
+  SettingId, SettingVal, GoAwayStreamId, MaxPushId: UInt64;
+  SeenSettings: TArray<UInt64>;
+  PendingConnErr, PendingStreamAbort: Boolean;
+  PendingErrCode: UInt64;
+  HeaderList: TArray<TPair<string, string>>;
+  HasHdrError, AppHandled: Boolean;
+  HName, HVal: string;
+  OutStatus: Integer;
+  OutContentType: string;
+  OutBody: TBytes;
+  OutExtra: TArray<TPair<string, string>>;
 begin
   try
     if ConnCtx.AppContext = nil then
@@ -623,12 +635,31 @@ begin
         case FrameType of
           HTTP3_FRAME_SETTINGS:
             begin
-              var SOff: Integer := 0;
-              var SettingId, SettingVal: UInt64;
+              SOff := 0;
+              SetLength(SeenSettings, 0);
               while SOff < Length(Payload) do
               begin
-                if not TQuicVarInt.Decode(Payload, SOff, SettingId) then Break;
-                if not TQuicVarInt.Decode(Payload, SOff, SettingVal) then Break;
+                if not TQuicVarInt.Decode(Payload, SOff, SettingId) then
+                begin
+                  CloseConnectionWithError(ConnCtx.Connection, H3_SETTINGS_ERROR);
+                  Exit;
+                end;
+                if not TQuicVarInt.Decode(Payload, SOff, SettingVal) then
+                begin
+                  CloseConnectionWithError(ConnCtx.Connection, H3_SETTINGS_ERROR);
+                  Exit;
+                end;
+
+                for J := 0 to High(SeenSettings) do
+                begin
+                  if SeenSettings[J] = SettingId then
+                  begin
+                    CloseConnectionWithError(ConnCtx.Connection, H3_SETTINGS_ERROR);
+                    Exit;
+                  end;
+                end;
+                SetLength(SeenSettings, Length(SeenSettings) + 1);
+                SeenSettings[High(SeenSettings)] := SettingId;
 
                 if (SettingId = $00) or (SettingId = $02) or (SettingId = $03) or
                    (SettingId = $04) or (SettingId = $05) then
@@ -659,8 +690,7 @@ begin
             end;
           HTTP3_FRAME_GOAWAY:
             begin
-              var GOff: Integer := 0;
-              var GoAwayStreamId: UInt64;
+              GOff := 0;
               if TQuicVarInt.Decode(Payload, GOff, GoAwayStreamId) then
               begin
                 H3State.Lock.Enter;
@@ -674,21 +704,26 @@ begin
             end;
           HTTP3_FRAME_MAX_PUSH_ID:
             begin
-              var MOff: Integer := 0;
-              var MaxPushId: UInt64;
+              MOff := 0;
               if TQuicVarInt.Decode(Payload, MOff, MaxPushId) then
               begin
+                PendingConnErr := False;
                 H3State.Lock.Enter;
                 try
                   if H3State.HasMaxPushId and (MaxPushId < H3State.ClientMaxPushId) then
+                    PendingConnErr := True
+                  else
                   begin
-                    CloseConnectionWithError(ConnCtx.Connection, H3_ID_ERROR);
-                    Exit;
+                    H3State.ClientMaxPushId := MaxPushId;
+                    H3State.HasMaxPushId := True;
                   end;
-                  H3State.ClientMaxPushId := MaxPushId;
-                  H3State.HasMaxPushId := True;
                 finally
                   H3State.Lock.Leave;
+                end;
+                if PendingConnErr then
+                begin
+                  CloseConnectionWithError(ConnCtx.Connection, H3_ID_ERROR);
+                  Exit;
                 end;
               end;
             end;
@@ -754,62 +789,80 @@ begin
               if QuicFailed(FQuicServer.MsQuic.Api.GetParam(StreamState.Stream, $08000000, StreamIdSize, @StreamId)) then
                 StreamId := UInt64(StreamState.Stream);
 
+              PendingConnErr := False;
+              PendingStreamAbort := False;
+              PendingErrCode := 0;
               H3State.Lock.Enter;
               try
                 if H3State.ClientGoAwayReceived and (StreamId >= H3State.ClientGoAwayStreamId) then
                 begin
-                  const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
-                  FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_REQUEST_REJECTED);
-                  Exit;
-                end;
+                  PendingStreamAbort := True;
+                  PendingErrCode := H3_REQUEST_REJECTED;
+                end
+                else
+                begin
+                  try
+                    HdrPairs := H3State.QpackDecoder.DecodeHeaderBlock(StreamId, Payload);
+                  except
+                    on E: Exception do
+                    begin
+                      PendingConnErr := True;
+                      PendingErrCode := QPACK_DECOMPRESSION_FAILED;
+                    end;
+                  end;
 
-                try
-                  HdrPairs := H3State.QpackDecoder.DecodeHeaderBlock(StreamId, Payload);
-                except
-                  on E: Exception do
+                  if not PendingConnErr then
                   begin
-                    CloseConnectionWithError(ConnCtx.Connection, QPACK_DECOMPRESSION_FAILED);
-                    Exit;
+                    ReqData := StreamState.Request;
+                    SetLength(HeaderList, Length(HdrPairs));
+                    HasHdrError := False;
+                    for HdrIdx := 0 to High(HdrPairs) do
+                    begin
+                      HName := string(HdrPairs[HdrIdx].Key);
+                      HVal := string(HdrPairs[HdrIdx].Value);
+                      if not ReqData.AddHeader(HName, HVal) then
+                      begin
+                        HasHdrError := True;
+                        Break;
+                      end;
+                      HeaderList[HdrIdx] := TPair<string, string>.Create(HName, HVal);
+                    end;
+
+                    if HasHdrError or ReqData.HasInvalidHeader then
+                    begin
+                      PendingStreamAbort := True;
+                      PendingErrCode := ReqData.ErrorCode;
+                      if PendingErrCode = 0 then
+                        PendingErrCode := H3_MESSAGE_ERROR;
+                    end
+                    else
+                    begin
+                      StreamState.HeaderPairs := HeaderList;
+                      StreamState.Request := ReqData;
+                    end;
                   end;
                 end;
-
-                ReqData := StreamState.Request;
-                var HeaderList: TArray<TPair<string, string>>;
-                SetLength(HeaderList, Length(HdrPairs));
-                var HasHdrError: Boolean := False;
-                for HdrIdx := 0 to High(HdrPairs) do
-                begin
-                  var HName := string(HdrPairs[HdrIdx].Key);
-                  var HVal := string(HdrPairs[HdrIdx].Value);
-                  if not ReqData.AddHeader(HName, HVal) then
-                  begin
-                    HasHdrError := True;
-                    Break;
-                  end;
-                  HeaderList[HdrIdx] := TPair<string, string>.Create(HName, HVal);
-                end;
-
-                if HasHdrError or ReqData.HasInvalidHeader then
-                begin
-                  const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
-                  var ErrCode := ReqData.ErrorCode;
-                  if ErrCode = 0 then ErrCode := H3_MESSAGE_ERROR;
-                  FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, ErrCode);
-                  Exit;
-                end;
-
-                StreamState.HeaderPairs := HeaderList;
-                StreamState.Request := ReqData;
               finally
                 H3State.Lock.Leave;
+              end;
+
+              if PendingConnErr then
+              begin
+                CloseConnectionWithError(ConnCtx.Connection, PendingErrCode);
+                Exit;
+              end;
+
+              if PendingStreamAbort then
+              begin
+                FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, $0006, PendingErrCode);
+                Exit;
               end;
 
               ReqPath := StreamState.Request.Path;
               ReqMethod := UpperCase(StreamState.Request.Method);
               if ReqMethod = '' then
               begin
-                const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
-                FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_MESSAGE_ERROR);
+                FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, $0006, H3_MESSAGE_ERROR);
                 Exit;
               end;
 
@@ -843,15 +896,15 @@ begin
                 end;
               end;
 
-              if (ReqMethod <> 'POST') and (ReqMethod <> 'PUT') then
+              if (ReqMethod <> 'POST') and (ReqMethod <> 'PUT') and (ReqMethod <> 'PATCH') then
               begin
-                var AppHandled: Boolean := False;
+                AppHandled := False;
                 if Assigned(FOnHttpRequest) then
                 begin
-                  var OutStatus: Integer := 404;
-                  var OutContentType: string := 'text/plain';
-                  var OutBody: TBytes := nil;
-                  var OutExtra: TArray<TPair<string, string>> := nil;
+                  OutStatus := 404;
+                  OutContentType := 'text/plain';
+                  OutBody := nil;
+                  OutExtra := nil;
                   FOnHttpRequest(Self, ReqMethod, ReqPath, ConnCtx.RemoteIP, StreamState.HeaderPairs, nil, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
                   if OutStatus <> 404 then
                   begin
@@ -921,12 +974,16 @@ begin
             end;
           HTTP3_FRAME_DATA:
             begin
+              if StreamState.Request.Method = '' then
+              begin
+                CloseConnectionWithError(ConnCtx.Connection, H3_FRAME_UNEXPECTED);
+                Exit;
+              end;
               if Length(Payload) > 0 then
               begin
                 if Int64(Length(StreamState.RequestBody)) + Int64(Length(Payload)) > FMaxRequestBodySize then
                 begin
-                  const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
-                  FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_EXCESSIVE_LOAD);
+                  FQuicServer.MsQuic.Api.StreamShutdown(StreamState.Stream, $0006, H3_EXCESSIVE_LOAD);
                   Exit;
                 end;
                 StreamState.AppendRequestBody(Payload);
@@ -943,10 +1000,10 @@ begin
           ReqPath := StreamState.Request.Path;
           if Assigned(FOnHttpRequest) then
           begin
-            var OutStatus: Integer := 404;
-            var OutContentType: string := 'text/plain';
-            var OutBody: TBytes := nil;
-            var OutExtra: TArray<TPair<string, string>> := nil;
+            OutStatus := 404;
+            OutContentType := 'text/plain';
+            OutBody := nil;
+            OutExtra := nil;
             FOnHttpRequest(Self, ReqMethod, ReqPath, ConnCtx.RemoteIP, StreamState.HeaderPairs, StreamState.RequestBody, ConnCtx.ClientCertInfo, OutStatus, OutContentType, OutBody, OutExtra);
             SendResponse(H3State, StreamState, ConnCtx, OutStatus, OutContentType, OutBody, OutExtra);
           end
@@ -977,9 +1034,7 @@ begin
     end;
   except
     on E: Exception do
-    begin
-
-    end;
+      Logger.Error('[HTTP/3] Exception in OnStreamReceive: %s (%s)', [E.Message, E.ClassName]);
   end;
 end;
 
@@ -1043,10 +1098,19 @@ begin
 
     FrameType := TQuicVarInt.Encode(HTTP3_FRAME_HEADERS);
     FrameLen := TQuicVarInt.Encode(Length(Block));
-    DataType := TQuicVarInt.Encode(HTTP3_FRAME_DATA);
-    DataLen := TQuicVarInt.Encode(Length(BodyData));
-    FullLen := Length(FrameType) + Length(FrameLen) + Length(Block) +
-               Length(DataType) + Length(DataLen) + Length(BodyData);
+    if Length(BodyData) > 0 then
+    begin
+      DataType := TQuicVarInt.Encode(HTTP3_FRAME_DATA);
+      DataLen := TQuicVarInt.Encode(Length(BodyData));
+      FullLen := Length(FrameType) + Length(FrameLen) + Length(Block) +
+                 Length(DataType) + Length(DataLen) + Length(BodyData);
+    end
+    else
+    begin
+      DataType := nil;
+      DataLen := nil;
+      FullLen := Length(FrameType) + Length(FrameLen) + Length(Block);
+    end;
     New(SendCtx);
     SendCtx.Server := FQuicServer;
     TInterlocked.Increment(FQuicServer.FSendCtxAllocated);
@@ -1115,10 +1179,8 @@ begin
 
       if (StreamHandle <> nil) and Assigned(FQuicServer) and Assigned(FQuicServer.MsQuic) and Assigned(FQuicServer.MsQuic.Api) then
       begin
-        const QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
-        const H3_INTERNAL_ERROR = $0102;
         try
-          FQuicServer.MsQuic.Api.StreamShutdown(StreamHandle, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, H3_INTERNAL_ERROR);
+          FQuicServer.MsQuic.Api.StreamShutdown(StreamHandle, $0006, $0102);
         except
           on EShut: Exception do
             Logger.Error('[HTTP/3] Error shutting down stream on exception: %s', [EShut.Message]);

@@ -84,8 +84,39 @@ end;
 function TQuicHttp3Request.AddHeader(const Name, Value: string): Boolean;
 var
   LowerName: string;
+  I: Integer;
+  Ch: Char;
 begin
-  LowerName := LowerCase(Trim(Name));
+  if Name = '' then
+  begin
+    FHasInvalidHeader := True;
+    FErrorMessage := 'Empty header name';
+    Exit(False);
+  end;
+
+  for I := 1 to Length(Name) do
+  begin
+    Ch := Name[I];
+    if ((Ch >= 'A') and (Ch <= 'Z')) or (Ord(Ch) <= 32) or (Ord(Ch) >= 127) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Invalid character in header name: ' + Name;
+      Exit(False);
+    end;
+  end;
+
+  for I := 1 to Length(Value) do
+  begin
+    Ch := Value[I];
+    if (Ch = #0) or (Ch = #10) or (Ch = #13) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Invalid control character in header value';
+      Exit(False);
+    end;
+  end;
+
+  LowerName := Name;
 
   if (LowerName = 'connection') or (LowerName = 'keep-alive') or
      (LowerName = 'proxy-connection') or (LowerName = 'transfer-encoding') or
@@ -96,7 +127,7 @@ begin
     Exit(False);
   end;
 
-  if (Length(LowerName) > 0) and (LowerName[1] = ':') then
+  if LowerName[1] = ':' then
   begin
     if FHasRegularHeaderSeen then
     begin
@@ -106,10 +137,20 @@ begin
     end;
     if not ((LowerName = ':method') or (LowerName = ':path') or
             (LowerName = ':scheme') or (LowerName = ':authority') or
-            (LowerName = ':protocol') or (LowerName = ':status')) then
+            (LowerName = ':protocol')) then
     begin
       FHasInvalidHeader := True;
-      FErrorMessage := 'Unknown pseudo-header: ' + LowerName;
+      FErrorMessage := 'Unknown or invalid request pseudo-header: ' + LowerName;
+      Exit(False);
+    end;
+    if ((LowerName = ':method') and (FMethod <> '')) or
+       ((LowerName = ':path') and (FPath <> '')) or
+       ((LowerName = ':scheme') and (FScheme <> '')) or
+       ((LowerName = ':authority') and (FAuthority <> '')) or
+       ((LowerName = ':protocol') and FHeaders.ContainsKey(':protocol')) then
+    begin
+      FHasInvalidHeader := True;
+      FErrorMessage := 'Duplicate pseudo-header: ' + LowerName;
       Exit(False);
     end;
   end

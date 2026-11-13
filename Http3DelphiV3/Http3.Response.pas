@@ -70,8 +70,30 @@ begin
 end;
 
 procedure TQuicHttp3Response.AddHeader(const Name, Value: string);
+var
+  LowerName: string;
+  I: Integer;
+  Ch: Char;
 begin
-  FHeaders.AddOrSetValue(Name, Value);
+  LowerName := LowerCase(Trim(Name));
+  if LowerName = '' then
+    raise EArgumentException.Create('Header name cannot be empty');
+
+  for I := 1 to Length(LowerName) do
+  begin
+    Ch := LowerName[I];
+    if (Ord(Ch) <= 32) or (Ord(Ch) >= 127) then
+      raise EArgumentException.Create('Invalid character in header name');
+  end;
+
+  for I := 1 to Length(Value) do
+  begin
+    Ch := Value[I];
+    if (Ch = #0) or (Ch = #10) or (Ch = #13) then
+      raise EArgumentException.Create('Invalid control character in header value');
+  end;
+
+  FHeaders.AddOrSetValue(LowerName, Value);
 end;
 
 procedure TQuicHttp3Response.SetBodyBytes(const ABytes: TBytes; const AContentType: string);

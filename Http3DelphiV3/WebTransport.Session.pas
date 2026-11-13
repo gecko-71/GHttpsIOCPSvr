@@ -70,6 +70,9 @@ var
   SendCtx: PQuicSendContext;
   Svr: TQuicServer;
 begin
+  if Size < 0 then
+    raise EArgumentOutOfRangeException.Create('Send buffer size cannot be negative');
+
   New(SendCtx);
   SendCtx.QuicBuffer.Length := Size;
 
@@ -158,12 +161,13 @@ var
   SendFlags: UInt32;
   Status: QUIC_STATUS;
 begin
-  if (Api = nil) or (Stream = nil) or (ConnCtx = nil) 
-              or (Length(Data) = 0) then 
-	 Exit;
+  if (Api = nil) or (Stream = nil) or (ConnCtx = nil) or
+     ((Length(Data) = 0) and (not CloseSend)) then
+    Exit;
 
   SendCtx := AllocWTSendContext(PConnectionContext(ConnCtx), Length(Data));
-  Move(Data[0], SendCtx.QuicBuffer.Buffer^, Length(Data));
+  if Length(Data) > 0 then
+    Move(Data[0], SendCtx.QuicBuffer.Buffer^, Length(Data));
 
   SendFlags := QUIC_SEND_FLAG_NONE;
   if CloseSend then

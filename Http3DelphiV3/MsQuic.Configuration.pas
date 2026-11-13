@@ -55,6 +55,7 @@ constructor TMsQuicConfiguration.Create(const AApi: PQuicApiTable; ARegistration
 var
   Status: QUIC_STATUS;
   AlpnBuffer: QUIC_BUFFER;
+  SettingsSize: UINT32;
 begin
   inherited Create;
   FApi := AApi;
@@ -70,12 +71,17 @@ begin
   AlpnBuffer.Length := Length(FAlpnStorage);
   AlpnBuffer.Buffer := PByte(PAnsiChar(FAlpnStorage));
 
+  if Settings <> nil then
+    SettingsSize := SizeOf(QUIC_SETTINGS)
+  else
+    SettingsSize := 0;
+
   Status := FApi.ConfigurationOpen(
     ARegistration.Handle,
     @AlpnBuffer,
     1,
     Settings,
-    SizeOf(QUIC_SETTINGS),
+    SettingsSize,
     nil,
     FHandle
   );

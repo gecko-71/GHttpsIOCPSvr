@@ -361,6 +361,8 @@ type
     property TotalBytesReceived: Int64 read FTotalBytesReceived;
     property BodyBytesReceived: Int64 read FBodyBytesReceived;
     property ExpectedBodySize: Int64 read FExpectedBodySize;
+    property HeadersEndPos: Integer read FHeadersEndPos;
+    property IsChunkedTransfer: Boolean read FIsChunkedTransfer;
     property MaxHeaderSize: Integer read FMaxHeaderSize;
     property MaxBodySize: Int64 read FMaxBodySize;
     property ValidationLevel: TValidationLevel read FValidationLevel;
@@ -797,8 +799,8 @@ end;
 
 class function TUriValidator.NormalizeURI(const URI: string): string;
 var
-  Scheme, Authority, Path, Query, Fragment, Host, Port: string;
-  SchemeEnd, AuthorityStart, PathStart, QueryStart, FragmentStart: Integer;
+  Scheme, Authority, Path, Query, Fragment, Host, Port, HostPart, UserInfo: string;
+  SchemeEnd, AuthorityStart, PathStart, QueryStart, FragmentStart, AtPos, ColonPos: Integer;
   PathSegments, NormalizedSegments: TStringList;
   I: Integer;
   Segment: string;
@@ -835,26 +837,33 @@ begin
   Scheme := LowerCase(Scheme);
   if Authority <> '' then
   begin
-    var AtPos := Pos('@', Authority);
-    var HostPart := Authority;
-    if AtPos > 0 then HostPart := Copy(Authority, AtPos + 1, Length(Authority));
-    var ColonPos := Pos(':', HostPart);
+    AtPos := Pos('@', Authority);
+    HostPart := Authority;
+    UserInfo := '';
+    if AtPos > 0 then
+    begin
+      UserInfo := Copy(Authority, 1, AtPos);
+      HostPart := Copy(Authority, AtPos + 1, Length(Authority));
+    end;
+    ColonPos := Pos(':', HostPart);
     if ColonPos > 0 then
     begin
       Host := Copy(HostPart, 1, ColonPos - 1);
       Port := Copy(HostPart, ColonPos + 1, Length(HostPart));
-    end else
+    end
+    else
     begin
       Host := HostPart;
       Port := '';
     end;
     Host := LowerCase(Host);
-    if ((Scheme = 'http') and (Port = '80')) or ((Scheme = 'https') and (Port = '443')) then Port := '';
+    if ((Scheme = 'http') and (Port = '80')) or ((Scheme = 'https') and (Port = '443')) then
+      Port := '';
     Authority := Host;
     if Port <> '' then
-       Authority := Authority + ':' + Port;
+      Authority := Authority + ':' + Port;
     if AtPos > 0 then
-       Authority := Copy(URI, 1, AtPos) + Authority;
+      Authority := UserInfo + Authority;
   end;
 
   if Path <> '' then
@@ -873,9 +882,7 @@ begin
             NormalizedSegments.Delete(NormalizedSegments.Count - 1);
         end
         else if (Segment <> '.') then
-        begin
-          NormalizedSegments.Add(LowerCase(Segment));
-        end;
+          NormalizedSegments.Add(Segment);
       end;
       Path := string.Join('/', NormalizedSegments.ToStringArray);
     finally
@@ -995,10 +1002,22 @@ begin
   end;
 
   CleanComments := StringReplace(LowerValue, '*/*', '', [rfReplaceAll]);
-  if (Pos('/*', CleanComments) > 0) or (Pos('*/', CleanComments) > 0) or (Pos('/*!', LowerValue) > 0) then
+  if (Pos('*/', CleanComments) > 0) or (Pos('/*!', LowerValue) > 0) then
   begin
     Result := True;
     Exit;
+  end;
+  I := Pos('/*', CleanComments);
+  while I > 0 do
+  begin
+    if (I > 1) and CharInSet(CleanComments[I - 1], ['a'..'z', '0'..'9', '-', '+', '.']) and
+       ((I + 2 > Length(CleanComments)) or CharInSet(CleanComments[I + 2], [',', ';', ' ', #9])) then
+      I := PosEx('/*', CleanComments, I + 2)
+    else
+    begin
+      Result := True;
+      Exit;
+    end;
   end;
 
   SQLPatterns := [
@@ -1330,10 +1349,15 @@ begin
 end;
 
 function TContentEncodingHandler.DecompressGzip(const Data: TBytes): TBytes;
+const
+  MAX_DECOMPRESSED_SIZE = 4 * 1024 * 1024;
 var
   InStream: TBytesStream;
   OutStream: TBytesStream;
   Decompressor: TZDecompressionStream;
+  Buffer: array[0..65535] of Byte;
+  BytesRead: Integer;
+  TotalRead: Int64;
 begin
   if Length(Data) = 0 then
   begin
@@ -1347,7 +1371,20 @@ begin
       try
         Decompressor := TZDecompressionStream.Create(InStream, 15 + 16);
         try
-          OutStream.CopyFrom(Decompressor, 0);
+          TotalRead := 0;
+          repeat
+            BytesRead := Decompressor.Read(Buffer[0], SizeOf(Buffer));
+            if BytesRead > 0 then
+            begin
+              TotalRead := TotalRead + BytesRead;
+              if TotalRead > MAX_DECOMPRESSED_SIZE then
+              begin
+                SetLength(Result, 0);
+                Exit;
+              end;
+              OutStream.WriteBuffer(Buffer[0], BytesRead);
+            end;
+          until BytesRead <= 0;
         finally
           Decompressor.Free;
         end;
@@ -1360,10 +1397,7 @@ begin
     end;
   except
     on E: Exception do
-    begin
-      SetLength(Result, Length(Data));
-      Move(Data[0], Result[0], Length(Data));
-    end;
+      SetLength(Result, 0);
   end;
 end;
 
@@ -2294,7 +2328,7 @@ begin
       Value := '';
     end;
     if Key <> '' then
-      ADictionary.Add(Key, Value);
+      ADictionary.AddOrSetValue(Key, Value);
 
     StartIndex := PairEndIndex + 1;
   end;
@@ -2356,7 +2390,7 @@ begin
       FAuthority := '';
       FPath := WorkingUri;
     end;
-    if not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
+    if not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
       FUriValidationErrors.Add('Path validation: ' + ErrorMsg);
     FNormalizedUri := TUriValidator.NormalizeURI(FRawUri);
     if FPath = '' then FPath := '/';
@@ -2450,8 +2484,8 @@ begin
     FVersion := StringToHttpVersion(Parts[2]);
     if FVersion = hvUnknown then
        raise Exception.CreateFmt('Unsupported HTTP version: %s', [Parts[2]]);
-    if not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
-       raise Exception.Create('Invalid URI path: ' + ErrorMsg);
+    if not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
+      raise Exception.Create('Invalid URI path: ' + ErrorMsg);
   except
     on E: Exception do
       raise Exception.CreateFmt('Error parsing request line: %s', [E.Message]);
@@ -2487,9 +2521,7 @@ begin
     if (FVersion = hvHTTP11) and (HostHeader = '') then
       raise Exception.Create('HTTP/1.1 requires Host header');
 
-    FIsSecure := (Headers.GetHeader('X-Forwarded-Proto') = 'https') or
-                (Headers.GetHeader('X-Forwarded-SSL') = 'on') or
-                (Pos('https', LowerCase(FScheme)) > 0);
+    FIsSecure := Pos('https', LowerCase(FScheme)) > 0;
   except
     on E: Exception do
        raise Exception.CreateFmt('Header parsing error: %s', [E.Message]);
@@ -2750,20 +2782,12 @@ var
   NewSize: Integer;
 begin
   if FErrorParsing or (FState = rsComplete) then
-     Exit;
+    Exit;
 
-  if (FState = rsWaitingHeaders) and (FRawBufferSize + Size > FMaxHeaderSize) then
-  begin
-    if FindHeadersEnd(FRawBuffer, FRawBufferSize) = -1 then
-    begin
-      SetError(Format('Headers size will exceed maximum limit (%d bytes)', [FMaxHeaderSize]), stOversizeAttack);
-      Exit;
-    end;
-  end;
   if Size <= 0 then
   begin
     if (FTotalBytesReceived = 0) then
-       SetError('Empty request detected', stMalformedURI);
+      SetError('Empty request detected', stMalformedURI);
     Exit;
   end;
 
@@ -2785,10 +2809,15 @@ begin
           FHeadersEndPos := FindHeadersEnd(FRawBuffer, FRawBufferSize);
           if FHeadersEndPos > 0 then
           begin
+            if FHeadersEndPos > FMaxHeaderSize then
+            begin
+              SetError(Format('Headers size exceeds maximum limit (%d bytes)', [FMaxHeaderSize]), stOversizeAttack);
+              Exit;
+            end;
             FState := rsParsingHeaders;
             ParseHeaders;
             if not FErrorParsing then
-               ProcessRemainingDataAfterHeaders;
+              ProcessRemainingDataAfterHeaders;
           end
           else
           begin
@@ -2801,7 +2830,10 @@ begin
           end;
         end;
       rsWaitingBody:
-        ProcessBodyData(Data, Size);
+        begin
+          FTotalBytesReceived := FTotalBytesReceived + Size;
+          ProcessBodyData(Data, Size);
+        end;
       rsError: Exit;
     end;
   except
@@ -3425,6 +3457,11 @@ begin
       var ColonPos := Pos(':', Line);
       if ColonPos > 0 then
       begin
+        if (ColonPos > 1) and CharInSet(Line[ColonPos - 1], [' ', #9]) then
+        begin
+          SetError('Whitespace before colon in header name (RFC 9112): ' + Line, stRequestSmuggling);
+          Exit;
+        end;
         CurrentHeaderName := Trim(Copy(Line, 1, ColonPos - 1));
         CurrentHeaderValue := Trim(Copy(Line, ColonPos + 1, MaxInt));
         if not THeaderValidator.ValidateHeaderName(CurrentHeaderName, ErrorMsg) then
@@ -3554,6 +3591,11 @@ begin
       end;
       Exit;
     end;
+    if (FExpectedBodySize = 0) and (not FIsChunkedTransfer) then
+    begin
+      FState := rsComplete;
+      Exit;
+    end;
     if RemainingSize > 0 then
     begin
       SetLength(RemainingData, RemainingSize);
@@ -3677,6 +3719,8 @@ procedure TRequest.ProcessBodyData(const Data: array of Byte; Size: Integer);
 var
   ActualDataToProcess: Integer;
   ProcessedSuccessfully: Boolean;
+  IsBodyComplete: Boolean;
+  MainBytes: TBytes;
 begin
   try
     if Size <= 0 then
@@ -3746,8 +3790,6 @@ begin
     end;
     if ProcessedSuccessfully then
     begin
-      FTotalBytesReceived := FTotalBytesReceived + ActualDataToProcess;
-      var IsBodyComplete: Boolean;
       if Assigned(FBodyParser) then
          IsBodyComplete := FBodyParser.IsComplete
       else if FExpectedBodySize > 0 then
@@ -3759,6 +3801,14 @@ begin
 
       if IsBodyComplete then
       begin
+        if Assigned(FBodyParser) and Assigned(FBodyStream) and (FBodyStream.Size = 0) then
+        begin
+          MainBytes := FBodyParser.GetMainPartAsBytes;
+          if Length(MainBytes) > 0 then
+            FBodyStream.WriteBuffer(MainBytes[0], Length(MainBytes));
+        end;
+        if Length(FRequestInfo.ContentEncodings) > 0 then
+          DecompressBodyIfNeeded;
         FState := rsComplete;
       end;
     end;

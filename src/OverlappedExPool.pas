@@ -65,6 +65,8 @@ implementation
 
 constructor TOverlappedExPool.Create(AInitialSize, AMaxSize: Integer;
   AMinFreeMemoryMb: Cardinal; AMaxMemoryLoadPercent: Byte);
+var
+  LInitialFillCount: Integer;
 begin
   inherited Create;
   FPool := TQueue<POverlappedEx>.Create;
@@ -77,15 +79,17 @@ begin
   FMaxMemoryLoadPercent := AMaxMemoryLoadPercent;
   if FMaxMemoryLoadPercent > 100 then
     FMaxMemoryLoadPercent := 100;
-  var LInitialFillCount := FInitialSize;
+  LInitialFillCount := FInitialSize;
   if (FMaxSize > 0) and (LInitialFillCount > FMaxSize) then
     LInitialFillCount := FMaxSize;
-  FillPool(LInitialFillCount);
+  if LInitialFillCount > 0 then
+    FillPool(LInitialFillCount);
 end;
 
 destructor TOverlappedExPool.Destroy;
 var
   Overlapped: POverlappedEx;
+  Req, Resp: TObject;
 begin
   TMonitor.Enter(FLock);
   try
@@ -98,13 +102,13 @@ begin
         if Assigned(Overlapped) then
         begin
           try
-            var Req := TObject(InterlockedExchangePointer(Pointer(Overlapped^.Request), nil));
+            Req := TObject(InterlockedExchangePointer(Pointer(Overlapped^.Request), nil));
             if Assigned(Req) then
               Req.Free;
           except
           end;
           try
-            var Resp := TObject(InterlockedExchangePointer(Pointer(Overlapped^.Response), nil));
+            Resp := TObject(InterlockedExchangePointer(Pointer(Overlapped^.Response), nil));
             if Assigned(Resp) then
               Resp.Free;
           except
@@ -154,7 +158,7 @@ begin
   end;
   if (FMaxMemoryLoadPercent > 0) and (MemStatus.dwMemoryLoad > FMaxMemoryLoadPercent) then
     Exit(False);
-  if (FMinFreeMemoryMb > 0) and (MemStatus.ullAvailPhys < FMinFreeMemoryMb * 1024 * 1024) then
+  if (FMinFreeMemoryMb > 0) and (MemStatus.ullAvailPhys < UInt64(FMinFreeMemoryMb) * 1024 * 1024) then
     Exit(False);
   Result := True;
 end;
@@ -190,7 +194,12 @@ begin
       InterlockedDecrement(FTotalCreated);
       Exit(nil);
     end;
-    New(Result);
+    try
+      New(Result);
+    except
+      InterlockedDecrement(FTotalCreated);
+      raise;
+    end;
     TMonitor.Enter(FLock);
     try
       FAllAllocated.Add(Result);

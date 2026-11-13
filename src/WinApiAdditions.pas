@@ -357,7 +357,7 @@ function ComapreCAS_OpType(var AOpType: TOperationType; ANewValue, AComparand: T
 
 const
   DEFAULT_MAXREQUESTSPERSECOND = 55 * 5;
-  DEFAULT_MAX_REQUEST_HEDER_SIZE = 16384 ; //8192;
+  DEFAULT_MAX_REQUEST_HEDER_SIZE = 16384;
   DEFAULT_MAX_REQUEST_SIZE = 10485760;
   DEFAULT_MAX_RESPONSE_SIZE = 104857600;
   DEFAULT_CHUNK_SIZE = 65536;
@@ -518,6 +518,9 @@ implementation
 
 uses System.SyncObjs;
 
+var
+  GAppendFileLock: TCriticalSection = nil;
+
 function FreeContextBuffer(pvContextBuffer: Pointer): SECURITY_STATUS; stdcall;
   external 'secur32.dll';
 
@@ -628,10 +631,10 @@ begin
   case Status of
     SEC_E_BUFFER_TOO_SMALL,
     SEC_E_MESSAGE_TOO_LARGE,
-    SEC_E_MESSAGE_ALTERED,
     SEC_E_INCOMPLETE_MESSAGE,
     SEC_E_INVALID_PARAMETER:
       Result := True;
+    SEC_E_MESSAGE_ALTERED,
     SEC_E_INVALID_HANDLE,
     SEC_E_NO_CREDENTIALS,
     SEC_E_CONTEXT_EXPIRED,
@@ -673,17 +676,24 @@ procedure AppendBytesToFile(const FileName: string; const Data: TBytes);
 var
   FileStream: TFileStream;
 begin
-  if FileExists(FileName) then
-    FileStream := TFileStream.Create(FileName, fmOpenReadWrite or fmShareDenyNone)
-  else
-    FileStream := TFileStream.Create(FileName, fmCreate or fmShareDenyNone);
-
+  if Assigned(GAppendFileLock) then
+    GAppendFileLock.Enter;
   try
-    FileStream.Seek(0, soEnd);
-    if Length(Data) > 0 then
-      FileStream.WriteBuffer(Data[0], Length(Data));
+    if FileExists(FileName) then
+      FileStream := TFileStream.Create(FileName, fmOpenReadWrite or fmShareDenyNone)
+    else
+      FileStream := TFileStream.Create(FileName, fmCreate or fmShareDenyNone);
+
+    try
+      FileStream.Seek(0, soEnd);
+      if Length(Data) > 0 then
+        FileStream.WriteBuffer(Data[0], Length(Data));
+    finally
+      FileStream.Free;
+    end;
   finally
-    FileStream.Free;
+    if Assigned(GAppendFileLock) then
+      GAppendFileLock.Leave;
   end;
 end;
 
@@ -743,5 +753,12 @@ begin
   if NeedCleanup then
     WSACleanup;
 end;
+
+initialization
+  GAppendFileLock := TCriticalSection.Create;
+
+finalization
+  GAppendFileLock.Free;
+  GAppendFileLock := nil;
 
 end.

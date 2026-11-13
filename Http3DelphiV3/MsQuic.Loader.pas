@@ -141,7 +141,10 @@ begin
 
       FLoaded := True;
     except
-      FreeLibrary(FDllHandle);
+      if Assigned(FApiTable) and Assigned(FMsQuicClose) then
+        FMsQuicClose(FApiTable);
+      if FDllHandle <> 0 then
+        FreeLibrary(FDllHandle);
       FDllHandle := 0;
       FMsQuicOpenVersion := nil;
       FMsQuicClose := nil;
@@ -157,8 +160,8 @@ procedure TMsQuicLibrary.Stop;
 begin
   FLock.Acquire;
   try
-    if not FLoaded then 
-	   Exit;
+    if not FLoaded then
+      Exit;
 
     if Assigned(FApiTable) and Assigned(FMsQuicClose) then
     begin
@@ -166,6 +169,14 @@ begin
       FApiTable := nil;
     end;
 
+    if FDllHandle <> 0 then
+    begin
+      FreeLibrary(FDllHandle);
+      FDllHandle := 0;
+    end;
+
+    FMsQuicOpenVersion := nil;
+    FMsQuicClose := nil;
     FLoaded := False;
   finally
     FLock.Release;
