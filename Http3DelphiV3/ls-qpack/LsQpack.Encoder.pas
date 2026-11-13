@@ -82,6 +82,8 @@ end;
 
 procedure TQpackEncoder.StartHeader(StreamId: UInt64; Seqno: Integer);
 begin
+  if FBlock = nil then
+    raise EQpackError.CreateCode('QPACK encoder not initialized', -1);
   CheckQpackStatus(lsqpack_enc_start_header(FBlock, StreamId, Seqno), 'lsqpack_enc_start_header');
 end;
 
@@ -92,10 +94,15 @@ var
   EncSz, HeaSz: NativeUInt;
   ValBuf: array[0..1023] of AnsiChar;
   DynValBuf: TBytes;
-  EncBuf: array[0..511] of Byte;
-  HeaBuf: array[0..2047] of Byte;
+  EncBuf: TBytes;
+  HeaBuf: TBytes;
   NameLen, ValLen, TotalLen: Integer;
+  Res: Integer;
+  Attempt: Integer;
 begin
+  if FBlock = nil then
+    raise EQpackError.CreateCode('QPACK encoder not initialized', -1);
+
   NameLen := Length(AName);
   ValLen := Length(AValue);
   TotalLen := NameLen + ValLen + 4;
@@ -104,19 +111,19 @@ begin
 
   if TotalLen <= SizeOf(ValBuf) then
   begin
-    if NameLen > 0 then  
-	   Move(AName[1], ValBuf[0], NameLen);
-    if ValLen > 0 then 
-	   Move(AValue[1], ValBuf[NameLen + 2], ValLen);
+    if NameLen > 0 then
+      Move(AName[1], ValBuf[0], NameLen);
+    if ValLen > 0 then
+      Move(AValue[1], ValBuf[NameLen + 2], ValLen);
     Xhdr.buf := @ValBuf[0];
   end
   else
   begin
     SetLength(DynValBuf, TotalLen);
-    if NameLen > 0 then 
-	   Move(AName[1], DynValBuf[0], NameLen);
-    if ValLen > 0 then 
-	   Move(AValue[1], DynValBuf[NameLen + 2], ValLen);
+    if NameLen > 0 then
+      Move(AName[1], DynValBuf[0], NameLen);
+    if ValLen > 0 then
+      Move(AValue[1], DynValBuf[NameLen + 2], ValLen);
     Xhdr.buf := PAnsiChar(@DynValBuf[0]);
   end;
 
@@ -125,14 +132,25 @@ begin
   Xhdr.val_offset := NameLen + 2;
   Xhdr.val_len := ValLen;
 
-  EncSz := SizeOf(EncBuf);
-  HeaSz := SizeOf(HeaBuf);
+  SetLength(EncBuf, Max(512, TotalLen + 64));
+  SetLength(HeaBuf, Max(2048, TotalLen + 64));
 
-  CheckQpackStatus(
-    lsqpack_enc_encode(FBlock, @EncBuf[0], EncSz,
-                       @HeaBuf[0], HeaSz, @Xhdr, 1),
-    'lsqpack_enc_encode'
-  );
+  for Attempt := 1 to 4 do
+  begin
+    EncSz := Length(EncBuf);
+    HeaSz := Length(HeaBuf);
+    Res := lsqpack_enc_encode(FBlock, @EncBuf[0], EncSz, @HeaBuf[0], HeaSz, @Xhdr, 1);
+    if Res = 0 then
+      Break;
+    if Res = 1 then
+      SetLength(EncBuf, Length(EncBuf) * 2)
+    else if Res = 2 then
+      SetLength(HeaBuf, Length(HeaBuf) * 2)
+    else
+      Break;
+  end;
+
+  CheckQpackStatus(Res, 'lsqpack_enc_encode');
 
   SetLength(AEncoderInstructions, EncSz);
   if EncSz > 0 then
@@ -149,6 +167,9 @@ var
   HeaSz: NativeUInt;
   Res: NativeInt;
 begin
+  if FBlock = nil then
+    raise EQpackError.CreateCode('QPACK encoder not initialized', -1);
+
   HeaSz := SizeOf(PrefBuf);
 
   Res := lsqpack_enc_end_header(FBlock, @PrefBuf[0], HeaSz, nil);

@@ -174,6 +174,8 @@ procedure TQpackDecoder.FeedEncoderStream(const AData: TBytes);
 var
   Res: Integer;
 begin
+  if FBlock = nil then
+    raise EQpackError.CreateCode('QPACK decoder not initialized', -1);
   if Length(AData) > 0 then
   begin
     Res := lsqpack_dec_enc_in(FBlock, PByte(@AData[0]), Length(AData));
@@ -189,7 +191,11 @@ var
   BufPtr: PByte;
   Ctx: TDecodeContext;
   I: Integer;
+  CancelBuf: array[0..31] of Byte;
 begin
+  if FBlock = nil then
+    raise EQpackError.CreateCode('QPACK decoder not initialized', -1);
+
   if Length(AData) = 0 then
   begin
     SetLength(Result, 0);
@@ -211,8 +217,12 @@ begin
       nil
     );
 
-    if (Res = 3) or (Res < 0) then
+    if Res <> 0 then
+    begin
+      if ((Res = 1) or (Res = 2)) and Assigned(lsqpack_dec_cancel_stream) then
+        lsqpack_dec_cancel_stream(FBlock, Pointer(Ctx), @CancelBuf[0], SizeOf(CancelBuf));
       raise EQpackError.CreateCode('Error decoding header block', Res);
+    end;
 
     SetLength(Result, Ctx.Pairs.Count);
     for I := 0 to Ctx.Pairs.Count - 1 do

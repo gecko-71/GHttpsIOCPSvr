@@ -53,6 +53,8 @@ type
     HeaderBlockSize: NativeUInt; Buf: PPByte; BufSz: NativeUInt;
     DecBuf: PByte; DecBufSz: PNativeUInt): Integer; cdecl;
 
+  TLsqpackDecCancelStream = function(Dec: Pointer; Hblock: Pointer;
+    Buf: PByte; BufSz: NativeUInt): NativeInt; cdecl;
   TLsqpackDecCancelStreamId = function(Dec: Pointer; StreamId: UInt64;
     Buf: PByte; BufSz: NativeUInt): NativeInt; cdecl;
 
@@ -68,6 +70,7 @@ var
   lsqpack_dec_cleanup: TLsqpackDecCleanup = nil;
   lsqpack_dec_enc_in: TLsqpackDecEncIn = nil;
   lsqpack_dec_header_in: TLsqpackDecHeaderIn = nil;
+  lsqpack_dec_cancel_stream: TLsqpackDecCancelStream = nil;
   lsqpack_dec_cancel_stream_id: TLsqpackDecCancelStreamId = nil;
 
 type
@@ -77,6 +80,7 @@ type
     FDllHandle: THandle;
     FLoaded: Boolean;
     procedure ResolveEntryPoints;
+    procedure ClearEntryPoints;
   public
     constructor Create(const ADllPath: string = 'ls-qpack.dll');
     destructor Destroy; override;
@@ -102,6 +106,22 @@ begin
   inherited Destroy;
 end;
 
+procedure TLsQpackLoader.ClearEntryPoints;
+begin
+  @lsqpack_enc_preinit := nil;
+  @lsqpack_enc_init := nil;
+  @lsqpack_enc_cleanup := nil;
+  @lsqpack_enc_start_header := nil;
+  @lsqpack_enc_encode := nil;
+  @lsqpack_enc_end_header := nil;
+  @lsqpack_dec_init := nil;
+  @lsqpack_dec_cleanup := nil;
+  @lsqpack_dec_enc_in := nil;
+  @lsqpack_dec_header_in := nil;
+  @lsqpack_dec_cancel_stream := nil;
+  @lsqpack_dec_cancel_stream_id := nil;
+end;
+
 procedure TLsQpackLoader.ResolveEntryPoints;
 begin
   @lsqpack_enc_preinit := GetProcAddress(FDllHandle, 'lsqpack_enc_preinit');
@@ -115,15 +135,20 @@ begin
   @lsqpack_dec_cleanup := GetProcAddress(FDllHandle, 'lsqpack_dec_cleanup');
   @lsqpack_dec_enc_in := GetProcAddress(FDllHandle, 'lsqpack_dec_enc_in');
   @lsqpack_dec_header_in := GetProcAddress(FDllHandle, 'lsqpack_dec_header_in');
+  @lsqpack_dec_cancel_stream := GetProcAddress(FDllHandle, 'lsqpack_dec_cancel_stream');
   @lsqpack_dec_cancel_stream_id := GetProcAddress(FDllHandle, 'lsqpack_dec_cancel_stream_id');
 
-  if not Assigned(lsqpack_enc_init) or not Assigned(lsqpack_dec_init) then
+  if not Assigned(lsqpack_enc_init) or not Assigned(lsqpack_enc_start_header) or
+     not Assigned(lsqpack_enc_encode) or not Assigned(lsqpack_enc_end_header) or
+     not Assigned(lsqpack_dec_init) or not Assigned(lsqpack_dec_enc_in) or
+     not Assigned(lsqpack_dec_header_in) then
     raise EQpackError.CreateCode('Could not find required entry points in ls-qpack.dll', -3);
 end;
 
 procedure TLsQpackLoader.Start(const ADllPath: string);
 begin
-  if FLoaded then Exit;
+  if FLoaded then
+    Exit;
 
   FDllHandle := LoadLibrary(PChar(ADllPath));
   if FDllHandle = 0 then
@@ -133,6 +158,7 @@ begin
     ResolveEntryPoints;
     FLoaded := True;
   except
+    ClearEntryPoints;
     FreeLibrary(FDllHandle);
     FDllHandle := 0;
     raise;
@@ -141,22 +167,15 @@ end;
 
 procedure TLsQpackLoader.Stop;
 begin
-  if not FLoaded then 
-     Exit;
+  if not FLoaded then
+    Exit;
 
-  @lsqpack_enc_preinit := nil;
-  @lsqpack_enc_init := nil;
-  @lsqpack_enc_cleanup := nil;
-  @lsqpack_enc_start_header := nil;
-  @lsqpack_enc_encode := nil;
-  @lsqpack_enc_end_header := nil;
-  @lsqpack_dec_init := nil;
-  @lsqpack_dec_cleanup := nil;
-  @lsqpack_dec_enc_in := nil;
-  @lsqpack_dec_header_in := nil;
-
-  FreeLibrary(FDllHandle);
-  FDllHandle := 0;
+  ClearEntryPoints;
+  if FDllHandle <> 0 then
+  begin
+    FreeLibrary(FDllHandle);
+    FDllHandle := 0;
+  end;
   FLoaded := False;
 end;
 
