@@ -98,7 +98,7 @@ uses
 
 type
 
-
+  TOnWTDatagramPtr = procedure(Sender: TObject; Session: PWTSessionContext; DataPtr: PByte; DataLen: Cardinal) of object;
 
   TWebTransportServer = class
 
@@ -129,6 +129,11 @@ type
     FOnStreamData:     TOnWTStreamData;
 
     FOnDatagram:       TOnWTDatagram;
+    FOnDatagramPtr:    TOnWTDatagramPtr;
+    FLastDatagramConn: HQUIC;
+    FLastDatagramQId:  UInt64;
+    FLastDatagramSess: TWTSessionContext;
+    FLastDatagramValid: Boolean;
 
     function IsOriginAllowed(const AOrigin: string; const AAuthority: string = ''): Boolean;
 
@@ -163,6 +168,7 @@ type
     function HandleStreamData(Stream: HQUIC; const Data: TBytes): Boolean; overload;
 
     procedure HandleDatagram(Connection: HQUIC; const Data: TBytes);
+    procedure HandleDatagramPtr(Connection: HQUIC; Buffer: PByte; BufferLength: Cardinal);
 
     property AllowedOrigins: string read FAllowedOrigins write FAllowedOrigins;
 
@@ -181,6 +187,7 @@ type
     property OnStreamData:     TOnWTStreamData     read FOnStreamData     write FOnStreamData;
 
     property OnDatagram:       TOnWTDatagram       read FOnDatagram       write FOnDatagram;
+    property OnDatagramPtr:    TOnWTDatagramPtr    read FOnDatagramPtr    write FOnDatagramPtr;
 
   end;
 
@@ -479,8 +486,10 @@ begin
 
 
       if HasSession then
-
+      begin
         FSessions.Remove(ConnectStream);
+        FLastDatagramValid := False;
+      end;
 
     finally
 
@@ -891,6 +900,7 @@ begin
       begin
 
         FSessions.Remove(Sess.ConnectStream);
+        FLastDatagramValid := False;
 
         DataStreamList.Clear;
 
@@ -1410,6 +1420,113 @@ begin
 
   end;
 
+end;
+
+procedure TWebTransportServer.HandleDatagramPtr(Connection: HQUIC; Buffer: PByte; BufferLength: Cardinal);
+var
+  Pair: TPair<HQUIC, TWTSessionContext>;
+  SessCtx: TWTSessionContext;
+  Found: Boolean;
+  DecodeOffset: Integer;
+  VarIntLen: Integer;
+  B0: Byte;
+  QuarterStreamId: UInt64;
+  TargetSessionId: TWTSessionId;
+  PayloadLen: Cardinal;
+  Payload: TBytes;
+begin
+  if (Buffer = nil) or (BufferLength = 0) or (BufferLength > 65536) or ((not Assigned(FOnDatagram)) and (not Assigned(FOnDatagramPtr))) then
+    Exit;
+
+  B0 := Buffer^;
+  VarIntLen := 1 shl (B0 shr 6);
+  if BufferLength < Cardinal(VarIntLen) then
+  begin
+    Logger.Warn('[WebTransport] Failed to decode Quarter Stream ID from datagram');
+    Exit;
+  end;
+
+  case VarIntLen of
+    1: QuarterStreamId := B0 and $3F;
+    2: QuarterStreamId := (UInt64(B0 and $3F) shl 8) or Buffer[1];
+    4: QuarterStreamId := (UInt64(B0 and $3F) shl 24) or (UInt64(Buffer[1]) shl 16) or (UInt64(Buffer[2]) shl 8) or Buffer[3];
+    8: QuarterStreamId := (UInt64(B0 and $3F) shl 56) or (UInt64(Buffer[1]) shl 48) or (UInt64(Buffer[2]) shl 40) or (UInt64(Buffer[3]) shl 32) or
+                          (UInt64(Buffer[4]) shl 24) or (UInt64(Buffer[5]) shl 16) or (UInt64(Buffer[6]) shl 8) or Buffer[7];
+  else
+    Exit;
+  end;
+
+  DecodeOffset := VarIntLen;
+  TargetSessionId := QuarterStreamId shl 2;
+
+  Found := False;
+  FLock.Enter;
+  try
+    if FLastDatagramValid and (FLastDatagramConn = Connection) and (FLastDatagramQId = QuarterStreamId) then
+    begin
+      SessCtx := FLastDatagramSess;
+      Found := True;
+    end
+    else
+    begin
+      for Pair in FSessions do
+      begin
+        if (Pair.Value.Connection = Connection) and
+           ((Pair.Value.StreamId = TargetSessionId) or
+            ((Pair.Value.StreamId shr 2) = QuarterStreamId)) then
+        begin
+          SessCtx := Pair.Value;
+          FLastDatagramConn := Connection;
+          FLastDatagramQId := QuarterStreamId;
+          FLastDatagramSess := SessCtx;
+          FLastDatagramValid := True;
+          Found := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    FLock.Leave;
+  end;
+
+  if not Found then
+  begin
+    Logger.Warn('[WebTransport] Dropped datagram for unknown session (QuarterStreamId: %d, TargetSessionId: %d)',
+      [QuarterStreamId, TargetSessionId]);
+    Exit;
+  end;
+
+  PayloadLen := BufferLength - Cardinal(DecodeOffset);
+  if Assigned(FOnDatagramPtr) then
+  begin
+    try
+      if PayloadLen > 0 then
+        FOnDatagramPtr(Self, @SessCtx, PByte(Buffer) + DecodeOffset, PayloadLen)
+      else
+        FOnDatagramPtr(Self, @SessCtx, nil, 0);
+    except
+      on E: Exception do
+        Logger.Error('[WebTransport] Exception in OnDatagramPtr event (SessionId: %d): %s (%s)',
+          [SessCtx.SessionId, E.Message, E.ClassName]);
+    end;
+    Exit;
+  end;
+
+  if PayloadLen > 0 then
+  begin
+    SetLength(Payload, PayloadLen);
+    Move(Buffer[DecodeOffset], Payload[0], PayloadLen);
+  end
+  else
+    SetLength(Payload, 0);
+
+  try
+    FOnDatagram(Self, @SessCtx, Payload);
+  except
+    on E: Exception do
+      Logger.Error('[WebTransport] Exception in OnDatagram event (SessionId: %d): %s (%s)',
+        [SessCtx.SessionId, E.Message, E.ClassName]);
+  end;
 end;
 
 

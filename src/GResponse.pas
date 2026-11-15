@@ -169,6 +169,7 @@ type
     FContentFinalized: Boolean;
     FHeaderPosition: Integer;
     FKeepAlive: Boolean;
+    FAltSvcLine: string;
     procedure BuildHeaders;
     procedure BuildContentBytes;
     procedure BuildMultipartContent;
@@ -232,7 +233,10 @@ type
     procedure Write(const Data: string); overload;
     function GetBodyBytes: TBytes;
     function IsContentTypeCompressible(const AContentType: string): Boolean;
+    function CanCompressBody: Boolean;
+    procedure SetAltSvcLine(const ALine: string); inline;
     function Compress(const AEncoding: string = 'gzip'): Boolean;
+    procedure Reset(ASocket: TSocket);
     function ApplyContentEncoding(const AAcceptEncoding: string): Boolean;
     property Headers: TStringList read FHeaders;
     property ContentType: string read FContentType;
@@ -252,6 +256,94 @@ implementation
 const
   DEFAULT_MAX_MEMORY_SIZE = 10 * 1024 * 1024;
   TEMP_FILE_PREFIX = 'GResponse_';
+
+var
+  GDateCacheLock: TObject;
+  GCachedDateTick: UInt64 = 0;
+  GCachedDateStr: string = '';
+  GCachedDateRaw: array[0..63] of Byte;
+  GCachedDateRawLen: Integer = 0;
+  GCachedTempDir: string = '';
+
+procedure UpdateCachedHttpDateLocked(NowTick: UInt64);
+var
+  I: Integer;
+  Len: Integer;
+begin
+  GCachedDateStr := FormatDateTime('ddd, dd mmm yyyy hh:nn:ss" GMT"', Now, TFormatSettings.Invariant);
+  Len := Length(GCachedDateStr);
+  if Len > SizeOf(GCachedDateRaw) then
+    Len := SizeOf(GCachedDateRaw);
+  for I := 1 to Len do
+    GCachedDateRaw[I - 1] := Byte(Ord(GCachedDateStr[I]));
+  GCachedDateRawLen := Len;
+  GCachedDateTick := NowTick;
+end;
+
+function GetCachedHttpDate: string;
+var
+  NowTick: UInt64;
+begin
+  NowTick := GetTickCount64;
+  if (GCachedDateTick <> 0) and (NowTick - GCachedDateTick < 1000) then
+    Exit(GCachedDateStr);
+  TMonitor.Enter(GDateCacheLock);
+  try
+    NowTick := GetTickCount64;
+    if (GCachedDateTick = 0) or (NowTick - GCachedDateTick >= 1000) then
+      UpdateCachedHttpDateLocked(NowTick);
+    Result := GCachedDateStr;
+  finally
+    TMonitor.Exit(GDateCacheLock);
+  end;
+end;
+
+procedure AppendCachedHttpDateBytes(P: PByte; var Offset: Integer);
+var
+  NowTick: UInt64;
+  Len: Integer;
+begin
+  NowTick := GetTickCount64;
+  Len := GCachedDateRawLen;
+  if (GCachedDateTick <> 0) and (Len > 0) and (NowTick - GCachedDateTick < 1000) then
+  begin
+    Move(GCachedDateRaw[0], P[Offset], Len);
+    Inc(Offset, Len);
+    Exit;
+  end;
+  TMonitor.Enter(GDateCacheLock);
+  try
+    NowTick := GetTickCount64;
+    if (GCachedDateTick = 0) or (GCachedDateRawLen = 0) or (NowTick - GCachedDateTick >= 1000) then
+      UpdateCachedHttpDateLocked(NowTick);
+    Len := GCachedDateRawLen;
+    if Len > 0 then
+    begin
+      Move(GCachedDateRaw[0], P[Offset], Len);
+      Inc(Offset, Len);
+    end;
+  finally
+    TMonitor.Exit(GDateCacheLock);
+  end;
+end;
+
+function GetDefaultResponseTempDir: string;
+begin
+  if GCachedTempDir <> '' then
+    Exit(GCachedTempDir);
+  TMonitor.Enter(GDateCacheLock);
+  try
+    if GCachedTempDir = '' then
+    begin
+      GCachedTempDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'download_tmp');
+      if not TDirectory.Exists(GCachedTempDir) then
+        TDirectory.CreateDirectory(GCachedTempDir);
+    end;
+    Result := GCachedTempDir;
+  finally
+    TMonitor.Exit(GDateCacheLock);
+  end;
+end;
 
 constructor TMultipartPart.Create;
 begin
@@ -376,7 +468,7 @@ begin
     FTempFileStream := nil;
     FTotalContentSize := 0;
     FContentFinalized := False;
-    FMultipartParts := TObjectList<TMultipartPart>.Create(True);
+    FMultipartParts := nil;
     FIsMultipart := False;
     FMultipartBuilt := False;
     FMultipartBoundary := '';
@@ -384,13 +476,11 @@ begin
     FSourceFilePath := '';
     FUseSourceFile := False;
     FSourceFileSize := 0;
-    FInMemoryFiles := TObjectList<TMemoryStream>.Create(True);
+    FInMemoryFiles := nil;
     FCurrentInMemoryFile := nil;
     SetLength(FHeadersData, 0);
     SetLength(FContentBytes, 0);
-    FResponseTempDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'download_tmp');
-    if not TDirectory.Exists(FResponseTempDir) then
-      TDirectory.CreateDirectory(FResponseTempDir);
+    FResponseTempDir := '';
   except
     on E: Exception do
     begin
@@ -423,10 +513,53 @@ begin
   end;
 end;
 
+procedure TResponse.Reset(ASocket: TSocket);
+begin
+  if FUseSourceFile or Assigned(FSourceFileStream) then
+    CleanupSourceFile;
+  if Assigned(FTempFileStream) or (FTempFilePath <> '') then
+    CleanupTempFile;
+  FSocket := ASocket;
+  FStatus := hsOK;
+  FHeaders.Clear;
+  FContentType := 'text/plain';
+  FBytesSent := 0;
+  FHeaderPosition := 0;
+  FHeadersBuilt := False;
+  FHeadersSent := False;
+  FContentBytesBuilt := False;
+  FContentPosition := 0;
+  FMaxMemorySize := DEFAULT_MAX_MEMORY_SIZE;
+  FStorageMode := csmMemory;
+  FTempFilePath := '';
+  FTempFileStream := nil;
+  FTotalContentSize := 0;
+  FContentFinalized := False;
+  if Assigned(FMultipartParts) then
+    FMultipartParts.Clear;
+  FIsMultipart := False;
+  FMultipartBuilt := False;
+  FMultipartBoundary := '';
+  FSourceFileStream := nil;
+  FSourceFilePath := '';
+  FUseSourceFile := False;
+  FSourceFileSize := 0;
+  if Assigned(FInMemoryFiles) then
+    FInMemoryFiles.Clear;
+  FCurrentInMemoryFile := nil;
+  SetLength(FHeadersData, 0);
+  if Length(FContentBytes) > 65536 then
+    SetLength(FContentBytes, 0);
+  FKeepAlive := False;
+  FAltSvcLine := '';
+end;
+
 procedure TResponse.RemoveHeader(const Name: string);
 var
   i: Integer;
 begin
+  if SameText(Name, 'Alt-Svc') then
+    FAltSvcLine := '';
   for i := FHeaders.Count - 1 downto 0 do
   begin
     if StartsText(Name + ':', FHeaders[i]) then
@@ -518,6 +651,7 @@ begin
     FSourceFileStream := nil;
   end;
   if (FSourceFilePath <> '') and
+     (FResponseTempDir <> '') and
      SameText(ExcludeTrailingPathDelimiter(TPath.GetDirectoryName(FSourceFilePath)),
               ExcludeTrailingPathDelimiter(FResponseTempDir)) and
      TFile.Exists(FSourceFilePath) then
@@ -644,9 +778,19 @@ begin
   end;
 end;
 
+procedure TResponse.SetAltSvcLine(const ALine: string);
+begin
+  FAltSvcLine := ALine;
+end;
+
 procedure TResponse.AddHeader(const Name, Value: string);
 begin
   try
+    if SameText(Name, 'Alt-Svc') and (FAltSvcLine = '') and (Pos(#13, Value) = 0) and (Pos(#10, Value) = 0) and (Pos(#0, Value) = 0) then
+    begin
+      FAltSvcLine := 'Alt-Svc: ' + Value + #13#10;
+      Exit;
+    end;
     FHeaders.Add(StripHeaderCRLF(Name) + ': ' + StripHeaderCRLF(Value));
   except
     on E: Exception do
@@ -695,9 +839,10 @@ begin
     begin
       FStorageMode := csmFile;
       EnsureTempFile;
-      if Length(FContentBytes) > 0 then
+      OldLen := Integer(FTotalContentSize) - DataSize;
+      if OldLen > 0 then
       begin
-        FTempFileStream.WriteBuffer(FContentBytes[0], Length(FContentBytes));
+        FTempFileStream.WriteBuffer(FContentBytes[0], OldLen);
         SetLength(FContentBytes, 0);
       end;
     end;
@@ -705,8 +850,9 @@ begin
     case FStorageMode of
       csmMemory:
         begin
-          OldLen := Length(FContentBytes);
-          SetLength(FContentBytes, OldLen + DataSize);
+          OldLen := Integer(FTotalContentSize) - DataSize;
+          if Length(FContentBytes) < OldLen + DataSize then
+            SetLength(FContentBytes, OldLen + DataSize);
           Move(Data[0], FContentBytes[OldLen], DataSize);
         end;
 
@@ -741,7 +887,7 @@ begin
           if not FContentBytesBuilt then
             BuildContentBytes;
 
-          RemainingBytes := Length(FContentBytes) - FContentPosition;
+          RemainingBytes := Integer(FTotalContentSize) - FContentPosition;
           if RemainingBytes > 0 then
           begin
             BytesToRead := Min(RemainingBytes, BufferSize);
@@ -772,16 +918,41 @@ end;
 procedure TResponse.AddTextContent(const ContentType, Content: string);
 var
   ContentBytes: TBytes;
+  Len: Integer;
+  I: Integer;
+  IsAscii: Boolean;
+  Ch: Word;
 begin
   try
     FContentType := ContentType;
+    Len := Length(Content);
+    if (FStorageMode = csmMemory) and (FTempFileStream = nil) and (FTotalContentSize = 0) and (Len <= FMaxMemorySize) then
+    begin
+      IsAscii := True;
+      for I := 1 to Len do
+      begin
+        Ch := Ord(Content[I]);
+        if Ch > 127 then
+        begin
+          IsAscii := False;
+          Break;
+        end;
+      end;
+      if IsAscii then
+      begin
+        if Length(FContentBytes) < Len then
+          SetLength(FContentBytes, Len);
+        for I := 1 to Len do
+          FContentBytes[I - 1] := Byte(Ord(Content[I]));
+        FTotalContentSize := Len;
+        FContentBytesBuilt := True;
+        FContentFinalized := True;
+        Exit;
+      end;
+    end;
     ContentBytes := TEncoding.UTF8.GetBytes(Content);
     WriteToStorage(ContentBytes);
     FinalizeContent;
-    var storMod := '';
-    if FStorageMode = csmMemory then
-      storMod := 'Memory'
-      else storMod := 'File';
   except
     on E: Exception do
     begin
@@ -1030,6 +1201,8 @@ begin
     GuidStr := StringReplace(StringReplace(StringReplace(GUIDToString(NewGuid), '{', '', []), '}', '', []), '-', '', [rfReplaceAll])
   else
     GuidStr := IntToStr(Random(MaxInt)) + IntToStr(Random(MaxInt));
+  if FResponseTempDir = '' then
+    FResponseTempDir := GetDefaultResponseTempDir;
   FileName := FormatDateTime('yyyymmdd_hhnnsszzz', Now) + '_' + GuidStr + Extension;
   Result := TPath.Combine(FResponseTempDir, FileName);
 end;
@@ -1154,6 +1327,8 @@ function TResponse.CreateInMemoryFile(const Filename, ContentType: string): TMem
 begin
   try
     Result := TMemoryStream.Create;
+    if not Assigned(FInMemoryFiles) then
+      FInMemoryFiles := TObjectList<TMemoryStream>.Create(True);
     FInMemoryFiles.Add(Result);
     FCurrentInMemoryFile := Result;
     if ContentType <> '' then
@@ -1231,7 +1406,10 @@ begin
     FIsMultipart := True;
     FMultipartType := MultipartType;
     FMultipartBoundary := GenerateBoundary;
-    FMultipartParts.Clear;
+    if Assigned(FMultipartParts) then
+      FMultipartParts.Clear
+    else
+      FMultipartParts := TObjectList<TMultipartPart>.Create(True);
     FContentType := GetContentTypeForMultipart(MultipartType) + '; boundary=' + FMultipartBoundary;
   except
     on E: Exception do
@@ -1245,6 +1423,8 @@ begin
     if not FIsMultipart then
       raise Exception.Create('Not in multipart mode. Call BeginMultipart first.');
     Result := TMultipartPart.Create;
+    if not Assigned(FMultipartParts) then
+      FMultipartParts := TObjectList<TMultipartPart>.Create(True);
     FMultipartParts.Add(Result);
   except
     on E: Exception do
@@ -1373,15 +1553,68 @@ var
   StatusText: string;
   HeaderBuilder: TStringBuilder;
   I: Integer;
+  FinalHeaders: TStringList;
+  HasServer: Boolean;
+  HasDate: Boolean;
+  HasConnection: Boolean;
+  HasHSTS: Boolean;
+  FastHeaderStr: string;
+  ConnLine: string;
+  ContentLenLine: string;
+  IsAsciiOnly: Boolean;
+  FastLen: Integer;
 begin
   if FHeadersBuilt then
     Exit;
   try
     if not FContentFinalized then
       FinalizeContent;
-    var FinalHeaders := TStringList.Create;
+    if FHeaders.Count = 0 then
+    begin
+      StatusText := GetStatusText(FStatus);
+      if (FStatus <> hsNoContent) and (FStatus <> hsNotModified) then
+        ContentLenLine := 'Content-Length: ' + IntToStr(FTotalContentSize) + #13#10
+      else
+        ContentLenLine := '';
+      if FKeepAlive then
+        ConnLine := 'Connection: keep-alive'#13#10'Keep-Alive: timeout=5, max=1000'#13#10
+      else
+        ConnLine := 'Connection: close'#13#10;
+      FastHeaderStr :=
+        'HTTP/1.1 ' + IntToStr(Integer(FStatus)) + ' ' + StatusText + #13#10 +
+        'Content-Type: ' + FContentType + #13#10 +
+        ContentLenLine +
+        'Server: GHttpsServerIOCP/2.0'#13#10 +
+        'Date: ' + GetCachedHttpDate + #13#10 +
+        ConnLine +
+        FAltSvcLine +
+        'Strict-Transport-Security: max-age=31536000; includeSubDomains; preload'#13#10#13#10;
+      FastLen := Length(FastHeaderStr);
+      IsAsciiOnly := True;
+      for I := 1 to FastLen do
+      begin
+        if Ord(FastHeaderStr[I]) > 127 then
+        begin
+          IsAsciiOnly := False;
+          Break;
+        end;
+      end;
+      if IsAsciiOnly then
+      begin
+        SetLength(FHeadersData, FastLen);
+        for I := 1 to FastLen do
+          FHeadersData[I - 1] := Byte(Ord(FastHeaderStr[I]));
+      end
+      else
+        FHeadersData := TEncoding.UTF8.GetBytes(FastHeaderStr);
+      FHeadersBuilt := True;
+      Exit;
+    end;
+    FinalHeaders := TStringList.Create;
     try
       FinalHeaders.AddStrings(FHeaders);
+      if FAltSvcLine <> '' then
+        FinalHeaders.Add(Copy(FAltSvcLine, 1, Length(FAltSvcLine) - 2));
       for I := FinalHeaders.Count - 1 downto 0 do
         if StartsText('Content-Type:', FinalHeaders[I]) then
           FinalHeaders.Delete(I);
@@ -1391,10 +1624,10 @@ begin
           FinalHeaders.Delete(I);
       if (FStatus <> hsNoContent) and (FStatus <> hsNotModified) then
         FinalHeaders.Insert(1, 'Content-Length: ' + IntToStr(FTotalContentSize));
-      var HasServer: Boolean := False;
-      var HasDate: Boolean := False;
-      var HasConnection: Boolean := False;
-      var HasHSTS: Boolean := False;
+      HasServer := False;
+      HasDate := False;
+      HasConnection := False;
+      HasHSTS := False;
       for I := 0 to FinalHeaders.Count - 1 do
       begin
         if StartsText('Server:', FinalHeaders[I]) then
@@ -1407,9 +1640,9 @@ begin
           HasHSTS := True;
       end;
       if not HasServer then
-         FinalHeaders.Add('Server: GHttpsServerIOCP/2.0');
+        FinalHeaders.Add('Server: GHttpsServerIOCP/2.0');
       if not HasDate then
-         FinalHeaders.Add('Date: ' + FormatDateTime('ddd, dd mmm yyyy hh:nn:ss" GMT"', Now, TFormatSettings.Invariant));
+        FinalHeaders.Add('Date: ' + GetCachedHttpDate);
       if not HasConnection then
       begin
         if FKeepAlive then
@@ -1421,7 +1654,7 @@ begin
           FinalHeaders.Add('Connection: close');
       end;
       if not HasHSTS then
-         FinalHeaders.Add('Strict-Transport-Security: max-age=31536000; includeSubDomains; preload');
+        FinalHeaders.Add('Strict-Transport-Security: max-age=31536000; includeSubDomains; preload');
       HeaderBuilder := TStringBuilder.Create;
       try
         StatusText := GetStatusText(FStatus);
@@ -1458,12 +1691,113 @@ begin
   end;
 end;
 
+function AppendAsciiStr(P: PByte; const S: string; var Offset: Integer): Boolean;
+var
+  I: Integer;
+  Len: Integer;
+  Ch: Word;
+begin
+  Len := Length(S);
+  for I := 1 to Len do
+  begin
+    Ch := Ord(S[I]);
+    if Ch > 127 then
+      Exit(False);
+    P[Offset] := Byte(Ch);
+    Inc(Offset);
+  end;
+  Result := True;
+end;
+
+function AppendRawAscii(P: PByte; const S: RawByteString; var Offset: Integer): Boolean;
+var
+  Len: Integer;
+begin
+  Len := Length(S);
+  if Len > 0 then
+  begin
+    Move(PAnsiChar(S)^, P[Offset], Len);
+    Inc(Offset, Len);
+  end;
+  Result := True;
+end;
+
+const
+  HDR_200_CT: RawByteString = 'HTTP/1.1 200 OK'#13#10'Content-Type: ';
+  HDR_CL: RawByteString = #13#10'Content-Length: ';
+  HDR_SERVER_DATE: RawByteString = #13#10'Server: GHttpsServerIOCP/2.0'#13#10'Date: ';
+  HDR_KEEPALIVE: RawByteString = #13#10'Connection: keep-alive'#13#10'Keep-Alive: timeout=5, max=1000'#13#10;
+  HDR_CLOSE: RawByteString = #13#10'Connection: close'#13#10;
+  HDR_HSTS_END: RawByteString = 'Strict-Transport-Security: max-age=31536000; includeSubDomains; preload'#13#10#13#10;
+
+procedure AppendInt64Ascii(P: PByte; Value: Int64; var Offset: Integer);
+var
+  Buf: array[0..23] of Byte;
+  Idx: Integer;
+  V: Int64;
+begin
+  if Value = 0 then
+  begin
+    P[Offset] := Ord('0');
+    Inc(Offset);
+    Exit;
+  end;
+  V := Value;
+  Idx := 24;
+  while V > 0 do
+  begin
+    Dec(Idx);
+    Buf[Idx] := Byte(Ord('0') + (V mod 10));
+    V := V div 10;
+  end;
+  Move(Buf[Idx], P[Offset], 24 - Idx);
+  Inc(Offset, 24 - Idx);
+end;
+
 function TResponse.ReadNextChunk(Buffer: PByte; BufferSize: Integer): Integer;
 var
-  BytesToCopy: Int64 ;
+  BytesToCopy: Int64;
   RemainingHeaderBytes: Integer;
+  HeaderCopied: Integer;
+  BodyCopied: Integer;
+  DirectOff: Integer;
 begin
+  HeaderCopied := 0;
   try
+    if (not FHeadersSent) and (not FHeadersBuilt) and (FHeaders.Count = 0) and
+       (not FUseSourceFile) and (not FIsMultipart) and (FStatus = hsOK) and
+       (FStorageMode = csmMemory) and (BufferSize >= 512 + Integer(FTotalContentSize)) then
+    begin
+      if not FContentFinalized then
+        FinalizeContent;
+      DirectOff := 0;
+      AppendRawAscii(Buffer, HDR_200_CT, DirectOff);
+      if AppendAsciiStr(Buffer, FContentType, DirectOff) then
+      begin
+        AppendRawAscii(Buffer, HDR_CL, DirectOff);
+        AppendInt64Ascii(Buffer, FTotalContentSize, DirectOff);
+        AppendRawAscii(Buffer, HDR_SERVER_DATE, DirectOff);
+        AppendCachedHttpDateBytes(Buffer, DirectOff);
+        if FKeepAlive then
+          AppendRawAscii(Buffer, HDR_KEEPALIVE, DirectOff)
+        else
+          AppendRawAscii(Buffer, HDR_CLOSE, DirectOff);
+        if (FAltSvcLine = '') or AppendAsciiStr(Buffer, FAltSvcLine, DirectOff) then
+        begin
+          AppendRawAscii(Buffer, HDR_HSTS_END, DirectOff);
+          if FTotalContentSize > 0 then
+          begin
+            Move(FContentBytes[0], Buffer[DirectOff], Integer(FTotalContentSize));
+            Inc(DirectOff, Integer(FTotalContentSize));
+            FContentPosition := Integer(FTotalContentSize);
+          end;
+          FHeadersBuilt := True;
+          FHeadersSent := True;
+          Result := DirectOff;
+          Exit;
+        end;
+      end;
+    end;
     if not FHeadersSent then
     begin
       if not FHeadersBuilt then
@@ -1476,21 +1810,26 @@ begin
           BytesToCopy := Min(RemainingHeaderBytes, BufferSize);
           Move(FHeadersData[FHeaderPosition], Buffer^, BytesToCopy);
           Inc(FHeaderPosition, BytesToCopy);
-          Result := BytesToCopy;
+          HeaderCopied := BytesToCopy;
           if FHeaderPosition >= Length(FHeadersData) then
             FHeadersSent := True;
-          Exit;
+          if (not FHeadersSent) or (HeaderCopied >= BufferSize) then
+          begin
+            Result := HeaderCopied;
+            Exit;
+          end;
         end;
       end;
     end;
     if (FStatus = hsNoContent) or (FStatus = hsNotModified) then
     begin
-      Result := 0;
+      Result := HeaderCopied;
       Exit;
     end;
     if FIsMultipart and not FMultipartBuilt then
       BuildMultipartContent;
-    Result := ReadFromStorage(Buffer, BufferSize);
+    BodyCopied := ReadFromStorage(PByte(NativeUInt(Buffer) + NativeUInt(HeaderCopied)), BufferSize - HeaderCopied);
+    Result := HeaderCopied + BodyCopied;
   except
     on E: Exception do
     begin
@@ -1536,7 +1875,7 @@ begin
           begin
             if not FContentBytesBuilt then
               BuildContentBytes;
-            Result := (FContentPosition >= Length(FContentBytes));
+            Result := (FContentPosition >= FTotalContentSize);
           end;
         csmFile:
           begin
@@ -1797,7 +2136,7 @@ begin
   begin
     if not FContentBytesBuilt then
       BuildContentBytes;
-    Result := Copy(FContentBytes, 0, Length(FContentBytes));
+    Result := Copy(FContentBytes, 0, Integer(FTotalContentSize));
   end
   else if (FStorageMode = csmFile) and Assigned(FTempFileStream) then
   begin
@@ -1917,6 +2256,13 @@ begin
   Result := False;
 end;
 
+function TResponse.CanCompressBody: Boolean;
+begin
+  Result := (not FHeadersBuilt) and (not FHeadersSent) and
+            (FStatus <> hsNoContent) and (FStatus <> hsNotModified) and (FStatus <> hsSwitchingProtocols) and
+            ((FStorageMode <> csmMemory) or (FTotalContentSize >= 128));
+end;
+
 function TResponse.Compress(const AEncoding: string): Boolean;
 var
   TargetEncoding: string;
@@ -1978,14 +2324,15 @@ begin
   end;
   if FStorageMode = csmMemory then
   begin
-    if Length(FContentBytes) < 128 then
+    if FTotalContentSize < 128 then
       Exit;
     try
+      RawBytes := Copy(FContentBytes, 0, Integer(FTotalContentSize));
       if TargetEncoding = 'gzip' then
-        Compressed := CompressBytesGzip(FContentBytes)
+        Compressed := CompressBytesGzip(RawBytes)
       else
-        Compressed := CompressBytesDeflate(FContentBytes);
-      if (Length(Compressed) > 0) and (Length(Compressed) < Length(FContentBytes)) then
+        Compressed := CompressBytesDeflate(RawBytes);
+      if (Length(Compressed) > 0) and (Length(Compressed) < Length(RawBytes)) then
       begin
         FContentBytes := Compressed;
         FTotalContentSize := Length(Compressed);
@@ -2107,5 +2454,11 @@ begin
   if ChosenEncoding <> '' then
     Result := Compress(ChosenEncoding);
 end;
+
+initialization
+  GDateCacheLock := TObject.Create;
+
+finalization
+  GDateCacheLock.Free;
 
 end.

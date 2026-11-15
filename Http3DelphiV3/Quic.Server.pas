@@ -130,6 +130,8 @@ type
     FStartupPageFileMB: Double;
     FActiveConnections:         TList<Pointer>;
     FConnectionsLock:           TCriticalSection;
+    FSendCtxList:               TList<Pointer>;
+    FSendCtxLock:               TCriticalSection;
     FActiveConnCount:           Integer;
     FAllConnsClosed:            TEvent;
     FShuttingDown:              Integer;
@@ -155,6 +157,8 @@ type
     procedure Start(Port: Word = 4433);
     procedure Stop;
     procedure ReloadCertificate(const NewHashHex: string);
+    function AllocSendCtx: PQuicSendContext;
+    procedure FreeSendCtx(SendCtx: PQuicSendContext);
     property SendCtxAllocated:           Integer read FSendCtxAllocated;
     property SendCtxFreed:               Integer read FSendCtxFreed;
     property ActiveConnectionCount:      Integer read FActiveConnCount;
@@ -258,6 +262,8 @@ begin
   FRequiredServerName        := '';
   FActiveConnections         := TList<Pointer>.Create;
   FConnectionsLock           := TCriticalSection.Create;
+  FSendCtxList               := TList<Pointer>.Create;
+  FSendCtxLock               := TCriticalSection.Create;
   FAllConnsClosed            := TEvent.Create(nil, True, True, '');
 
   if GetProcessMemoryInfo(GetCurrentProcess(), @MemCounters, SizeOf(MemCounters)) then
@@ -271,9 +277,41 @@ destructor TQuicServer.Destroy;
 begin
   Stop;
   FAllConnsClosed.Free;
+  FSendCtxLock.Free;
+  FSendCtxList.Free;
   FConnectionsLock.Free;
   FActiveConnections.Free;
   inherited Destroy;
+end;
+
+function TQuicServer.AllocSendCtx: PQuicSendContext;
+begin
+  New(Result);
+  Result.Server := Self;
+  Result.DynamicBuffer := nil;
+  TInterlocked.Increment(FSendCtxAllocated);
+  FSendCtxLock.Enter;
+  try
+    FSendCtxList.Add(Result);
+  finally
+    FSendCtxLock.Leave;
+  end;
+end;
+
+procedure TQuicServer.FreeSendCtx(SendCtx: PQuicSendContext);
+begin
+  if SendCtx = nil then
+    Exit;
+  FSendCtxLock.Enter;
+  try
+    FSendCtxList.Remove(SendCtx);
+  finally
+    FSendCtxLock.Leave;
+  end;
+  TInterlocked.Increment(FSendCtxFreed);
+  if SendCtx.DynamicBuffer <> nil then
+    FreeMem(SendCtx.DynamicBuffer);
+  Dispose(SendCtx);
 end;
 
 procedure TQuicServer.OnNewConnection(Sender: TObject; Connection: HQUIC; const Info: PQUIC_NEW_CONNECTION_INFO; var AcceptConnection: Boolean);
@@ -647,10 +685,13 @@ begin
             SendCtx := PQuicSendContext(Event.ClientContext);
             Event.ClientContext := nil;
             if Server <> nil then
-              TInterlocked.Increment(Server.FSendCtxFreed);
-            if SendCtx.DynamicBuffer <> nil then
-              FreeMem(SendCtx.DynamicBuffer);
-            Dispose(SendCtx);
+              Server.FreeSendCtx(SendCtx)
+            else
+            begin
+              if SendCtx.DynamicBuffer <> nil then
+                FreeMem(SendCtx.DynamicBuffer);
+              Dispose(SendCtx);
+            end;
           end;
         end;
 
@@ -697,10 +738,13 @@ begin
           begin
             SendCtx := PQuicSendContext(Event.ClientContext);
             if Server <> nil then
-              TInterlocked.Increment(Server.FSendCtxFreed);
-            if SendCtx.DynamicBuffer <> nil then
-              FreeMem(SendCtx.DynamicBuffer);
-            Dispose(SendCtx);
+              Server.FreeSendCtx(SendCtx)
+            else
+            begin
+              if SendCtx.DynamicBuffer <> nil then
+                FreeMem(SendCtx.DynamicBuffer);
+              Dispose(SendCtx);
+            end;
           end;
         end;
 
@@ -829,6 +873,7 @@ var
   ConnPtr: Pointer;
   ConnsToShutdown: TArray<Pointer>;
   I: Integer;
+  LeakedCtx: PQuicSendContext;
 begin
   if TInterlocked.Exchange(FShuttingDown, 1) = 1 then
     Exit;
@@ -902,6 +947,24 @@ begin
     FMsQuic.Stop;
     FMsQuic.Free;
     FMsQuic := nil;
+  end;
+
+  FSendCtxLock.Enter;
+  try
+    for I := FSendCtxList.Count - 1 downto 0 do
+    begin
+      LeakedCtx := PQuicSendContext(FSendCtxList[I]);
+      if LeakedCtx <> nil then
+      begin
+        if LeakedCtx.DynamicBuffer <> nil then
+          FreeMem(LeakedCtx.DynamicBuffer);
+        Dispose(LeakedCtx);
+        TInterlocked.Increment(FSendCtxFreed);
+      end;
+    end;
+    FSendCtxList.Clear;
+  finally
+    FSendCtxLock.Leave;
   end;
 
   Logger.Info('[Shutdown] Server stopped. Total connections handled: %d (allocated) / %d (freed).',

@@ -49,6 +49,7 @@ procedure WTSendConnect200(Api: PQuicApiTable; ConnCtx: Pointer; Stream: HQUIC; 
 procedure WTSendOnStream(Api: PQuicApiTable; ConnCtx: Pointer; Stream: HQUIC; const Data: TBytes; CloseSend: Boolean = False);
 procedure WTSendDatagram(Api: PQuicApiTable; ConnCtx: Pointer; Connection: HQUIC; const Data: TBytes); overload;
 procedure WTSendDatagram(Api: PQuicApiTable; ConnCtx: Pointer; Connection: HQUIC; SessionId: TWTSessionId; const Data: TBytes); overload;
+procedure WTSendDatagramPtr(Api: PQuicApiTable; ConnCtx: Pointer; Connection: HQUIC; SessionId: TWTSessionId; DataPtr: PByte; DataLen: Cardinal);
 procedure WTCloseSession(Api: PQuicApiTable; Session: PWTSessionContext; ErrorCode: UInt64 = WT_SESSION_GONE);
 
 type
@@ -56,6 +57,7 @@ type
   public
     procedure SendOnStream(Stream: HQUIC; const Data: TBytes; CloseSend: Boolean = False);
     procedure SendDatagram(const Data: TBytes);
+    procedure SendDatagramPtr(DataPtr: PByte; DataLen: Cardinal);
     procedure Close(ErrorCode: UInt64 = WT_SESSION_GONE);
   end;
 
@@ -73,7 +75,16 @@ begin
   if Size < 0 then
     raise EArgumentOutOfRangeException.Create('Send buffer size cannot be negative');
 
-  New(SendCtx);
+  if (ConnCtx <> nil) and (ConnCtx.Server <> nil) then
+  begin
+    Svr := TQuicServer(ConnCtx.Server);
+    SendCtx := Svr.AllocSendCtx;
+  end
+  else
+  begin
+    New(SendCtx);
+    SendCtx.Server := nil;
+  end;
   SendCtx.QuicBuffer.Length := Size;
 
   if Size <= 1500 then
@@ -87,15 +98,6 @@ begin
     SendCtx.QuicBuffer.Buffer := SendCtx.DynamicBuffer;
   end;
 
-  if (ConnCtx <> nil) and (ConnCtx.Server <> nil) then
-  begin
-    Svr := TQuicServer(ConnCtx.Server);
-    SendCtx.Server := Svr;
-    TInterlocked.Increment(Svr.FSendCtxAllocated);
-  end
-  else
-    SendCtx.Server := nil;
-
   Result := SendCtx;
 end;
 
@@ -103,12 +105,13 @@ procedure FreeWTSendContextOnError(SendCtx: PQuicSendContext);
 var
   Svr: TQuicServer;
 begin
-  if SendCtx = nil then 
-     Exit;
+  if SendCtx = nil then
+    Exit;
   if SendCtx.Server <> nil then
   begin
     Svr := TQuicServer(SendCtx.Server);
-    TInterlocked.Increment(Svr.FSendCtxFreed);
+    Svr.FreeSendCtx(SendCtx);
+    Exit;
   end;
 
   if SendCtx.DynamicBuffer <> nil then
@@ -187,17 +190,29 @@ var
   Status: QUIC_STATUS;
   QuarterStreamId: UInt64;
   PrefixBytes: TBytes;
+  PrefixLen: Integer;
   TotalSize: Integer;
 begin
-  if (Api = nil) or (Connection = nil) or (ConnCtx = nil) or (Length(Data) = 0) then Exit;
+  if (Api = nil) or (Connection = nil) or (ConnCtx = nil) or (Length(Data) = 0) then
+    Exit;
 
   QuarterStreamId := SessionId shr 2;
-  PrefixBytes := TQuicVarInt.Encode(QuarterStreamId);
-  TotalSize := Length(PrefixBytes) + Length(Data);
-
-  SendCtx := AllocWTSendContext(PConnectionContext(ConnCtx), TotalSize);
-  Move(PrefixBytes[0], SendCtx.QuicBuffer.Buffer^, Length(PrefixBytes));
-  Move(Data[0], (PByte(SendCtx.QuicBuffer.Buffer) + Length(PrefixBytes))^, Length(Data));
+  if QuarterStreamId < 64 then
+  begin
+    PrefixLen := 1;
+    TotalSize := 1 + Length(Data);
+    SendCtx := AllocWTSendContext(PConnectionContext(ConnCtx), TotalSize);
+    SendCtx.QuicBuffer.Buffer^ := Byte(QuarterStreamId);
+  end
+  else
+  begin
+    PrefixBytes := TQuicVarInt.Encode(QuarterStreamId);
+    PrefixLen := Length(PrefixBytes);
+    TotalSize := PrefixLen + Length(Data);
+    SendCtx := AllocWTSendContext(PConnectionContext(ConnCtx), TotalSize);
+    Move(PrefixBytes[0], SendCtx.QuicBuffer.Buffer^, PrefixLen);
+  end;
+  Move(Data[0], (PByte(SendCtx.QuicBuffer.Buffer) + PrefixLen)^, Length(Data));
 
   Status := Api.DatagramSend(Connection, @SendCtx.QuicBuffer, 1, QUIC_SEND_FLAG_NONE, SendCtx);
   if QuicFailed(Status) then
@@ -210,6 +225,44 @@ end;
 procedure WTSendDatagram(Api: PQuicApiTable; ConnCtx: Pointer; Connection: HQUIC; const Data: TBytes);
 begin
   WTSendDatagram(Api, ConnCtx, Connection, 0, Data);
+end;
+
+procedure WTSendDatagramPtr(Api: PQuicApiTable; ConnCtx: Pointer; Connection: HQUIC; SessionId: TWTSessionId; DataPtr: PByte; DataLen: Cardinal);
+var
+  SendCtx: PQuicSendContext;
+  Status: QUIC_STATUS;
+  QuarterStreamId: UInt64;
+  PrefixBytes: TBytes;
+  PrefixLen: Integer;
+  TotalSize: Integer;
+begin
+  if (Api = nil) or (Connection = nil) or (ConnCtx = nil) or (DataPtr = nil) or (DataLen = 0) then
+    Exit;
+
+  QuarterStreamId := SessionId shr 2;
+  if QuarterStreamId < 64 then
+  begin
+    PrefixLen := 1;
+    TotalSize := 1 + Integer(DataLen);
+    SendCtx := AllocWTSendContext(PConnectionContext(ConnCtx), TotalSize);
+    SendCtx.QuicBuffer.Buffer^ := Byte(QuarterStreamId);
+  end
+  else
+  begin
+    PrefixBytes := TQuicVarInt.Encode(QuarterStreamId);
+    PrefixLen := Length(PrefixBytes);
+    TotalSize := PrefixLen + Integer(DataLen);
+    SendCtx := AllocWTSendContext(PConnectionContext(ConnCtx), TotalSize);
+    Move(PrefixBytes[0], SendCtx.QuicBuffer.Buffer^, PrefixLen);
+  end;
+  Move(DataPtr^, (PByte(SendCtx.QuicBuffer.Buffer) + PrefixLen)^, DataLen);
+
+  Status := Api.DatagramSend(Connection, @SendCtx.QuicBuffer, 1, QUIC_SEND_FLAG_NONE, SendCtx);
+  if QuicFailed(Status) then
+  begin
+    Logger.Warn('[WT] WTSendDatagramPtr failed to send datagram (SessionId: %d, Status: 0x%x)', [SessionId, Status]);
+    FreeWTSendContextOnError(SendCtx);
+  end;
 end;
 
 procedure WTCloseSession(Api: PQuicApiTable; Session: PWTSessionContext; ErrorCode: UInt64 = WT_SESSION_GONE);
@@ -249,12 +302,26 @@ var
   Svr: TQuicServer;
 begin
   PConn := PConnectionContext(ConnCtx);
-  if (PConn = nil) or (PConn.Server = nil) then 
-     Exit;
+  if (PConn = nil) or (PConn.Server = nil) then
+    Exit;
   Svr := TQuicServer(PConn.Server);
-  if (Svr.MsQuic = nil) or (Svr.MsQuic.Api = nil) then 
-     Exit;
+  if (Svr.MsQuic = nil) or (Svr.MsQuic.Api = nil) then
+    Exit;
   WTSendDatagram(Svr.MsQuic.Api, ConnCtx, Connection, StreamId, Data);
+end;
+
+procedure TWTSessionContextHelper.SendDatagramPtr(DataPtr: PByte; DataLen: Cardinal);
+var
+  PConn: PConnectionContext;
+  Svr: TQuicServer;
+begin
+  PConn := PConnectionContext(ConnCtx);
+  if (PConn = nil) or (PConn.Server = nil) then
+    Exit;
+  Svr := TQuicServer(PConn.Server);
+  if (Svr.MsQuic = nil) or (Svr.MsQuic.Api = nil) then
+    Exit;
+  WTSendDatagramPtr(Svr.MsQuic.Api, ConnCtx, Connection, StreamId, DataPtr, DataLen);
 end;
 
 procedure TWTSessionContextHelper.Close(ErrorCode: UInt64);

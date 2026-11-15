@@ -76,16 +76,25 @@ type
     ClientSocket: TSocket;
     SSLContext: TCtxtHandle;
     SSLContextValid: Boolean;
+    SSLStreamHeaderSize: DWORD;
+    SSLStreamTrailerSize: DWORD;
+    SSLStreamMaxMessage: DWORD;
+    SSLStreamSizesValid: Boolean;
     SSLHandshakeStep: Integer;
     SSLNeedsMoreData: Boolean;
-    SSLOutputBuffer: array[0..65535] of Byte;
+    SSLOutputBuffer: array[0..36863] of Byte;
     SSLOutputSize: DWORD;
     Request: TRequest;
     Response: TResponse;
+    CachedResponse: TResponse;
     LastActivityTime: UInt64;
     KeepAliveRequestsCount: Integer;
     KeepAliveActive: Boolean;
     IsTLS: Boolean;
+    SkipIOCP: Boolean;
+    AllowInlineRecv: Boolean;
+    InlineRecvReady: Boolean;
+    InlineSyncBytes: DWORD;
     ListenerPort: Word;
     WebSocketSession: TObject;
     WebSocketState: Integer;
@@ -100,6 +109,7 @@ const
   SO_UPDATE_ACCEPT_CONTEXT = $700B;
   ASC_REQ_SESSION_TICKET = $00000040;
   ASC_REQ_MUTUAL_AUTH = $00000002;
+  FILE_SKIP_COMPLETION_PORT_ON_SUCCESS = $01;
 
   WORKER_THREAD_COUNT = 48;
 
@@ -513,6 +523,7 @@ procedure SafeFreeSSLBuffer(var Buffer: Pointer);
 procedure AppendBytesToFile(const FileName: string; const Data: TBytes);
 
 function GetPrimaryIPv4Address: string;
+function SetFileCompletionNotificationModes(FileHandle: THandle; Flags: Byte): BOOL; stdcall; external 'kernel32.dll';
 
 implementation
 

@@ -38,8 +38,8 @@ type
   TOverlappedExPool = class
   private
     FPool: TQueue<POverlappedEx>;
-    FAllAllocated: TList<POverlappedEx>;
-    FLock: TObject;
+    FAllAllocated: TDictionary<POverlappedEx, Byte>;
+    FLock: _RTL_SRWLOCK;
     FInitialSize: Integer;
     FTotalCreated: Integer;
     FMaxSize: Integer;
@@ -53,6 +53,7 @@ type
     destructor Destroy; override;
     function Acquire: POverlappedEx;
     procedure Release(AOverlapped: POverlappedEx);
+    function IsAllocated(AOverlapped: POverlappedEx): Boolean;
     function GetCount: Integer;
     property Count: Integer read GetCount;
     property TotalCreated: Integer read FTotalCreated;
@@ -70,8 +71,8 @@ var
 begin
   inherited Create;
   FPool := TQueue<POverlappedEx>.Create;
-  FAllAllocated := TList<POverlappedEx>.Create;
-  FLock := TObject.Create;
+  FAllAllocated := TDictionary<POverlappedEx, Byte>.Create;
+  InitializeSRWLock(FLock);
   FInitialSize := AInitialSize;
   FMaxSize := AMaxSize;
   FTotalCreated := 0;
@@ -91,13 +92,13 @@ var
   Overlapped: POverlappedEx;
   Req, Resp: TObject;
 begin
-  TMonitor.Enter(FLock);
+  AcquireSRWLockExclusive(FLock);
   try
     if Assigned(FPool) then
       FPool.Clear;
     if Assigned(FAllAllocated) then
     begin
-      for Overlapped in FAllAllocated do
+      for Overlapped in FAllAllocated.Keys do
       begin
         if Assigned(Overlapped) then
         begin
@@ -113,6 +114,12 @@ begin
               Resp.Free;
           except
           end;
+          try
+            Resp := TObject(InterlockedExchangePointer(Pointer(Overlapped^.CachedResponse), nil));
+            if Assigned(Resp) then
+              Resp.Free;
+          except
+          end;
           Dispose(Overlapped);
         end;
       end;
@@ -120,10 +127,9 @@ begin
       FAllAllocated := nil;
     end;
   finally
-    TMonitor.Exit(FLock);
+    ReleaseSRWLockExclusive(FLock);
   end;
   FPool.Free;
-  FLock.Free;
   inherited;
 end;
 
@@ -139,7 +145,7 @@ begin
     FillChar(Overlapped^, SizeOf(TOverlappedEx), 0);
     Initialize(Overlapped^);
     Overlapped^.InPool := 1;
-    FAllAllocated.Add(Overlapped);
+    FAllAllocated.AddOrSetValue(Overlapped, 1);
     FPool.Enqueue(Overlapped);
     Inc(FTotalCreated);
   end;
@@ -167,14 +173,14 @@ function TOverlappedExPool.Acquire: POverlappedEx;
 var
   LNewTotal: Integer;
 begin
-  TMonitor.Enter(FLock);
+  AcquireSRWLockExclusive(FLock);
   try
     if FPool.Count > 0 then
       Result := FPool.Dequeue
     else
       Result := nil;
   finally
-    TMonitor.Exit(FLock);
+    ReleaseSRWLockExclusive(FLock);
   end;
   if not Assigned(Result) then
   begin
@@ -200,11 +206,11 @@ begin
       InterlockedDecrement(FTotalCreated);
       raise;
     end;
-    TMonitor.Enter(FLock);
+    AcquireSRWLockExclusive(FLock);
     try
-      FAllAllocated.Add(Result);
+      FAllAllocated.AddOrSetValue(Result, 1);
     finally
-      TMonitor.Exit(FLock);
+      ReleaseSRWLockExclusive(FLock);
     end;
   end;
   if Assigned(Result) then
@@ -217,27 +223,74 @@ begin
 end;
 
 procedure TOverlappedExPool.Release(AOverlapped: POverlappedEx);
+var
+  Req, Resp: TObject;
+  ShouldFree: Boolean;
 begin
   if not Assigned(AOverlapped) then
     Exit;
   if InterlockedCompareExchange(AOverlapped^.InPool, 1, 0) <> 0 then
     Exit;
 
-  TMonitor.Enter(FLock);
+  ShouldFree := False;
+  AcquireSRWLockExclusive(FLock);
   try
-    FPool.Enqueue(AOverlapped);
+    if FPool.Count >= 256 then
+    begin
+      if Assigned(FAllAllocated) then
+        FAllAllocated.Remove(AOverlapped);
+      InterlockedDecrement(FTotalCreated);
+      ShouldFree := True;
+    end
+    else
+      FPool.Enqueue(AOverlapped);
   finally
-    TMonitor.Exit(FLock);
+    ReleaseSRWLockExclusive(FLock);
+  end;
+
+  if ShouldFree then
+  begin
+    try
+      Req := TObject(InterlockedExchangePointer(Pointer(AOverlapped^.Request), nil));
+      if Assigned(Req) then
+        Req.Free;
+    except
+    end;
+    try
+      Resp := TObject(InterlockedExchangePointer(Pointer(AOverlapped^.Response), nil));
+      if Assigned(Resp) then
+        Resp.Free;
+    except
+    end;
+    try
+      Resp := TObject(InterlockedExchangePointer(Pointer(AOverlapped^.CachedResponse), nil));
+      if Assigned(Resp) then
+        Resp.Free;
+    except
+    end;
+    Dispose(AOverlapped);
+  end;
+end;
+
+function TOverlappedExPool.IsAllocated(AOverlapped: POverlappedEx): Boolean;
+begin
+  if AOverlapped = nil then
+    Exit(False);
+  AcquireSRWLockShared(FLock);
+  try
+    Result := FAllAllocated.ContainsKey(AOverlapped);
+  finally
+    ReleaseSRWLockShared(FLock);
   end;
 end;
 
 function TOverlappedExPool.GetCount: Integer;
 begin
-  TMonitor.Enter(FLock);
+  AcquireSRWLockShared(FLock);
   try
     Result := FPool.Count;
   finally
-    TMonitor.Exit(FLock);
+    ReleaseSRWLockShared(FLock);
   end;
 end;
 

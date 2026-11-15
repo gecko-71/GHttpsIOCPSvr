@@ -52,6 +52,7 @@ type
     Payload: TBytes;
     class function Decode(const RawData: TBytes; var Offset: Integer; out Frame: TWebSocketFrame; var ErrorMsg: string): Boolean; static;
     class function IsValidUTF8(const Bytes: TBytes): Boolean; static;
+    class function IsValidUTF8Ptr(P: PByte; Len: Integer): Boolean; static;
     class function Encode(Opcode: TWebSocketOpcode; const Payload: TBytes; Fin: Boolean = True): TBytes; static;
   end;
 
@@ -71,6 +72,12 @@ type
     FOverlappedPool: TOverlappedExPool;
     FRoutePath: string;
     FSubProtocol: string;
+    FCachedRouteHandler: IInterface;
+    FCachedRawRouteHandler: IInterface;
+    FBatchActive: Boolean;
+    FBatchLen: Integer;
+    FBatchOverlapped: POverlappedEx;
+    FWriteQueueCount: Integer;
     procedure Unmask(var Frame: TWebSocketFrame);
     function GetIsTLS: Boolean;
   public
@@ -83,11 +90,21 @@ type
     constructor Create(ASocket: TSocket; AReadOverlapped: POverlappedEx; AOverlappedPool: TOverlappedExPool);
     destructor Destroy; override;
     procedure QueueSendFrame(Opcode: TWebSocketOpcode; const Payload: TBytes);
+    function TryFastSendText(const Text: string): Boolean;
+    function TryFastSendRaw(Opcode: TWebSocketOpcode; PayloadPtr: PByte; PayloadLen: Integer): Boolean;
+    procedure BeginFastBatch;
+    procedure EndFastBatch;
     procedure SendText(const Text: string);
+    procedure SendRaw(Opcode: TWebSocketOpcode; PayloadPtr: PByte; PayloadLen: Integer);
     procedure SendBinary(const Data: TBytes);
     function DequeueNextWrite(out Chunk: TBytes): Boolean;
     function HasPendingWrites: Boolean;
     function ProcessIncomingPlaintext(const PlainData: TBytes; out CloseConnection: Boolean): TArray<TBytes>;
+    function ProcessIncomingPlaintextPtr(DataPtr: PByte; DataLen: Integer; out CloseConnection: Boolean): TArray<TBytes>;
+    function TryProcessSingleFramePtr(DataPtr: PByte; DataLen: Integer; OutBuf: PByte; OutBufCap: Integer;
+      out OutLen: Integer; out OutOpcode: TWebSocketOpcode; out CloseConnection: Boolean): Boolean;
+    function TryProcessNextFramePtr(DataPtr: PByte; DataLen: Integer; OutBuf: PByte; OutBufCap: Integer;
+      out OutLen, ConsumedBytes: Integer; out OutOpcode: TWebSocketOpcode; out CloseConnection: Boolean): Boolean;
     function DetachWriteOverlapped: POverlappedEx;
     property Socket: TSocket read FSocket;
     property ReadOverlapped: POverlappedEx read FReadOverlapped write FReadOverlapped;
@@ -95,6 +112,8 @@ type
     property LastActivityTime: UInt64 read FLastActivityTime write FLastActivityTime;
     property RoutePath: string read FRoutePath write FRoutePath;
     property SubProtocol: string read FSubProtocol write FSubProtocol;
+    property CachedRouteHandler: IInterface read FCachedRouteHandler write FCachedRouteHandler;
+    property CachedRawRouteHandler: IInterface read FCachedRawRouteHandler write FCachedRawRouteHandler;
     property LastReceivedOpcode: TWebSocketOpcode read FCurrentOpcode;
     property IsTLS: Boolean read GetIsTLS;
     property IsSecure: Boolean read GetIsTLS;
@@ -227,17 +246,18 @@ begin
   Result := True;
 end;
 
-class function TWebSocketFrame.IsValidUTF8(const Bytes: TBytes): Boolean;
+class function TWebSocketFrame.IsValidUTF8Ptr(P: PByte; Len: Integer): Boolean;
 var
-  I, Len, Needed: Integer;
+  I, Needed: Integer;
   B: Byte;
 begin
   Result := True;
-  Len := Length(Bytes);
+  if (Len <= 0) or (P = nil) then
+    Exit;
   I := 0;
   while I < Len do
   begin
-    B := Bytes[I];
+    B := P[I];
     if B <= $7F then
     begin
       Inc(I);
@@ -257,24 +277,31 @@ begin
     if I + Needed >= Len then
       Exit(False);
 
-    if (B = $E0) and (Bytes[I + 1] < $A0) then
+    if (B = $E0) and (P[I + 1] < $A0) then
       Exit(False);
-    if (B = $ED) and (Bytes[I + 1] > $9F) then
+    if (B = $ED) and (P[I + 1] > $9F) then
       Exit(False);
-    if (B = $F0) and (Bytes[I + 1] < $90) then
+    if (B = $F0) and (P[I + 1] < $90) then
       Exit(False);
-    if (B = $F4) and (Bytes[I + 1] > $8F) then
+    if (B = $F4) and (P[I + 1] > $8F) then
       Exit(False);
 
     Inc(I);
     while Needed > 0 do
     begin
-      if (Bytes[I] < $80) or (Bytes[I] > $BF) then
+      if (P[I] < $80) or (P[I] > $BF) then
         Exit(False);
       Inc(I);
       Dec(Needed);
     end;
   end;
+end;
+
+class function TWebSocketFrame.IsValidUTF8(const Bytes: TBytes): Boolean;
+begin
+  if Length(Bytes) = 0 then
+    Exit(True);
+  Result := IsValidUTF8Ptr(@Bytes[0], Length(Bytes));
 end;
 
 class function TWebSocketFrame.Encode(Opcode: TWebSocketOpcode; const Payload: TBytes; Fin: Boolean): TBytes;
@@ -342,6 +369,8 @@ begin
   FLastActivityTime := GetTickCount64;
   SetLength(FIncomingBuffer, 0);
   SetLength(FFramePayloadBuffer, 0);
+  FCachedRouteHandler := nil;
+  FCachedRawRouteHandler := nil;
 end;
 
 procedure TWebSocketSession.AddRef;
@@ -398,6 +427,8 @@ begin
 
   SetLength(FIncomingBuffer, 0);
   SetLength(FFramePayloadBuffer, 0);
+  FCachedRouteHandler := nil;
+  FCachedRawRouteHandler := nil;
 
   if Assigned(LocalLock) then
   begin
@@ -445,13 +476,126 @@ begin
   end;
 end;
 
+function TWebSocketSession.TryProcessSingleFramePtr(DataPtr: PByte; DataLen: Integer; OutBuf: PByte; OutBufCap: Integer;
+  out OutLen: Integer; out OutOpcode: TWebSocketOpcode; out CloseConnection: Boolean): Boolean;
+var
+  Consumed: Integer;
+begin
+  Result := TryProcessNextFramePtr(DataPtr, DataLen, OutBuf, OutBufCap, OutLen, Consumed, OutOpcode, CloseConnection) and
+            (Consumed = DataLen);
+end;
+
+function TWebSocketSession.TryProcessNextFramePtr(DataPtr: PByte; DataLen: Integer; OutBuf: PByte; OutBufCap: Integer;
+  out OutLen, ConsumedBytes: Integer; out OutOpcode: TWebSocketOpcode; out CloseConnection: Boolean): Boolean;
+var
+  B0, B1, Rsv, OpByte, Len7: Byte;
+  HdrLen, PayLen, I, Chunks, Rem: Integer;
+  MaskKey: array[0..3] of Byte;
+  Mask32: UInt32;
+  Src32, Dst32: PCardinal;
+  Src8, Dst8: PByte;
+begin
+  Result := False;
+  OutLen := 0;
+  ConsumedBytes := 0;
+  OutOpcode := wsOpText;
+  CloseConnection := False;
+  if (InCleanup <> 0) or (DataLen < 6) or (DataPtr = nil) or (OutBuf = nil) then
+    Exit;
+
+  if (Length(FIncomingBuffer) <> 0) or FFragmentInProgress then
+    Exit;
+
+  B0 := DataPtr[0];
+  B1 := DataPtr[1];
+  Rsv := B0 and $70;
+  OpByte := B0 and $0F;
+  Len7 := B1 and $7F;
+  if ((B0 and $80) = 0) or (Rsv <> 0) or ((B1 and $80) = 0) or
+     ((OpByte <> Byte(Ord(wsOpText))) and (OpByte <> Byte(Ord(wsOpBinary)))) or (Len7 >= 127) then
+    Exit;
+
+  if Len7 < 126 then
+  begin
+    HdrLen := 6;
+    PayLen := Len7;
+  end
+  else
+  begin
+    if DataLen < 8 then
+      Exit;
+    HdrLen := 8;
+    PayLen := (Integer(DataPtr[2]) shl 8) or Integer(DataPtr[3]);
+    if PayLen < 126 then
+      Exit;
+  end;
+
+  if (HdrLen + PayLen > DataLen) or (PayLen > OutBufCap) or (PayLen > MAX_WS_MESSAGE_SIZE) then
+    Exit;
+
+  Move(DataPtr[HdrLen - 4], MaskKey[0], 4);
+  if PayLen > 0 then
+  begin
+    Move(MaskKey[0], Mask32, 4);
+    Src32 := PCardinal(@DataPtr[HdrLen]);
+    Dst32 := PCardinal(OutBuf);
+    Chunks := PayLen div 4;
+    Rem := PayLen mod 4;
+    for I := 0 to Chunks - 1 do
+    begin
+      Dst32^ := Src32^ xor Mask32;
+      Inc(Src32);
+      Inc(Dst32);
+    end;
+    if Rem > 0 then
+    begin
+      Src8 := PByte(Src32);
+      Dst8 := PByte(Dst32);
+      for I := 0 to Rem - 1 do
+      begin
+        Dst8^ := Src8^ xor MaskKey[I];
+        Inc(Src8);
+        Inc(Dst8);
+      end;
+    end;
+  end;
+  if (OpByte = Byte(Ord(wsOpText))) and not TWebSocketFrame.IsValidUTF8Ptr(OutBuf, PayLen) then
+  begin
+    QueueSendFrame(wsOpClose, TBytes.Create($03, $EF));
+    CloseConnection := True;
+    Exit;
+  end;
+  FLastActivityTime := GetTickCount64;
+  FCurrentOpcode := TWebSocketOpcode(OpByte);
+  OutLen := PayLen;
+  ConsumedBytes := HdrLen + PayLen;
+  OutOpcode := FCurrentOpcode;
+  Result := True;
+end;
+
 function TWebSocketSession.ProcessIncomingPlaintext(const PlainData: TBytes; out CloseConnection: Boolean): TArray<TBytes>;
+begin
+  if Length(PlainData) > 0 then
+    Result := ProcessIncomingPlaintextPtr(@PlainData[0], Length(PlainData), CloseConnection)
+  else
+    Result := ProcessIncomingPlaintextPtr(nil, 0, CloseConnection);
+end;
+
+function TWebSocketSession.ProcessIncomingPlaintextPtr(DataPtr: PByte; DataLen: Integer; out CloseConnection: Boolean): TArray<TBytes>;
 var
   Offset, PrevOffset: Integer;
   Frame: TWebSocketFrame;
   ErrorMsg: string;
   MsgList: TList<TBytes>;
   Lock: TCriticalSection;
+  PrevLen: Integer;
+  B0, B1, Rsv, OpByte, Len7: Byte;
+  HdrLen, PayLen, I, Chunks, Rem: Integer;
+  MaskKey: array[0..3] of Byte;
+  Mask32: UInt32;
+  Src32, Dst32: PCardinal;
+  Src8, Dst8: PByte;
+  MsgBytes: TBytes;
 begin
   CloseConnection := False;
   if InCleanup <> 0 then
@@ -460,15 +604,100 @@ begin
     Exit(nil);
   end;
 
+  Lock := FLock;
+  if not Assigned(Lock) or (InCleanup <> 0) then
+  begin
+    CloseConnection := True;
+    Exit(nil);
+  end;
+
+  if (DataLen >= 6) and Assigned(DataPtr) then
+  begin
+    B0 := DataPtr[0];
+    B1 := DataPtr[1];
+    Rsv := B0 and $70;
+    OpByte := B0 and $0F;
+    Len7 := B1 and $7F;
+    if ((B0 and $80) <> 0) and (Rsv = 0) and ((B1 and $80) <> 0) and
+       ((OpByte = Byte(Ord(wsOpText))) or (OpByte = Byte(Ord(wsOpBinary)))) and (Len7 < 127) then
+    begin
+      if Len7 < 126 then
+      begin
+        HdrLen := 6;
+        PayLen := Len7;
+      end
+      else
+      begin
+        if DataLen < 8 then
+          HdrLen := DataLen + 1
+        else
+        begin
+          HdrLen := 8;
+          PayLen := (Integer(DataPtr[2]) shl 8) or Integer(DataPtr[3]);
+          if PayLen < 126 then
+            HdrLen := DataLen + 1;
+        end;
+      end;
+
+      if (HdrLen + PayLen = DataLen) and (UInt64(PayLen) <= MAX_WS_MESSAGE_SIZE) then
+      begin
+        Lock.Acquire;
+        try
+          if InCleanup <> 0 then
+          begin
+            CloseConnection := True;
+            Exit(nil);
+          end;
+          if (Length(FIncomingBuffer) = 0) and (not FFragmentInProgress) then
+          begin
+            Move(DataPtr[HdrLen - 4], MaskKey[0], 4);
+            SetLength(MsgBytes, PayLen);
+            if PayLen > 0 then
+            begin
+              Move(MaskKey[0], Mask32, 4);
+              Src32 := PCardinal(@DataPtr[HdrLen]);
+              Dst32 := PCardinal(@MsgBytes[0]);
+              Chunks := PayLen div 4;
+              Rem := PayLen mod 4;
+              for I := 0 to Chunks - 1 do
+              begin
+                Dst32^ := Src32^ xor Mask32;
+                Inc(Src32);
+                Inc(Dst32);
+              end;
+              if Rem > 0 then
+              begin
+                Src8 := PByte(Src32);
+                Dst8 := PByte(Dst32);
+                for I := 0 to Rem - 1 do
+                begin
+                  Dst8^ := Src8^ xor MaskKey[I];
+                  Inc(Src8);
+                  Inc(Dst8);
+                end;
+              end;
+            end;
+            if (OpByte = Byte(Ord(wsOpText))) and not TWebSocketFrame.IsValidUTF8(MsgBytes) then
+            begin
+              QueueSendFrame(wsOpClose, TBytes.Create($03, $EF));
+              CloseConnection := True;
+              Exit(nil);
+            end;
+            FLastActivityTime := GetTickCount64;
+            FCurrentOpcode := TWebSocketOpcode(OpByte);
+            SetLength(Result, 1);
+            Result[0] := MsgBytes;
+            Exit;
+          end;
+        finally
+          Lock.Leave;
+        end;
+      end;
+    end;
+  end;
+
   MsgList := TList<TBytes>.Create;
   try
-    Lock := FLock;
-    if not Assigned(Lock) or (InCleanup <> 0) then
-    begin
-      CloseConnection := True;
-      Exit;
-    end;
-
     Lock.Acquire;
     try
       if InCleanup <> 0 then
@@ -477,11 +706,11 @@ begin
         Exit;
       end;
 
-      if Length(PlainData) > 0 then
+      if (DataLen > 0) and Assigned(DataPtr) then
       begin
-        var PrevLen := Length(FIncomingBuffer);
-        SetLength(FIncomingBuffer, PrevLen + Length(PlainData));
-        Move(PlainData[0], FIncomingBuffer[PrevLen], Length(PlainData));
+        PrevLen := Length(FIncomingBuffer);
+        SetLength(FIncomingBuffer, PrevLen + DataLen);
+        Move(DataPtr^, FIncomingBuffer[PrevLen], DataLen);
       end;
 
       Offset := 0;
@@ -706,7 +935,10 @@ begin
       Lock.Acquire;
       try
         if Assigned(FWriteQueue) then
+        begin
           FWriteQueue.Enqueue(RawFrame);
+          TInterlocked.Increment(FWriteQueueCount);
+        end;
       finally
         Lock.Leave;
       end;
@@ -734,7 +966,10 @@ begin
           IsFin := (Offset + Len) >= Length(Payload);
           RawFrame := TWebSocketFrame.Encode(CurrentOpcode, CurrentChunk, IsFin);
           if Assigned(FWriteQueue) then
+          begin
             FWriteQueue.Enqueue(RawFrame);
+            TInterlocked.Increment(FWriteQueueCount);
+          end;
 
           Inc(Offset, Len);
           CurrentOpcode := wsOpContinuation;
@@ -746,8 +981,270 @@ begin
   end;
 end;
 
+function TWebSocketSession.TryFastSendText(const Text: string): Boolean;
+var
+  WriteOv: POverlappedEx;
+  Utf8Len: Integer;
+  StartIdx: Integer;
+  FrameLen: Integer;
+  WSABuf: TWSABUF;
+  BytesSent: DWORD;
+begin
+  Result := False;
+  if (InCleanup <> 0) or (Length(Text) > 4096) then
+    Exit;
+
+  WriteOv := FWriteOverlapped;
+  if (not Assigned(WriteOv)) or WriteOv^.IsTLS then
+    Exit;
+
+  if TInterlocked.CompareExchange(WritePending, 1, 0) <> 0 then
+    Exit;
+
+  if (InCleanup <> 0) or (FWriteOverlapped <> WriteOv) or HasPendingWrites then
+  begin
+    TInterlocked.Exchange(WritePending, 0);
+    Exit;
+  end;
+
+  if Length(Text) = 0 then
+    Utf8Len := 0
+  else
+  begin
+    Utf8Len := WideCharToMultiByte(CP_UTF8, 0, PWideChar(Pointer(Text)), Length(Text),
+      PAnsiChar(@WriteOv^.SSLOutputBuffer[4]), SizeOf(WriteOv^.SSLOutputBuffer) - 4, nil, nil);
+    if Utf8Len <= 0 then
+    begin
+      TInterlocked.Exchange(WritePending, 0);
+      Exit;
+    end;
+  end;
+
+  if Utf8Len < 126 then
+  begin
+    StartIdx := 2;
+    WriteOv^.SSLOutputBuffer[2] := $81;
+    WriteOv^.SSLOutputBuffer[3] := Byte(Utf8Len);
+    FrameLen := 2 + Utf8Len;
+  end
+  else
+  begin
+    StartIdx := 0;
+    WriteOv^.SSLOutputBuffer[0] := $81;
+    WriteOv^.SSLOutputBuffer[1] := 126;
+    WriteOv^.SSLOutputBuffer[2] := Byte(Utf8Len shr 8);
+    WriteOv^.SSLOutputBuffer[3] := Byte(Utf8Len and $FF);
+    FrameLen := 4 + Utf8Len;
+  end;
+
+  WSABuf.len := FrameLen;
+  WSABuf.buf := @WriteOv^.SSLOutputBuffer[StartIdx];
+  ZeroMemory(@WriteOv^.Overlapped, SizeOf(TOverlapped));
+  BytesSent := 0;
+  if WSASend(FSocket, @WSABuf, 1, BytesSent, 0, @WriteOv^.Overlapped, nil) = SOCKET_ERROR then
+  begin
+    if WSAGetLastError = WSA_IO_PENDING then
+      Result := True
+    else
+      TInterlocked.Exchange(WritePending, 0);
+    Exit;
+  end;
+
+  if WriteOv^.SkipIOCP then
+  begin
+    if BytesSent > 0 then
+    begin
+      TInterlocked.Exchange(WritePending, 0);
+      Result := True;
+    end
+    else
+      TInterlocked.Exchange(WritePending, 0);
+  end
+  else
+    Result := True;
+end;
+
+procedure TWebSocketSession.BeginFastBatch;
+var
+  WriteOv: POverlappedEx;
+begin
+  if FBatchActive or (InCleanup <> 0) then
+    Exit;
+  WriteOv := FWriteOverlapped;
+  if (not Assigned(WriteOv)) or WriteOv^.IsTLS then
+    Exit;
+  if TInterlocked.CompareExchange(WritePending, 1, 0) <> 0 then
+    Exit;
+  if (InCleanup <> 0) or (FWriteOverlapped <> WriteOv) or HasPendingWrites then
+  begin
+    TInterlocked.Exchange(WritePending, 0);
+    Exit;
+  end;
+  FBatchActive := True;
+  FBatchLen := 0;
+  FBatchOverlapped := WriteOv;
+end;
+
+procedure TWebSocketSession.EndFastBatch;
+var
+  WriteOv: POverlappedEx;
+  SendLen: Integer;
+  WSABuf: TWSABUF;
+  BytesSent: DWORD;
+begin
+  if not FBatchActive then
+    Exit;
+  FBatchActive := False;
+  WriteOv := FBatchOverlapped;
+  SendLen := FBatchLen;
+  FBatchOverlapped := nil;
+  FBatchLen := 0;
+  if (SendLen <= 0) or (not Assigned(WriteOv)) or (InCleanup <> 0) or (FWriteOverlapped <> WriteOv) then
+  begin
+    TInterlocked.Exchange(WritePending, 0);
+    Exit;
+  end;
+  WSABuf.len := SendLen;
+  WSABuf.buf := @WriteOv^.SSLOutputBuffer[0];
+  ZeroMemory(@WriteOv^.Overlapped, SizeOf(TOverlapped));
+  BytesSent := 0;
+  if WSASend(FSocket, @WSABuf, 1, BytesSent, 0, @WriteOv^.Overlapped, nil) = SOCKET_ERROR then
+  begin
+    if WSAGetLastError <> WSA_IO_PENDING then
+      TInterlocked.Exchange(WritePending, 0);
+    Exit;
+  end;
+  if WriteOv^.SkipIOCP then
+    TInterlocked.Exchange(WritePending, 0);
+end;
+
+function TWebSocketSession.TryFastSendRaw(Opcode: TWebSocketOpcode; PayloadPtr: PByte; PayloadLen: Integer): Boolean;
+var
+  WriteOv: POverlappedEx;
+  StartIdx: Integer;
+  FrameLen: Integer;
+  HdrBytes: Integer;
+  WSABuf: TWSABUF;
+  BytesSent: DWORD;
+  FirstByte: Byte;
+begin
+  Result := False;
+  if (InCleanup <> 0) or (PayloadLen < 0) or (PayloadLen > 4096) then
+    Exit;
+
+  if FBatchActive and Assigned(FBatchOverlapped) then
+  begin
+    WriteOv := FBatchOverlapped;
+    if PayloadLen < 126 then
+      HdrBytes := 2
+    else
+      HdrBytes := 4;
+    if (InCleanup = 0) and (FWriteOverlapped = WriteOv) and
+       (FBatchLen + HdrBytes + PayloadLen <= SizeOf(WriteOv^.SSLOutputBuffer)) then
+    begin
+      FirstByte := $80 or Byte(Ord(Opcode));
+      if PayloadLen < 126 then
+      begin
+        WriteOv^.SSLOutputBuffer[FBatchLen] := FirstByte;
+        WriteOv^.SSLOutputBuffer[FBatchLen + 1] := Byte(PayloadLen);
+      end
+      else
+      begin
+        WriteOv^.SSLOutputBuffer[FBatchLen] := FirstByte;
+        WriteOv^.SSLOutputBuffer[FBatchLen + 1] := 126;
+        WriteOv^.SSLOutputBuffer[FBatchLen + 2] := Byte(PayloadLen shr 8);
+        WriteOv^.SSLOutputBuffer[FBatchLen + 3] := Byte(PayloadLen and $FF);
+      end;
+      if (PayloadLen > 0) and Assigned(PayloadPtr) then
+        Move(PayloadPtr^, WriteOv^.SSLOutputBuffer[FBatchLen + HdrBytes], PayloadLen);
+      Inc(FBatchLen, HdrBytes + PayloadLen);
+      Result := True;
+      Exit;
+    end;
+    EndFastBatch;
+  end;
+
+  WriteOv := FWriteOverlapped;
+  if (not Assigned(WriteOv)) or WriteOv^.IsTLS then
+    Exit;
+
+  if TInterlocked.CompareExchange(WritePending, 1, 0) <> 0 then
+    Exit;
+
+  if (InCleanup <> 0) or (FWriteOverlapped <> WriteOv) or HasPendingWrites then
+  begin
+    TInterlocked.Exchange(WritePending, 0);
+    Exit;
+  end;
+
+  if (PayloadLen > 0) and Assigned(PayloadPtr) then
+    Move(PayloadPtr^, WriteOv^.SSLOutputBuffer[4], PayloadLen);
+
+  FirstByte := $80 or Byte(Ord(Opcode));
+  if PayloadLen < 126 then
+  begin
+    StartIdx := 2;
+    WriteOv^.SSLOutputBuffer[2] := FirstByte;
+    WriteOv^.SSLOutputBuffer[3] := Byte(PayloadLen);
+    FrameLen := 2 + PayloadLen;
+  end
+  else
+  begin
+    StartIdx := 0;
+    WriteOv^.SSLOutputBuffer[0] := FirstByte;
+    WriteOv^.SSLOutputBuffer[1] := 126;
+    WriteOv^.SSLOutputBuffer[2] := Byte(PayloadLen shr 8);
+    WriteOv^.SSLOutputBuffer[3] := Byte(PayloadLen and $FF);
+    FrameLen := 4 + PayloadLen;
+  end;
+
+  WSABuf.len := FrameLen;
+  WSABuf.buf := @WriteOv^.SSLOutputBuffer[StartIdx];
+  ZeroMemory(@WriteOv^.Overlapped, SizeOf(TOverlapped));
+  BytesSent := 0;
+  if WSASend(FSocket, @WSABuf, 1, BytesSent, 0, @WriteOv^.Overlapped, nil) = SOCKET_ERROR then
+  begin
+    if WSAGetLastError = WSA_IO_PENDING then
+      Result := True
+    else
+      TInterlocked.Exchange(WritePending, 0);
+    Exit;
+  end;
+
+  if WriteOv^.SkipIOCP then
+  begin
+    if BytesSent > 0 then
+    begin
+      TInterlocked.Exchange(WritePending, 0);
+      Result := True;
+    end
+    else
+      TInterlocked.Exchange(WritePending, 0);
+  end
+  else
+    Result := True;
+end;
+
+procedure TWebSocketSession.SendRaw(Opcode: TWebSocketOpcode; PayloadPtr: PByte; PayloadLen: Integer);
+var
+  Buf: TBytes;
+begin
+  if TryFastSendRaw(Opcode, PayloadPtr, PayloadLen) then
+    Exit;
+  if (PayloadLen > 0) and Assigned(PayloadPtr) then
+  begin
+    SetLength(Buf, PayloadLen);
+    Move(PayloadPtr^, Buf[0], PayloadLen);
+  end
+  else
+    SetLength(Buf, 0);
+  QueueSendFrame(Opcode, Buf);
+end;
+
 procedure TWebSocketSession.SendText(const Text: string);
 begin
+  if TryFastSendText(Text) then
+    Exit;
   QueueSendFrame(wsOpText, TEncoding.UTF8.GetBytes(Text));
 end;
 
@@ -769,6 +1266,7 @@ begin
       if Assigned(FWriteQueue) and (FWriteQueue.Count > 0) then
       begin
         Chunk := FWriteQueue.Dequeue;
+        TInterlocked.Decrement(FWriteQueueCount);
         Result := True;
       end;
     finally
@@ -783,21 +1281,8 @@ begin
 end;
 
 function TWebSocketSession.HasPendingWrites: Boolean;
-var
-  Lock: TCriticalSection;
 begin
-  Result := False;
-  Lock := FLock;
-  if Assigned(Lock) then
-  begin
-    Lock.Acquire;
-    try
-      if Assigned(FWriteQueue) then
-        Result := FWriteQueue.Count > 0;
-    finally
-      Lock.Leave;
-    end;
-  end;
+  Result := TInterlocked.CompareExchange(FWriteQueueCount, 0, 0) <> 0;
 end;
 
 { TWebSocketManager }

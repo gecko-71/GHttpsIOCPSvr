@@ -174,14 +174,12 @@ begin
 end;
 
 procedure THttp3Server.OnDatagramReceived(Sender: TObject; Connection: HQUIC; ConnCtx: PConnectionContext; const Buffer: PByte; BufferLength: Cardinal);
-var
-  Data: TBytes;
 begin
-  if not Assigned(FWebTransport) then Exit;
-  if (Buffer = nil) or (BufferLength = 0) then Exit;
-  SetLength(Data, BufferLength);
-  Move(Buffer^, Data[0], BufferLength);
-  FWebTransport.HandleDatagram(Connection, Data);
+  if not Assigned(FWebTransport) then
+    Exit;
+  if (Buffer = nil) or (BufferLength = 0) then
+    Exit;
+  FWebTransport.HandleDatagramPtr(Connection, Buffer, BufferLength);
 end;
 
 procedure THttp3Server.ConfigureQpack(ConnCtx: PConnectionContext; H3State: THttp3ConnectionState);
@@ -248,20 +246,14 @@ begin
   Status := FQuicServer.MsQuic.Api.StreamStart(Stream, QUIC_STREAM_START_FLAG_NONE);
   if QuicSucceeded(Status) then
   begin
-    New(SendCtx);
-    SendCtx.Server := FQuicServer;
-    TInterlocked.Increment(FQuicServer.FSendCtxAllocated);
-    SendCtx.DynamicBuffer := nil;
+    SendCtx := FQuicServer.AllocSendCtx;
     Move(SettingsFrame[0], SendCtx.Data[0], Length(SettingsFrame));
     SendCtx.QuicBuffer.Length := Length(SettingsFrame);
     SendCtx.QuicBuffer.Buffer := @SendCtx.Data[0];
 
     Status := FQuicServer.MsQuic.Api.StreamSend(Stream, @SendCtx.QuicBuffer, 1, QUIC_SEND_FLAG_NONE, SendCtx);
     if QuicFailed(Status) then
-    begin
-      Dispose(SendCtx);
-      TInterlocked.Increment(FQuicServer.FSendCtxFreed);
-    end;
+      FQuicServer.FreeSendCtx(SendCtx);
   end;
 
   Status := FQuicServer.MsQuic.Api.StreamOpen(ConnCtx.Connection,
@@ -276,10 +268,7 @@ begin
                             QUIC_STREAM_START_FLAG_NONE);
     if QuicSucceeded(Status) then
     begin
-      New(SendCtx);
-      SendCtx.Server := FQuicServer;
-      TInterlocked.Increment(FQuicServer.FSendCtxAllocated);
-      SendCtx.DynamicBuffer := nil;
+      SendCtx := FQuicServer.AllocSendCtx;
       Move(VarIntStreamType[0], SendCtx.Data[0], Length(VarIntStreamType));
       SendCtx.QuicBuffer.Length := Length(VarIntStreamType);
       SendCtx.QuicBuffer.Buffer := @SendCtx.Data[0];
@@ -288,10 +277,7 @@ begin
                                  @SendCtx.QuicBuffer,
                                  1,
                                  QUIC_SEND_FLAG_NONE, SendCtx)) then
-      begin
-        Dispose(SendCtx);
-        TInterlocked.Increment(FQuicServer.FSendCtxFreed);
-      end;
+        FQuicServer.FreeSendCtx(SendCtx);
     end;
   end;
 
@@ -306,10 +292,7 @@ begin
     Status := FQuicServer.MsQuic.Api.StreamStart(Stream, QUIC_STREAM_START_FLAG_NONE);
     if QuicSucceeded(Status) then
     begin
-      New(SendCtx);
-      SendCtx.Server := FQuicServer;
-      TInterlocked.Increment(FQuicServer.FSendCtxAllocated);
-      SendCtx.DynamicBuffer := nil;
+      SendCtx := FQuicServer.AllocSendCtx;
       Move(VarIntStreamType[0], SendCtx.Data[0], Length(VarIntStreamType));
       SendCtx.QuicBuffer.Length := Length(VarIntStreamType);
       SendCtx.QuicBuffer.Buffer := @SendCtx.Data[0];
@@ -317,10 +300,7 @@ begin
       if QuicFailed(FQuicServer.MsQuic.Api.StreamSend(Stream,
                          @SendCtx.QuicBuffer, 1,
                          QUIC_SEND_FLAG_NONE, SendCtx)) then
-      begin
-        Dispose(SendCtx);
-        TInterlocked.Increment(FQuicServer.FSendCtxFreed);
-      end;
+        FQuicServer.FreeSendCtx(SendCtx);
     end;
   end;
 end;
@@ -1111,9 +1091,7 @@ begin
       DataLen := nil;
       FullLen := Length(FrameType) + Length(FrameLen) + Length(Block);
     end;
-    New(SendCtx);
-    SendCtx.Server := FQuicServer;
-    TInterlocked.Increment(FQuicServer.FSendCtxAllocated);
+    SendCtx := FQuicServer.AllocSendCtx;
     SendCtx.QuicBuffer.Length := FullLen;
 
     if FullLen <= 1500 then
@@ -1152,10 +1130,7 @@ begin
     Status := FQuicServer.MsQuic.Api.StreamSend(StreamHandle, @SendCtx.QuicBuffer, 1, QUIC_SEND_FLAG_FIN, SendCtx);
     if not QuicSucceeded(Status) then
     begin
-      if SendCtx.DynamicBuffer <> nil then
-        FreeMem(SendCtx.DynamicBuffer);
-      Dispose(SendCtx);
-      TInterlocked.Increment(FQuicServer.FSendCtxFreed);
+      FQuicServer.FreeSendCtx(SendCtx);
       SendCtx := nil;
     end;
   except
@@ -1167,10 +1142,7 @@ begin
       if SendCtx <> nil then
       begin
         try
-          if SendCtx.DynamicBuffer <> nil then
-            FreeMem(SendCtx.DynamicBuffer);
-          Dispose(SendCtx);
-          TInterlocked.Increment(FQuicServer.FSendCtxFreed);
+          FQuicServer.FreeSendCtx(SendCtx);
         except
           on EFree: Exception do
             Logger.Error('[HTTP/3] Error freeing SendCtx on exception: %s', [EFree.Message]);
