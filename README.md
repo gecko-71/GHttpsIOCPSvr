@@ -297,7 +297,7 @@ Server.RegisterWebTransportRoute('/live-transport',
 
 ## Performance Benchmarks (`k6` / `xk6-http3`)
 
-Measured on Windows 11 (AMD64), 6 logical CPU threads, 15.8 GB RAM (`2026-11-15 18:01:39`). Full report: [benchmark_suite_k6/results/BENCHMARK_REPORT.md](benchmark_suite_k6/results/BENCHMARK_REPORT.md).
+Measured on Windows 11 
 
 ### HTTP (Plaintext)
 
