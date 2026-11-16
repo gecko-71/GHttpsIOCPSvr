@@ -1,4 +1,4 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{1F506B04-7DD1-4CBE-A88E-50CB9E2957E9}</ProjectGuid>
         <ProjectVersion>20.3</ProjectVersion>
@@ -96,9 +96,22 @@
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
         <DCCReference Include="..\..\src\GHttpsServerIOCP.pas"/>
+        <DCCReference Include="..\..\src\GHttpsServerTypes.pas"/>
+        <DCCReference Include="..\..\src\GSchannelTlsManager.pas"/>
+        <DCCReference Include="..\..\src\GIpSecurityAndCors.pas"/>
+        <DCCReference Include="..\..\src\GWebSocketBridge.pas"/>
+        <DCCReference Include="..\..\src\GHttp3WebTransportBridge.pas"/>
+        <DCCReference Include="..\..\src\GIocpWorkerEngine.pas"/>
         <DCCReference Include="..\..\src\GWebSocket.pas"/>
         <DCCReference Include="..\..\src\GJWTManager.pas"/>
         <DCCReference Include="..\..\src\GRequest.pas"/>
+        <DCCReference Include="..\..\src\GRequestTypes.pas"/>
+        <DCCReference Include="..\..\src\GRequestHeaderValidator.pas"/>
+        <DCCReference Include="..\..\src\GRequestUriValidator.pas"/>
+        <DCCReference Include="..\..\src\GRequestEncodingAndRecovery.pas"/>
+        <DCCReference Include="..\..\src\GRequestHeaders.pas"/>
+        <DCCReference Include="..\..\src\GRequestInfo.pas"/>
+        <DCCReference Include="..\..\src\GRequestHeaderFastParser.pas"/>
         <DCCReference Include="..\..\src\GRequestBody.pas"/>
         <DCCReference Include="..\..\src\GResponse.pas"/>
         <DCCReference Include="..\..\src\OverlappedExPool.pas"/>

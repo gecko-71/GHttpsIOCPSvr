@@ -1,4 +1,4 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{F1E2D3C4-B5A6-47F8-9012-3456789ABCDE}</ProjectGuid>
         <ProjectVersion>20.3</ProjectVersion>
@@ -84,8 +84,21 @@
         <DCCReference Include="src\GTerm.ConPty.pas"/>
         <DCCReference Include="src\GTerm.Session.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\src\GHttpsServerIOCP.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GHttpsServerTypes.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GSchannelTlsManager.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GIpSecurityAndCors.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GWebSocketBridge.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GHttp3WebTransportBridge.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GIocpWorkerEngine.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\src\GJWTManager.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\src\GRequest.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GRequestTypes.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GRequestHeaderValidator.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GRequestUriValidator.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GRequestEncodingAndRecovery.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GRequestHeaders.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GRequestInfo.pas"/>
+        <DCCReference Include="GHttpsIOCPSvr\src\GRequestHeaderFastParser.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\src\GRequestBody.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\src\GResponse.pas"/>
         <DCCReference Include="GHttpsIOCPSvr\src\OverlappedExPool.pas"/>

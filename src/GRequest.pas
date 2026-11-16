@@ -1,27 +1,3 @@
-{
-  MIT License
-
-  Copyright (c) (c) 2026 GECKO-71
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files (the "Software"), to deal
-  in the Software without restriction, including without limitation the rights
-  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-  copies of the Software, and to permit persons to whom the Software is
-  furnished to do so, subject to the following conditions:
-
-  The above copyright notice and this permission notice shall be included in all
-  copies or substantial portions of the Software.
-
-  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-  SOFTWARE.
-}
-
 unit GRequest;
 
 interface
@@ -30,228 +6,84 @@ uses
   Quick.Logger, System.SysUtils, System.Classes, System.Threading, System.SyncObjs,
   System.Generics.Collections, System.Math, System.StrUtils, System.Character,
   Winapi.Windows, Winapi.WinSock2,
-  System.NetEncoding, GRequestBody, System.Generics.Defaults, System.ZLib;
+  System.NetEncoding, GRequestBody, System.Generics.Defaults, System.ZLib,
+  GRequestTypes, GRequestUriValidator, GRequestHeaderValidator,
+  GRequestEncodingAndRecovery, GRequestHeaders, GRequestInfo,
+  GRequestHeaderFastParser;
 
 type
-  TGClientCertInfo = record
-    HasCertificate: Boolean;
-    IsVerified: Boolean;
-    Subject: string;
-    CommonName: string;
-    Issuer: string;
-    SerialNumber: string;
-    ThumbprintSHA256: string;
-    ValidFrom: TDateTime;
-    ValidTo: TDateTime;
-    ValidationError: string;
-    SAN: string;
-    RawCertBase64: string;
-  end;
+  TGClientCertInfo = GRequestTypes.TGClientCertInfo;
+  TClientCertValidateEvent = GRequestTypes.TClientCertValidateEvent;
+  TCaseInsensitiveStringComparer = GRequestTypes.TCaseInsensitiveStringComparer;
+  THttpMethod = GRequestTypes.THttpMethod;
+  THttpVersion = GRequestTypes.THttpVersion;
+  TRequestState = GRequestTypes.TRequestState;
+  TTransferEncoding = GRequestTypes.TTransferEncoding;
+  TConnectionType = GRequestTypes.TConnectionType;
+  TSecurityThreat = GRequestTypes.TSecurityThreat;
+  TRecoveryAction = GRequestTypes.TRecoveryAction;
+  TValidationLevel = GRequestTypes.TValidationLevel;
+  TUriValidator = GRequestUriValidator.TUriValidator;
+  THeaderValidator = GRequestHeaderValidator.THeaderValidator;
+  TContentEncodingHandler = GRequestEncodingAndRecovery.TContentEncodingHandler;
+  TRequestRecovery = GRequestEncodingAndRecovery.TRequestRecovery;
+  THttpHeaders = GRequestHeaders.THttpHeaders;
+  THttpRequestInfo = GRequestInfo.THttpRequestInfo;
 
-  TClientCertValidateEvent = reference to function(const CertInfo: TGClientCertInfo): Boolean;
+const
+  hmUnknown = GRequestTypes.hmUnknown;
+  hmGET = GRequestTypes.hmGET;
+  hmPOST = GRequestTypes.hmPOST;
+  hmPUT = GRequestTypes.hmPUT;
+  hmDELETE = GRequestTypes.hmDELETE;
+  hmHEAD = GRequestTypes.hmHEAD;
+  hmOPTIONS = GRequestTypes.hmOPTIONS;
+  hmPATCH = GRequestTypes.hmPATCH;
+  hmTRACE = GRequestTypes.hmTRACE;
+  hmCONNECT = GRequestTypes.hmCONNECT;
 
-  TCaseInsensitiveStringComparer = class(TInterfacedObject, IEqualityComparer<string>)
-  public
-    function Equals(const Left, Right: string): Boolean; reintroduce; overload;
-    function GetHashCode(const Value: string): Integer; reintroduce; overload;
-  end;
+  hvUnknown = GRequestTypes.hvUnknown;
+  hvHTTP10 = GRequestTypes.hvHTTP10;
+  hvHTTP11 = GRequestTypes.hvHTTP11;
+  hvHTTP20 = GRequestTypes.hvHTTP20;
 
-  THttpMethod = (hmUnknown, hmGET, hmPOST, hmPUT, hmDELETE, hmHEAD, hmOPTIONS, hmPATCH, hmTRACE, hmCONNECT);
-  THttpVersion = (hvUnknown, hvHTTP10, hvHTTP11, hvHTTP20);
-  TRequestState = (rsWaitingHeaders, rsParsingHeaders, rsWaitingBody, rsComplete, rsError, rsRecovering);
-  TTransferEncoding = (teNone, teChunked, teCompress, teDeflate, teGzip, teIdentity);
-  TConnectionType = (ctKeepAlive, ctClose, ctUpgrade);
-  TSecurityThreat = (stNone, stRequestSmuggling, stHeaderInjection, stOversizeAttack,
-                    stMalformedURI, stInvalidEncoding, stSuspiciousHeaders);
-  TRecoveryAction = (raAbort, raSkipHeader, raTruncateValue, raSanitize, raContinue);
-  TValidationLevel = (vlStrict, vlModerate, vlPermissive);
+  rsWaitingHeaders = GRequestTypes.rsWaitingHeaders;
+  rsParsingHeaders = GRequestTypes.rsParsingHeaders;
+  rsWaitingBody = GRequestTypes.rsWaitingBody;
+  rsComplete = GRequestTypes.rsComplete;
+  rsError = GRequestTypes.rsError;
+  rsRecovering = GRequestTypes.rsRecovering;
 
-  TUriValidator = class
-  protected
-    class function IsUnreserved(C: Char): Boolean;
-    class function IsReserved(C: Char): Boolean;
-    class function IsGenDelim(C: Char): Boolean;
-    class function IsSubDelim(C: Char): Boolean;
-    class function IsValidFragment(const Fragment: string): Boolean;
-    class function DecodePercentEncoding(const Input: string): string;
-    class function IsValidPercentEncoded(const Input: string; Pos: Integer): Boolean;
-  public
-    class function IsValidPath(const Path: string): Boolean;
-    class function IsValidQuery(const Query: string): Boolean;
-    class function ValidateURI(const URI: string; out ErrorMsg: string): Boolean;
-    class function ValidateAbsolutePath(const Path: string; out ErrorMsg: string): Boolean;
-    class function SanitizeURI(const URI: string): string;
-    class function NormalizeURI(const URI: string): string;
-    class function IsValidScheme(const Scheme: string): Boolean;
-    class function IsValidAuthority(const Authority: string): Boolean;
-  end;
+  teNone = GRequestTypes.teNone;
+  teChunked = GRequestTypes.teChunked;
+  teCompress = GRequestTypes.teCompress;
+  teDeflate = GRequestTypes.teDeflate;
+  teGzip = GRequestTypes.teGzip;
+  teIdentity = GRequestTypes.teIdentity;
 
-  THeaderValidator = class
-  protected
-    class function IsValidTokenChar(C: Char): Boolean;
-    class function IsValidFieldVChar(C: Char): Boolean;
-    class function IsObsText(C: Char): Boolean;
-    class function HasSuspiciousPatterns(const Value: string): Boolean;
-    class function DetectInjectionAttempt(const Value: string): Boolean;
-  public
-    class function ValidateHeaderName(const Name: string; out ErrorMsg: string): Boolean;
-    class function ValidateHeaderValue(const AHeaderName, Value: string; out ErrorMsg: string): Boolean;
-    class function SanitizeHeaderValue(const Value: string): string;
-    class function IsSafeHeaderName(const Name: string): Boolean;
-    class function HasSuspiciousPatternsPtr(P: PByte; Len: Integer): Boolean;
-    class function DetectRequestSmuggling(const Headers: TStringList): TSecurityThreat;
-  end;
+  ctKeepAlive = GRequestTypes.ctKeepAlive;
+  ctClose = GRequestTypes.ctClose;
+  ctUpgrade = GRequestTypes.ctUpgrade;
 
-  TContentEncodingHandler = class
-  private
-    function GetEncodingFromString(const EncodingStr: string): TContentEncoding;
-    function DecompressGzip(const Data: TBytes): TBytes;
-    function DecompressDeflate(const Data: TBytes): TBytes;
-    function DecompressBrotli(const Data: TBytes): TBytes;
-  public
-    constructor Create;
-    destructor Destroy; override;
-    function ParseContentEncoding(const EncodingHeader: string): TArray<TContentEncoding>;
-    function DecompressData(const Data: TBytes; Encoding: TContentEncoding): TBytes;
-    function GetEncodingName(Encoding: TContentEncoding): string;
-    function IsCompressionSupported(Encoding: TContentEncoding): Boolean;
-  end;
+  stNone = GRequestTypes.stNone;
+  stRequestSmuggling = GRequestTypes.stRequestSmuggling;
+  stHeaderInjection = GRequestTypes.stHeaderInjection;
+  stOversizeAttack = GRequestTypes.stOversizeAttack;
+  stMalformedURI = GRequestTypes.stMalformedURI;
+  stInvalidEncoding = GRequestTypes.stInvalidEncoding;
+  stSuspiciousHeaders = GRequestTypes.stSuspiciousHeaders;
 
-  TRequestRecovery = class
-  private
-    FRecoveryActions: TList<TRecoveryAction>;
-    FErrorLog: TStringList;
-    FRecoveryAttempts: Integer;
-    FMaxRecoveryAttempts: Integer;
-  public
-    constructor Create(MaxAttempts: Integer = 3);
-    destructor Destroy; override;
-    function CanRecover(const Error: string): Boolean;
-    function SuggestRecoveryAction(const Error: string; const Context: string): TRecoveryAction;
-    procedure LogRecoveryAttempt(const Action: TRecoveryAction; const Details: string);
-    function GetRecoveryLog: string;
-    procedure Clear;
-    property RecoveryAttempts: Integer read FRecoveryAttempts;
-    property MaxRecoveryAttempts: Integer read FMaxRecoveryAttempts write FMaxRecoveryAttempts;
-  end;
+  raAbort = GRequestTypes.raAbort;
+  raSkipHeader = GRequestTypes.raSkipHeader;
+  raTruncateValue = GRequestTypes.raTruncateValue;
+  raSanitize = GRequestTypes.raSanitize;
+  raContinue = GRequestTypes.raContinue;
 
-  THttpHeaders = class
-  private
-    FHeaders: TObjectDictionary<string, TStringList>;
-    FPooledLists: TList<TStringList>;
-    FSlotNames: array[0..15] of string;
-    FSlotValues: array[0..15] of string;
-    FSlotCount: Integer;
-    FUseDict: Boolean;
-    FValidationLevel: TValidationLevel;
-    FContentEncodingHandler: TContentEncodingHandler;
-    function NormalizeHeaderName(const HeaderName: string): string;
-    function ProcessInternationalHeader(const Value: string): string;
-    procedure EnsureDictMode;
-  protected
-    function ParseFoldedHeader(const Lines: TStringList; StartIndex: Integer; out EndIndex: Integer): string;
-    procedure ValidateAndAdd(const Name, Value: string);
-    function GetContentLength: string;
-    function GetContentType: string;
-    function GetContentEncoding: string;
-    function GetUserAgent: string;
-    function GetHost: string;
-    function GetAuthorization: string;
-    function GetCookie: string;
-    function GetReferer: string;
-    function GetTransferEncoding: string;
-    function GetConnection: string;
-  public
-    constructor Create(ValidationLevel: TValidationLevel = vlModerate);
-    destructor Destroy; override;
-    procedure AddHeader(const Name, Value: string);
-    procedure AddNormalizedHeader(const NormalizedName, CleanValue: string);
-    procedure AddMultipleValues(const Name: string; const Values: TArray<string>);
-    function GetHeader(const Name: string): string;
-    function GetHeaderValues(const Name: string): TArray<string>;
-    function HasHeader(const Name: string): Boolean;
-    function GetFirstValue(const Name: string): string;
-    function GetLastValue(const Name: string): string;
-    procedure Clear;
-    function GetHeaderNames: TArray<string>;
-    function Count: Integer;
-    function DetectSecurityThreats: TArray<TSecurityThreat>;
-    function SanitizeHeaders: Integer;
-    function GetContentEncodings: TArray<TContentEncoding>;
-    function IsCompressionUsed: Boolean;
-    property ValidationLevel: TValidationLevel read FValidationLevel write FValidationLevel;
-    property ContentLength: string read GetContentLength;
-    property ContentType: string read GetContentType;
-    property ContentEncoding: string read GetContentEncoding;
-    property UserAgent: string read GetUserAgent;
-    property Host: string read GetHost;
-    property Authorization: string read GetAuthorization;
-    property Cookie: string read GetCookie;
-    property Referer: string read GetReferer;
-    property TransferEncoding: string read GetTransferEncoding;
-    property Connection: string read GetConnection;
-    property Headers: TObjectDictionary<string, TStringList> read FHeaders;
-  end;
+  vlStrict = GRequestTypes.vlStrict;
+  vlModerate = GRequestTypes.vlModerate;
+  vlPermissive = GRequestTypes.vlPermissive;
 
-  THttpRequestInfo = class
-  private
-    FMethod: THttpMethod;
-    FVersion: THttpVersion;
-    FUri: string;
-    FRawUri: string;
-    FNormalizedUri: string;
-    FQueryString: string;
-    FPath: string;
-    FFragment: string;
-    FScheme: string;
-    FAuthority: string;
-    FTransferEncoding: TTransferEncoding;
-    FConnectionType: TConnectionType;
-    FContentLength: Int64;
-    FContentEncodings: TArray<TContentEncoding>;
-    FIsSecure: Boolean;
-    FUriValidationErrors: TStringList;
-    FQueryParameters: TDictionary<string, string>;
-    function StringToHttpMethod(const MethodStr: string): THttpMethod;
-    function StringToHttpVersion(const VersionStr: string): THttpVersion;
-    function ParseTransferEncoding(const EncodingStr: string): TTransferEncoding;
-    function ParseConnectionType(const ConnectionStr: string): TConnectionType;
-  public
-    constructor Create;
-    destructor Destroy; override;
-    procedure ValidateUriComponents;
-    procedure ParseQueryString(const AQueryString: string; ADictionary: TDictionary<string, string>);
-    procedure ParseUri(const RawUri: string);
-    procedure ParseRequestLine(const RequestLine: string);
-    function ParseRequestLinePtr(LinePtr: PByte; LineLen: Integer; var CachedUri: string): Boolean;
-    procedure ParseFromHeaders(Headers: THttpHeaders);
-    procedure Clear;
-    property Method: THttpMethod read FMethod;
-    property Version: THttpVersion read FVersion;
-    property Uri: string read FUri;
-    property RawUri: string read FRawUri;
-    property NormalizedUri: string read FNormalizedUri;
-    property QueryString: string read FQueryString;
-    property Path: string read FPath;
-    property Fragment: string read FFragment;
-    property Scheme: string read FScheme;
-    property Authority: string read FAuthority;
-    property TransferEncoding: TTransferEncoding read FTransferEncoding;
-    property ConnectionType: TConnectionType read FConnectionType;
-    property ContentLength: Int64 read FContentLength;
-    property ContentEncodings: TArray<TContentEncoding> read FContentEncodings;
-    property IsSecure: Boolean read FIsSecure write FIsSecure;
-    property UriValidationErrors: TStringList read FUriValidationErrors;
-    property QueryParameters: TDictionary<string, string> read FQueryParameters;
-    function MethodToString: string;
-    function VersionToString: string;
-    function HasBody: Boolean;
-    function IsMethodSafe: Boolean;
-    function IsMethodIdempotent: Boolean;
-    function IsUriValid: Boolean;
-    function GetUriValidationSummary: string;
-  end;
-
+type
   TRequest = class
   private
     FHeadersSize: Integer;
@@ -391,7 +223,7 @@ type
     property AllowedFileExtensions: TStringList read FAllowedFileExtensions;
     property BlockedMimeTypes: TStringList read FBlockedMimeTypes;
     property RawBuffer: TBytes read FRawBuffer;
-    property RawBufferSize: Integer read FRawBufferSize write  FRawBufferSize;
+    property RawBufferSize: Integer read FRawBufferSize write FRawBufferSize;
     property ClientCertificate: TGClientCertInfo read FClientCertInfo write FClientCertInfo;
     function IsComplete: Boolean;
     function IsHeadersComplete: Boolean;
@@ -403,8 +235,9 @@ type
     function IsRecoverable: Boolean;
   end;
 
-implementation
+function IsHexDigit(c: Char): Boolean;
 
+implementation
 
 const
   CRLF = #13#10;
@@ -419,3002 +252,7 @@ const
 
 function IsHexDigit(c: Char): Boolean;
 begin
-  Result := ((c >= '0') and (c <= '9')) or
-            ((c >= 'A') and (c <= 'F')) or
-            ((c >= 'a') and (c <= 'f'));
-end;
-
-class function TUriValidator.IsUnreserved(C: Char): Boolean;
-begin
-  Result := C.IsLetterOrDigit or (C = '-') or (C = '.') or (C = '_') or (C = '~');
-end;
-
-class function TUriValidator.IsReserved(C: Char): Boolean;
-begin
-  Result := IsGenDelim(C) or IsSubDelim(C);
-end;
-
-class function TUriValidator.IsGenDelim(C: Char): Boolean;
-begin
-  Result := CharInSet(C, [':', '/', '?', '#', '[', ']', '@']);
-end;
-
-class function TUriValidator.IsSubDelim(C: Char): Boolean;
-begin
-  Result := CharInSet(C, ['!', '$', '&', '''', '(', ')', '*', '+', ',', ';', '=']);
-end;
-
-class function TUriValidator.IsValidScheme(const Scheme: string): Boolean;
-var
-  I: Integer;
-begin
-  Result := False;
-  if Length(Scheme) = 0 then
-    Exit;
-  if not Scheme[1].IsLetter then
-    Exit;
-  for I := 2 to Length(Scheme) do
-  begin
-    if not (Scheme[I].IsLetterOrDigit or CharInSet(Scheme[I], ['+', '-', '.'])) then
-      Exit;
-  end;
-  Result := True;
-end;
-
-class function TUriValidator.IsValidAuthority(const Authority: string): Boolean;
-var
-  I: Integer;
-  C: Char;
-begin
-  Result := True;
-
-  for I := 1 to Length(Authority) do
-  begin
-    C := Authority[I];
-    if not (IsUnreserved(C) or
-            IsSubDelim(C) or
-            (C = ':') or
-            (C = '@') or
-            (C = '[') or
-            (C = ']')) then
-    begin
-      if (C = '%') and (I <= Length(Authority) - 2) then
-      begin
-        if not IsValidPercentEncoded(Authority, I) then
-        begin
-          Result := False;
-          Exit;
-        end;
-      end
-      else
-      begin
-        Result := False;
-        Exit;
-      end;
-    end;
-  end;
-end;
-
-class function TUriValidator.IsValidPath(const Path: string): Boolean;
-var
-  I: Integer;
-  C: Char;
-  DecodedPath: string;
-begin
-  Result := True;
-  if Length(Path) = 0 then
-  begin
-    Exit(True);
-  end;
-  DecodedPath := TNetEncoding.URL.Decode(Path);
-  if (Pos('..', DecodedPath) > 0) or THeaderValidator.HasSuspiciousPatterns(DecodedPath) then
-    Exit(False);
-
-  try
-    I := 1;
-    while I <= Length(Path) do
-    begin
-      C := Path[I];
-      if IsUnreserved(C) or
-         IsSubDelim(C) or
-         (C = ':') or
-         (C = '@') or
-         (C = '/') then
-      begin
-        Inc(I);
-        Continue;
-      end;
-      if (C = '%') and (I <= Length(Path) - 2) then
-      begin
-        if IsValidPercentEncoded(Path, I) then
-        begin
-          Inc(I, 3);
-          Continue;
-        end
-        else
-        begin
-          Result := False;
-          Exit;
-        end;
-      end;
-      Result := False;
-      Exit;
-    end;
-  except
-    on E: Exception do
-    begin
-      Logger.Error('DEBUG: Exception in IsValidPath: %s', [E.Message]);
-      Result := False;
-    end;
-  end;
-end;
-
-class function TUriValidator.IsValidQuery(const Query: string): Boolean;
-var
-  I: Integer;
-  C: Char;
-  DecodedQuery: string;
-begin
-  Result := True;
-  if Length(Query) > 1000 then
-    Exit(False);
-
-  DecodedQuery := TNetEncoding.URL.Decode(Query);
-  if THeaderValidator.HasSuspiciousPatterns(DecodedQuery) then
-    Exit(False);
-
-  for I := 1 to Length(Query) do
-  begin
-    C := Query[I];
-    if not (IsUnreserved(C) or
-            IsSubDelim(C) or
-            (C = ':') or
-            (C = '@') or
-            (C = '/') or
-            (C = '?')) then
-    begin
-      if (C = '%') and (I <= Length(Query) - 2) then
-      begin
-        if not IsValidPercentEncoded(Query, I) then
-        begin
-          Result := False;
-          Exit;
-        end;
-      end;
-    end;
-  end;
-end;
-
-class function TUriValidator.IsValidFragment(const Fragment: string): Boolean;
-var
-  I: Integer;
-  C: Char;
-begin
-  Result := True;
-  for I := 1 to Length(Fragment) do
-  begin
-    C := Fragment[I];
-    if not (IsUnreserved(C) or
-            IsSubDelim(C) or
-            (C = ':') or
-            (C = '@') or
-            (C = '/') or
-            (C = '?')) then
-    begin
-      if (C = '%') and (I <= Length(Fragment) - 2) then
-      begin
-        if not IsValidPercentEncoded(Fragment, I) then
-        begin
-          Result := False;
-          Exit;
-        end;
-      end
-      else
-      begin
-        Result := False;
-        Exit;
-      end;
-    end;
-  end;
-end;
-
-class function TUriValidator.IsValidPercentEncoded(const Input: string; Pos: Integer): Boolean;
-begin
-  Result := False;
-  if (Pos > Length(Input) - 2) then
-    Exit;
-  if Input[Pos] <> '%' then
-    Exit;
-  Result := IsHexDigit(Input[Pos + 1]) and IsHexDigit(Input[Pos + 2]);
-end;
-
-class function TUriValidator.DecodePercentEncoding(const Input: string): string;
-var
-  I: Integer;
-  HexStr: string;
-  ByteValue: Byte;
-begin
-  Result := '';
-  I := 1;
-  while I <= Length(Input) do
-  begin
-    if (Input[I] = '%') and (I <= Length(Input) - 2) and IsValidPercentEncoded(Input, I) then
-    begin
-      HexStr := Copy(Input, I + 1, 2);
-      try
-        ByteValue := StrToInt('$' + HexStr);
-        Result := Result + Chr(ByteValue);
-        Inc(I, 3);
-      except
-        Result := Result + Input[I];
-        Inc(I);
-      end;
-    end
-    else
-    begin
-      Result := Result + Input[I];
-      Inc(I);
-    end;
-  end;
-end;
-
-class function TUriValidator.ValidateURI(const URI: string; out ErrorMsg: string): Boolean;
-var
-  SchemeEnd, AuthorityStart, AuthorityEnd, PathEnd, QueryEnd: Integer;
-  Scheme, Authority, Path, Query, Fragment: string;
-begin
-  Result := False;
-  ErrorMsg := '';
-  try
-    if Length(URI) = 0 then
-    begin
-      ErrorMsg := 'URI cannot be empty';
-      Exit;
-    end;
-    if Length(URI) > 2048 then
-    begin
-      ErrorMsg := 'URI too long (>2048 characters)';
-      Exit;
-    end;
-    SchemeEnd := Pos(':', URI);
-    if SchemeEnd > 0 then
-    begin
-      Scheme := Copy(URI, 1, SchemeEnd - 1);
-      if not IsValidScheme(Scheme) then
-      begin
-        ErrorMsg := 'Incorrect schema URI: ' + Scheme;
-        Exit;
-      end;
-    end;
-    AuthorityEnd := 0;
-    if (SchemeEnd > 0) and (SchemeEnd < Length(URI) - 1) and
-       (Copy(URI, SchemeEnd + 1, 2) = '//') then
-    begin
-      AuthorityStart := SchemeEnd + 3;
-      AuthorityEnd := AuthorityStart;
-
-      while (AuthorityEnd <= Length(URI)) and
-            not CharInSet(URI[AuthorityEnd], ['/', '?', '#']) do
-        Inc(AuthorityEnd);
-      Dec(AuthorityEnd);
-      if AuthorityEnd >= AuthorityStart then
-      begin
-        Authority := Copy(URI, AuthorityStart, AuthorityEnd - AuthorityStart + 1);
-        if not IsValidAuthority(Authority) then
-        begin
-          ErrorMsg := 'Incorrect authority in URI: ' + Authority;
-          Exit;
-        end;
-      end;
-    end;
-    PathEnd := Length(URI);
-    QueryEnd := Pos('?', URI);
-    if QueryEnd > 0 then
-      PathEnd := QueryEnd - 1;
-    if Pos('#', URI) > 0 then
-      PathEnd := Min(PathEnd, Pos('#', URI) - 1);
-    if AuthorityEnd > 0 then
-      Path := Copy(URI, AuthorityEnd + 1, PathEnd - AuthorityEnd)
-    else if SchemeEnd > 0 then
-      Path := Copy(URI, SchemeEnd + 1, PathEnd - SchemeEnd)
-    else
-      Path := Copy(URI, 1, PathEnd);
-    if not IsValidPath(Path) then
-    begin
-      ErrorMsg := 'Invalid path in URI: ' + Path;
-      Exit;
-    end;
-    if QueryEnd > 0 then
-    begin
-      QueryEnd := Pos('#', URI);
-      if QueryEnd = 0 then
-        QueryEnd := Length(URI)
-      else
-        Dec(QueryEnd);
-
-      Query := Copy(URI, Pos('?', URI) + 1, QueryEnd - Pos('?', URI));
-      if not IsValidQuery(Query) then
-      begin
-        ErrorMsg := 'Invalid query string in URI: ' + Query;
-        Exit;
-      end;
-    end;
-    if Pos('#', URI) > 0 then
-    begin
-      Fragment := Copy(URI, Pos('#', URI) + 1, Length(URI));
-      if not IsValidFragment(Fragment) then
-      begin
-        ErrorMsg := 'Invalid fragment in URI: ' + Fragment;
-        Exit;
-      end;
-    end;
-
-    Result := True;
-
-  except
-    on E: Exception do
-    begin
-      ErrorMsg := 'URI validation error: ' + E.Message;
-      Result := False;
-    end;
-  end;
-end;
-
-class function TUriValidator.ValidateAbsolutePath(const Path: string; out ErrorMsg: string): Boolean;
-begin
-  Result := False;
-  ErrorMsg := '';
-  try
-    if Length(Path) = 0 then
-    begin
-      ErrorMsg := 'The path cannot be empty';
-      Exit;
-    end;
-
-    if Path[1] <> '/' then
-    begin
-      ErrorMsg := 'The path must be absolute (start with /)';
-      Exit;
-    end;
-
-    if not IsValidPath(Path) then
-    begin
-      ErrorMsg := 'Invalid characters in path';
-      Exit;
-    end;
-
-    Result := True;
-
-  except
-    on E: Exception do
-    begin
-      ErrorMsg := 'Path validation error: ' + E.Message;
-      Result := False;
-    end;
-  end;
-end;
-
-class function TUriValidator.SanitizeURI(const URI: string): string;
-var
-  I: Integer;
-  C: Char;
-begin
-  Result := '';
-  for I := 1 to Length(URI) do
-  begin
-    C := URI[I];
-    if IsUnreserved(C) or IsReserved(C) or (C = '%') then
-      Result := Result + C
-    else
-      Result := Result + '%' + IntToHex(Ord(C), 2);
-  end;
-end;
-
-class function TUriValidator.NormalizeURI(const URI: string): string;
-var
-  Scheme, Authority, Path, Query, Fragment, Host, Port, HostPart, UserInfo: string;
-  SchemeEnd, AuthorityStart, PathStart, QueryStart, FragmentStart, AtPos, ColonPos: Integer;
-  PathSegments, NormalizedSegments: TStringList;
-  I: Integer;
-  Segment: string;
-begin
-  if (Length(URI) > 0) and (URI[1] = '/') and (Pos('?', URI) = 0) and (Pos('#', URI) = 0) and
-     (Pos('%', URI) = 0) and (Pos('//', URI) = 0) and (Pos('/.', URI) = 0) and (Pos('\', URI) = 0) then
-  begin
-    Result := URI;
-    Exit;
-  end;
-  Scheme := ''; Authority := ''; Path := URI; Query := ''; Fragment := '';
-  SchemeEnd := Pos(':', URI);
-  if (SchemeEnd > 0) and (Pos('//', URI) = SchemeEnd + 1) then
-  begin
-    Scheme := Copy(URI, 1, SchemeEnd - 1);
-    AuthorityStart := SchemeEnd + 3;
-    PathStart := Pos('/', URI, AuthorityStart);
-    if PathStart = 0 then
-    begin
-      Authority := Copy(URI, AuthorityStart, Length(URI));
-      Path := '/';
-    end else
-    begin
-      Authority := Copy(URI, AuthorityStart, PathStart - AuthorityStart);
-      Path := Copy(URI, PathStart, Length(URI));
-    end;
-  end;
-  FragmentStart := Pos('#', Path);
-  if FragmentStart > 0 then
-  begin
-    Fragment := Copy(Path, FragmentStart, Length(Path));
-    Path := Copy(Path, 1, FragmentStart - 1);
-  end;
-  QueryStart := Pos('?', Path);
-  if QueryStart > 0 then
-  begin
-    Query := Copy(Path, QueryStart, Length(Path));
-    Path := Copy(Path, 1, QueryStart - 1);
-  end;
-  Scheme := LowerCase(Scheme);
-  if Authority <> '' then
-  begin
-    AtPos := Pos('@', Authority);
-    HostPart := Authority;
-    UserInfo := '';
-    if AtPos > 0 then
-    begin
-      UserInfo := Copy(Authority, 1, AtPos);
-      HostPart := Copy(Authority, AtPos + 1, Length(Authority));
-    end;
-    ColonPos := Pos(':', HostPart);
-    if ColonPos > 0 then
-    begin
-      Host := Copy(HostPart, 1, ColonPos - 1);
-      Port := Copy(HostPart, ColonPos + 1, Length(HostPart));
-    end
-    else
-    begin
-      Host := HostPart;
-      Port := '';
-    end;
-    Host := LowerCase(Host);
-    if ((Scheme = 'http') and (Port = '80')) or ((Scheme = 'https') and (Port = '443')) then
-      Port := '';
-    Authority := Host;
-    if Port <> '' then
-      Authority := Authority + ':' + Port;
-    if AtPos > 0 then
-      Authority := UserInfo + Authority;
-  end;
-
-  if Path <> '' then
-  begin
-    PathSegments := TStringList.Create;
-    NormalizedSegments := TStringList.Create;
-    try
-      PathSegments.Delimiter := '/';
-      PathSegments.DelimitedText := Path;
-      for I := 0 to PathSegments.Count - 1 do
-      begin
-        Segment := PathSegments[I];
-        if Segment = '..' then
-        begin
-          if (NormalizedSegments.Count > 0) and (NormalizedSegments.Count > NormalizedSegments.IndexOf('')) then
-            NormalizedSegments.Delete(NormalizedSegments.Count - 1);
-        end
-        else if (Segment <> '.') then
-          NormalizedSegments.Add(Segment);
-      end;
-      Path := string.Join('/', NormalizedSegments.ToStringArray);
-    finally
-      PathSegments.Free;
-      NormalizedSegments.Free;
-    end;
-  end;
-  if Path = '' then
-     Path := '/';
-  Result := '';
-  if Scheme <> '' then
-    Result := Scheme + '://' + Authority;
-  Result := Result + Path + Query + Fragment;
-end;
-
-class function THeaderValidator.IsValidTokenChar(C: Char): Boolean;
-begin
-  Result := C.IsLetterOrDigit or
-           CharInSet(C, ['-', '.', '_', '~', '^', '`', '|']);
-end;
-
-class function THeaderValidator.IsValidFieldVChar(C: Char): Boolean;
-begin
-  Result := (Ord(C) >= $21) and (Ord(C) <= $7E);
-end;
-
-class function THeaderValidator.IsObsText(C: Char): Boolean;
-begin
-  Result := (Ord(C) >= $80) and (Ord(C) <= $FF);
-end;
-
-function FastContainsAsciiCI(const Haystack, LowerNeedle: string): Boolean; forward;
-
-function MatchAsciiCIEq(P: PByte; const Lit: AnsiString): Boolean; inline;
-var
-  I, L: Integer;
-begin
-  L := Length(Lit);
-  for I := 0 to L - 1 do
-  begin
-    if (P[I] or $20) <> Ord(Lit[I + 1]) then
-      Exit(False);
-  end;
-  Result := True;
-end;
-
-class function THeaderValidator.HasSuspiciousPatternsPtr(P: PByte; Len: Integer): Boolean;
-var
-  I: Integer;
-  B, BL: Byte;
-begin
-  Result := False;
-  if (P = nil) or (Len <= 0) then
-    Exit;
-
-  for I := 0 to Len - 1 do
-  begin
-    B := P[I];
-    case B of
-      0, 10, 13, 34, 36, 37, 38, 39, 40, 42, 59, 60, 61, 62, 92, 96, 123, 124:
-        Exit(True);
-      46:
-        if (I + 1 < Len) and (P[I + 1] = 46) then
-          Exit(True);
-      58:
-        if (I + 2 < Len) and (P[I + 1] = Ord('2')) and (P[I + 2] = Ord('2')) then
-          Exit(True);
-      47:
-        if (I + 4 < Len) and MatchAsciiCIEq(P + I + 1, 'etc/') then
-          Exit(True);
-      Ord('s'), Ord('S'):
-        if ((I + 9 <= Len) and MatchAsciiCIEq(P + I, 'slowloris')) or
-           ((I + 4 <= Len) and MatchAsciiCIEq(P + I, 'sys.')) or
-           ((I + 6 <= Len) and MatchAsciiCIEq(P + I, 'sleep(')) or
-           ((I + 3 <= Len) and MatchAsciiCIEq(P + I, 'sp_')) then
-          Exit(True);
-      Ord('j'), Ord('J'):
-        if (I + 11 <= Len) and MatchAsciiCIEq(P + I, 'javascript:') then
-          Exit(True);
-      Ord('v'), Ord('V'):
-        if (I + 9 <= Len) and MatchAsciiCIEq(P + I, 'vbscript:') then
-          Exit(True);
-      Ord('d'), Ord('D'):
-        if ((I + 9 <= Len) and MatchAsciiCIEq(P + I, 'data:text')) or
-           ((I + 7 <= Len) and MatchAsciiCIEq(P + I, 'delete ')) or
-           ((I + 10 <= Len) and MatchAsciiCIEq(P + I, 'deletefrom')) or
-           ((I + 5 <= Len) and MatchAsciiCIEq(P + I, 'drop ')) or
-           ((I + 9 <= Len) and MatchAsciiCIEq(P + I, 'droptable')) or
-           ((I + 12 <= Len) and MatchAsciiCIEq(P + I, 'dropdatabase')) or
-           ((I + 9 <= Len) and MatchAsciiCIEq(P + I, 'dbms_pipe')) then
-          Exit(True);
-      Ord('x'), Ord('X'):
-        if ((I + 17 <= Len) and MatchAsciiCIEq(P + I, 'x-injected-header')) or
-           ((I + 16 <= Len) and MatchAsciiCIEq(P + I, 'x-forwarded-host')) or
-           ((I + 15 <= Len) and MatchAsciiCIEq(P + I, 'x-original-host')) or
-           ((I + 11 <= Len) and MatchAsciiCIEq(P + I, 'xp_cmdshell')) then
-          Exit(True);
-      Ord('w'), Ord('W'):
-        if ((I + 7 <= Len) and MatchAsciiCIEq(P + I, 'win.ini')) or
-           ((I + 7 <= Len) and MatchAsciiCIEq(P + I, 'waitfor')) then
-          Exit(True);
-      Ord('b'), Ord('B'):
-        if ((I + 8 <= Len) and MatchAsciiCIEq(P + I, 'boot.ini')) or
-           ((I + 10 <= Len) and MatchAsciiCIEq(P + I, 'benchmark(')) then
-          Exit(True);
-      Ord('p'), Ord('P'):
-        if ((I + 10 <= Len) and MatchAsciiCIEq(P + I, 'powershell')) or
-           ((I + 9 <= Len) and MatchAsciiCIEq(P + I, 'pg_sleep(')) then
-          Exit(True);
-      Ord('t'), Ord('T'):
-        if ((I + 13 <= Len) and MatchAsciiCIEq(P + I, 'this.password')) or
-           ((I + 9 <= Len) and MatchAsciiCIEq(P + I, 'truncate ')) or
-           ((I + 13 <= Len) and MatchAsciiCIEq(P + I, 'truncatetable')) then
-          Exit(True);
-      Ord('u'), Ord('U'):
-        if ((I + 6 <= Len) and MatchAsciiCIEq(P + I, 'union ')) or
-           ((I + 11 <= Len) and MatchAsciiCIEq(P + I, 'unionselect')) or
-           ((I + 14 <= Len) and MatchAsciiCIEq(P + I, 'unionallselect')) or
-           ((I + 10 <= Len) and MatchAsciiCIEq(P + I, 'updatexml(')) or
-           ((I + 9 <= Len) and MatchAsciiCIEq(P + I, 'utl_inaddr')) then
-          Exit(True);
-      Ord('i'), Ord('I'):
-        if ((I + 7 <= Len) and MatchAsciiCIEq(P + I, 'insert ')) or
-           ((I + 10 <= Len) and MatchAsciiCIEq(P + I, 'insertinto')) or
-           ((I + 18 <= Len) and MatchAsciiCIEq(P + I, 'information_schema')) then
-          Exit(True);
-      Ord('a'), Ord('A'):
-        if ((I + 10 <= Len) and MatchAsciiCIEq(P + I, 'all_tables')) or
-           ((I + 6 <= Len) and MatchAsciiCIEq(P + I, 'alter ')) or
-           ((I + 10 <= Len) and MatchAsciiCIEq(P + I, 'altertable')) or
-           ((I + 5 <= Len) and MatchAsciiCIEq(P + I, 'admin')) then
-          Exit(True);
-      Ord('e'), Ord('E'):
-        if (I + 13 <= Len) and MatchAsciiCIEq(P + I, 'extractvalue(') then
-          Exit(True);
-      Ord('c'), Ord('C'):
-        if ((I + 5 <= Len) and MatchAsciiCIEq(P + I, 'cat /')) or
-           ((I + 7 <= Len) and MatchAsciiCIEq(P + I, 'ctxsys.')) then
-          Exit(True);
-      Ord('o'), Ord('O'):
-        if (I + 5 <= Len) and MatchAsciiCIEq(P + I, 'on') then
-        begin
-          BL := P[I + 2] or $20;
-          if (BL = Ord('l')) or (BL = Ord('e')) or (BL = Ord('c')) or (BL = Ord('m')) then
-            Exit(True);
-        end;
-      Ord('0'):
-        if (I + 4 <= Len) and ((P[I + 1] or $20) = Ord('x')) and (P[I + 2] = Ord('7')) and ((P[I + 3] or $20) = Ord('f')) then
-          Exit(True);
-      Ord('1'):
-        if (I + 7 <= Len) and (P[I + 1] = Ord('6')) and (P[I + 2] = Ord('9')) and (P[I + 3] = Ord('.')) then
-          Exit(True);
-    end;
-  end;
-end;
-
-class function THeaderValidator.HasSuspiciousPatterns(const Value: string): Boolean;
-const
-  SUSPICIOUS_PATTERNS: array[0..51] of string = (
-    'javascript:', 'data:text/html', 'vbscript:', '<script', '</script>', '<svg', '<iframe',
-    'onload=', 'onerror=', 'onclick=', 'onmouseover=',
-    'x-injected-header', 'x-forwarded-host', 'x-original-host',
-    '../..', '..\..', '..%2f', '..%5c', '..%5C', '..\', '%252e%252e', '%c0%af', '%c0', '%e0%80%af', '%f0%80%80%af',
-    '/etc/passwd', 'win.ini', 'boot.ini', '\\192.168.',
-    'cat /etc', 'cat /', 'cat$ifs', '*(|', '%s%s%s', '%n%n%n%n', #13#10, '\r\n',
-    '${jndi:', '169.254.169.254', '0x7f000001', '127.0.0.1:22',
-    '{{', '${', 'powershell', '&&', '||', '$(', '`',
-    '''$gt''', '''$ne''', '''$where''', 'this.password'
-  );
-  SQL_PATTERNS: array[0..40] of string = (
-    'or 1=1', 'or ''1''=''1''', 'or ''1''=''1', 'or ''1'' = ''1''', 'or ''a''=''a',
-    'and 1=1', 'and 1=2', '1''=''1', '1=1--', ''' or ''=''',
-    'waitfor delay', 'sleep(', 'pg_sleep(', 'benchmark(', 'dbms_pipe.receive_message',
-    'sp_executesql', 'xp_cmdshell', '; shutdown', '; drop',
-    'information_schema', 'sys.tables', 'sys.objects', 'sys.user_tables', 'all_tables',
-    'extractvalue(', 'updatexml(', 'utl_inaddr.', 'ctxsys.driths.',
-    '1;--', 'admin''--', 'admin''#', 'admin''/*',
-    'union select', 'union all select', 'union distinct select',
-    'insert into', 'delete from',
-    'drop table', 'drop database', 'alter table', 'truncate table'
-  );
-  SQL_PATTERNS_NOWS: array[0..40] of string = (
-    'or1=1', 'or''1''=''1''', 'or''1''=''1', 'or''1''=''1''', 'or''a''=''a',
-    'and1=1', 'and1=2', '1''=''1', '1=1--', '''or''=''',
-    'waitfordelay', 'sleep(', 'pg_sleep(', 'benchmark(', 'dbms_pipe.receive_message',
-    'sp_executesql', 'xp_cmdshell', ';shutdown', ';drop',
-    'information_schema', 'sys.tables', 'sys.objects', 'sys.user_tables', 'all_tables',
-    'extractvalue(', 'updatexml(', 'utl_inaddr.', 'ctxsys.driths.',
-    '1;--', 'admin''--', 'admin''#', 'admin''/*',
-    'unionselect', 'unionallselect', 'uniondistinctselect',
-    'insertinto', 'deletefrom',
-    'droptable', 'dropdatabase', 'altertable', 'truncatetable'
-  );
-var
-  LowerValue: string;
-  NoWsValue: string;
-  CollapsedValue: string;
-  CleanComments: string;
-  I: Integer;
-  J: Integer;
-  Len: Integer;
-  SelPos: Integer;
-  UpdPos: Integer;
-  LastWasSpace: Boolean;
-  HasWhitespace: Boolean;
-  IsSimpleSafeChars: Boolean;
-  HasDot, HasSlash, HasStar, HasColon, Has1, Has0: Boolean;
-  CharMask: Cardinal;
-  C: Char;
-begin
-  Result := False;
-  Len := Length(Value);
-  if Len = 0 then
-    Exit;
-
-  HasWhitespace := False;
-  IsSimpleSafeChars := Len <= 64;
-  HasDot := False;
-  HasSlash := False;
-  HasStar := False;
-  HasColon := False;
-  Has1 := False;
-  Has0 := False;
-  CharMask := 0;
-
-  for I := 1 to Len do
-  begin
-    C := Value[I];
-    if C = #0 then
-      Exit(True);
-    if (Ord(C) < 32) and (C <> #9) and (C <> #10) and (C <> #13) then
-      Exit(True);
-    if (C = ' ') or (C = #9) or (C = #10) or (C = #13) then
-      HasWhitespace := True;
-    if IsSimpleSafeChars then
-    begin
-      if (C >= 'a') and (C <= 'z') then
-        CharMask := CharMask or (Cardinal(1) shl (Ord(C) - Ord('a')))
-      else if (C >= 'A') and (C <= 'Z') then
-        CharMask := CharMask or (Cardinal(1) shl (Ord(C) - Ord('A')))
-      else if C = '.' then
-      begin
-        if (I > 1) and (Value[I - 1] = '.') then
-          Exit(True);
-        HasDot := True;
-      end
-      else if C = '/' then
-        HasSlash := True
-      else if C = '*' then
-        HasStar := True
-      else if C = ':' then
-        HasColon := True
-      else if C = '1' then
-        Has1 := True
-      else if C = '0' then
-        Has0 := True
-      else if not (((C >= '2') and (C <= '9')) or (C = '-') or (C = '+')) then
-        IsSimpleSafeChars := False;
-    end;
-  end;
-
-  if IsSimpleSafeChars then
-  begin
-    if HasSlash and HasStar and (Value <> '*/*') then
-    begin
-      LowerValue := LowerCase(Value);
-      if (Pos('/*', LowerValue) > 0) or (Pos('*/', LowerValue) > 0) then
-      begin
-        CleanComments := StringReplace(LowerValue, '*/*', '', [rfReplaceAll]);
-        if (Pos('*/', CleanComments) > 0) or (Pos('/*!', LowerValue) > 0) or (Pos('/*', CleanComments) > 0) then
-          Exit(True);
-      end;
-    end;
-    if HasColon and (Len >= 10) then
-    begin
-      if ((CharMask and (1 shl 9)) <> 0) and FastContainsAsciiCI(Value, 'javascript:') then
-        Exit(True);
-      if ((CharMask and (1 shl 21)) <> 0) and FastContainsAsciiCI(Value, 'vbscript:') then
-        Exit(True);
-      if ((CharMask and (1 shl 3)) <> 0) and FastContainsAsciiCI(Value, 'data:text/html') then
-        Exit(True);
-      if Has1 and FastContainsAsciiCI(Value, '127.0.0.1:22') then
-        Exit(True);
-    end;
-    if ((CharMask and (1 shl 23)) <> 0) and (Len >= 15) then
-    begin
-      if FastContainsAsciiCI(Value, 'x-injected-header') or FastContainsAsciiCI(Value, 'x-forwarded-host') or
-         FastContainsAsciiCI(Value, 'x-original-host') then
-        Exit(True);
-    end;
-    if HasDot and (Len >= 7) then
-    begin
-      if Has1 and FastContainsAsciiCI(Value, '169.254.169.254') then
-        Exit(True);
-      if CharMask <> 0 then
-      begin
-        if ((CharMask and (1 shl 19)) <> 0) and FastContainsAsciiCI(Value, 'this.password') then
-          Exit(True);
-        if ((CharMask and (1 shl 22)) <> 0) and FastContainsAsciiCI(Value, 'win.ini') then
-          Exit(True);
-        if ((CharMask and (1 shl 1)) <> 0) and FastContainsAsciiCI(Value, 'boot.ini') then
-          Exit(True);
-        if ((CharMask and ((1 shl 18) or (1 shl 24))) = ((1 shl 18) or (1 shl 24))) and
-           (FastContainsAsciiCI(Value, 'sys.tables') or FastContainsAsciiCI(Value, 'sys.objects') or FastContainsAsciiCI(Value, 'sys.user')) then
-          Exit(True);
-        if ((CharMask and (1 shl 20)) <> 0) and FastContainsAsciiCI(Value, 'utl_inaddr.') then
-          Exit(True);
-        if ((CharMask and (1 shl 2)) <> 0) and FastContainsAsciiCI(Value, 'ctxsys.driths.') then
-          Exit(True);
-      end;
-    end;
-    if HasSlash and (Len >= 11) and ((CharMask and (1 shl 4)) <> 0) and FastContainsAsciiCI(Value, '/etc/passwd') then
-      Exit(True);
-    if Has0 and (Len >= 10) and ((CharMask and (1 shl 23)) <> 0) and FastContainsAsciiCI(Value, '0x7f000001') then
-      Exit(True);
-    if (Len >= 10) and ((CharMask and ((1 shl 15) or (1 shl 22))) = ((1 shl 15) or (1 shl 22))) and FastContainsAsciiCI(Value, 'powershell') then
-      Exit(True);
-    if (Len >= 6) and ((CharMask and ((1 shl 18) or (1 shl 4) or (1 shl 11))) = ((1 shl 18) or (1 shl 4) or (1 shl 11))) and FastContainsAsciiCI(Value, 'select') then
-      Exit(True);
-    if (Len >= 6) and ((CharMask and ((1 shl 20) or (1 shl 15) or (1 shl 3))) = ((1 shl 20) or (1 shl 15) or (1 shl 3))) and FastContainsAsciiCI(Value, 'update') then
-      Exit(True);
-    Exit(False);
-  end;
-
-  if (Pos('%00', Value) > 0) then
-    Exit(True);
-
-  LowerValue := LowerCase(Value);
-
-  if HasWhitespace then
-  begin
-    SetLength(NoWsValue, Len);
-    J := 0;
-    for I := 1 to Len do
-    begin
-      if not CharInSet(LowerValue[I], [' ', #9, #10, #13]) then
-      begin
-        Inc(J);
-        NoWsValue[J] := LowerValue[I];
-      end;
-    end;
-    SetLength(NoWsValue, J);
-
-    SetLength(CollapsedValue, Len);
-    J := 0;
-    LastWasSpace := False;
-    for I := 1 to Len do
-    begin
-      if CharInSet(LowerValue[I], [' ', #9]) then
-      begin
-        if not LastWasSpace then
-        begin
-          Inc(J);
-          CollapsedValue[J] := ' ';
-          LastWasSpace := True;
-        end;
-      end
-      else
-      begin
-        Inc(J);
-        CollapsedValue[J] := LowerValue[I];
-        LastWasSpace := False;
-      end;
-    end;
-    SetLength(CollapsedValue, J);
-  end
-  else
-  begin
-    NoWsValue := LowerValue;
-    CollapsedValue := LowerValue;
-  end;
-
-  for I := 0 to High(SUSPICIOUS_PATTERNS) do
-  begin
-    if (Pos(SUSPICIOUS_PATTERNS[I], LowerValue) > 0) or
-       (HasWhitespace and ((Pos(SUSPICIOUS_PATTERNS[I], NoWsValue) > 0) or
-                           (Pos(SUSPICIOUS_PATTERNS[I], CollapsedValue) > 0))) then
-      Exit(True);
-  end;
-
-  if (Pos('/*', LowerValue) > 0) or (Pos('*/', LowerValue) > 0) then
-  begin
-    CleanComments := StringReplace(LowerValue, '*/*', '', [rfReplaceAll]);
-    if (Pos('*/', CleanComments) > 0) or (Pos('/*!', LowerValue) > 0) then
-      Exit(True);
-    I := Pos('/*', CleanComments);
-    while I > 0 do
-    begin
-      if (I > 1) and CharInSet(CleanComments[I - 1], ['a'..'z', '0'..'9', '-', '+', '.']) and
-         ((I + 2 > Length(CleanComments)) or CharInSet(CleanComments[I + 2], [',', ';', ' ', #9])) then
-        I := PosEx('/*', CleanComments, I + 2)
-      else
-        Exit(True);
-    end;
-  end;
-
-  for I := 0 to High(SQL_PATTERNS) do
-  begin
-    if (Pos(SQL_PATTERNS[I], CollapsedValue) > 0) or
-       (Pos(SQL_PATTERNS_NOWS[I], NoWsValue) > 0) then
-      Exit(True);
-  end;
-
-  SelPos := Pos('select', NoWsValue);
-  if SelPos > 0 then
-  begin
-    if Pos('from', Copy(NoWsValue, SelPos + 6, MaxInt)) > 0 then
-      Exit(True);
-    if (Pos('select*', NoWsValue) > 0) or
-       (Pos('select@@', NoWsValue) > 0) or
-       (Pos('selectnull', NoWsValue) > 0) or
-       (Pos('selectchar(', NoWsValue) > 0) then
-      Exit(True);
-  end;
-
-  UpdPos := Pos('update', NoWsValue);
-  if UpdPos > 0 then
-  begin
-    if Pos('set', Copy(NoWsValue, UpdPos + 6, MaxInt)) > 0 then
-      Exit(True);
-  end;
-end;
-
-
-class function THeaderValidator.DetectInjectionAttempt(const Value: string): Boolean;
-var
-  I: Integer;
-begin
-  Result := False;
-  for I := 1 to Length(Value) do
-  begin
-    if (Value[I] = #13) or (Value[I] = #10) or (Value[I] = #0) then
-    begin
-      Result := True;
-      Exit;
-    end;
-    if (Ord(Value[I]) < 32) and (Value[I] <> #9) then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
-end;
-
-class function THeaderValidator.ValidateHeaderName(const Name: string; out ErrorMsg: string): Boolean;
-var
-  I: Integer;
-  Len: Integer;
-  LowerName: string;
-begin
-  Result := False;
-  ErrorMsg := '';
-  try
-    Len := Length(Name);
-    if Len = 0 then
-    begin
-      ErrorMsg := 'Header name cannot be empty';
-      Exit;
-    end;
-
-    if Len > 256 then
-    begin
-      ErrorMsg := 'Header name too long (>256 characters)';
-      Exit;
-    end;
-    if ((Len = 4) and SameText(Name, 'Host')) or
-       ((Len = 10) and (SameText(Name, 'User-Agent') or SameText(Name, 'Connection'))) or
-       ((Len = 6) and SameText(Name, 'Accept')) or
-       ((Len = 14) and SameText(Name, 'Content-Length')) or
-       ((Len = 12) and SameText(Name, 'Content-Type')) or
-       ((Len = 15) and (SameText(Name, 'Accept-Encoding') or SameText(Name, 'Accept-Language'))) then
-    begin
-      Result := True;
-      Exit;
-    end;
-    for I := 1 to Len do
-    begin
-      if not IsValidTokenChar(Name[I]) then
-      begin
-        ErrorMsg := Format('Invalid character in header name: %s (code: %d, position %d', [Name[I], Ord(Name[I]), I]);
-        Exit;
-      end;
-    end;
-    LowerName := LowerCase(Name);
-    if (Pos('script', LowerName) > 0) or
-       (Pos('javascript', LowerName) > 0) or
-       (Pos('vbscript', LowerName) > 0) then
-    begin
-      ErrorMsg := 'Forbidden pattern in header name: ' + Name;
-      Exit;
-    end;
-    if HasSuspiciousPatterns(Name) then
-    begin
-      ErrorMsg := 'Suspicious patterns detected in header name: ' + Name;
-      Exit;
-    end;
-    Result := True;
-  except
-    on E: Exception do
-    begin
-      ErrorMsg := 'Header name validation error: ' + E.Message;
-      Result := False;
-    end;
-  end;
-end;
-
-class function THeaderValidator.SanitizeHeaderValue(const Value: string): string;
-var
-  I: Integer;
-  C: Char;
-begin
-  Result := '';
-  for I := 1 to Length(Value) do
-  begin
-    C := Value[I];
-    if (Ord(C) < 32) and (C <> ' ') and (C <> #9) then
-      Continue;
-    if CharInSet(C, [#13, #10, #0]) then
-      Continue;
-    Result := Result + C;
-  end;
-  Result := Trim(Result);
-  if Length(Result) > 8192 then
-    Result := Copy(Result, 1, 8192);
-end;
-
-const
-  CSafeHeaders: array[0..16] of string = (
-    'accept', 'accept-encoding', 'accept-language', 'authorization',
-    'cache-control', 'connection', 'content-length', 'content-type',
-    'cookie', 'host', 'referer', 'user-agent', 'x-requested-with',
-    'x-forwarded-for', 'x-real-ip', 'if-none-match', 'if-modified-since'
-  );
-  CUnsafeHeaders: array[0..7] of string = (
-    'x-forwarded-host', 'x-original-host', 'x-rewrite-url',
-    'x-original-url', 'x-override-url', 'x-http-destip',
-    'x-http-host-override', 'x-forwarded-server'
-  );
-
-function FastContainsAsciiCI(const Haystack, LowerNeedle: string): Boolean;
-var
-  HLen, NLen, I, J: Integer;
-  C1, C2: Word;
-begin
-  NLen := Length(LowerNeedle);
-  if NLen = 0 then
-    Exit(True);
-  HLen := Length(Haystack);
-  if HLen < NLen then
-    Exit(False);
-  for I := 1 to HLen - NLen + 1 do
-  begin
-    C1 := Ord(Haystack[I]);
-    if (C1 >= Ord('A')) and (C1 <= Ord('Z')) then
-      C1 := C1 or $20;
-    if C1 = Ord(LowerNeedle[1]) then
-    begin
-      Result := True;
-      for J := 2 to NLen do
-      begin
-        C2 := Ord(Haystack[I + J - 1]);
-        if (C2 >= Ord('A')) and (C2 <= Ord('Z')) then
-          C2 := C2 or $20;
-        if C2 <> Ord(LowerNeedle[J]) then
-        begin
-          Result := False;
-          Break;
-        end;
-      end;
-      if Result then
-        Exit(True);
-    end;
-  end;
-  Result := False;
-end;
-
-class function THeaderValidator.IsSafeHeaderName(const Name: string): Boolean;
-var
-  I: Integer;
-  Len: Integer;
-  NeedsNorm: Boolean;
-  NormalizedName: string;
-begin
-  Len := Length(Name);
-  if Len = 0 then
-    Exit(False);
-  NeedsNorm := (Name[1] <= ' ') or (Name[Len] <= ' ');
-  if not NeedsNorm then
-  begin
-    for I := 1 to Len do
-    begin
-      if (Name[I] >= 'A') and (Name[I] <= 'Z') then
-      begin
-        NeedsNorm := True;
-        Break;
-      end;
-    end;
-  end;
-  if NeedsNorm then
-    NormalizedName := LowerCase(Trim(Name))
-  else
-    NormalizedName := Name;
-  if Length(NormalizedName) = 0 then
-    Exit(False);
-
-  for I := 0 to High(CUnsafeHeaders) do
-  begin
-    if NormalizedName = CUnsafeHeaders[I] then
-      Exit(False);
-  end;
-
-  for I := 0 to High(CSafeHeaders) do
-  begin
-    if NormalizedName = CSafeHeaders[I] then
-      Exit(True);
-  end;
-
-  if (Length(NormalizedName) >= 2) and (NormalizedName[1] = 'x') and (NormalizedName[2] = '-') then
-  begin
-    if THeaderValidator.HasSuspiciousPatterns(NormalizedName) then
-      Exit(False);
-    Exit(Length(NormalizedName) <= 64);
-  end;
-  Result := (Length(NormalizedName) <= 64) and NormalizedName[1].IsLetter;
-end;
-
-class function THeaderValidator.DetectRequestSmuggling(const Headers: TStringList): TSecurityThreat;
-var
-  I, ContentLengthCount, TransferEncodingCount: Integer;
-  Line, Name, Value: string;
-  ColonPos: Integer;
-  ContentLengthValues: TStringList;
-  HasChunked, HasContentLength: Boolean;
-begin
-  Result := stNone;
-  ContentLengthCount := 0;
-  TransferEncodingCount := 0;
-  HasChunked := False;
-  HasContentLength := False;
-  ContentLengthValues := TStringList.Create;
-  try
-    var HostCount := 0;
-    for I := 0 to Headers.Count - 1 do
-    begin
-      Line := Headers[I];
-      ColonPos := Pos(':', Line);
-      if ColonPos > 0 then
-      begin
-        if (ColonPos > 1) and (Line[ColonPos - 1] = ' ') then
-        begin
-          Result := stRequestSmuggling;
-          Exit;
-        end;
-
-        Name := LowerCase(Trim(Copy(Line, 1, ColonPos - 1)));
-        Value := Trim(Copy(Line, ColonPos + 1, Length(Line)));
-
-        if Name = 'host' then
-        begin
-          Inc(HostCount);
-          if HostCount > 1 then
-          begin
-            Result := stRequestSmuggling;
-            Exit;
-          end;
-        end
-        else if Name = 'content-length' then
-        begin
-          Inc(ContentLengthCount);
-          ContentLengthValues.Add(Value);
-          HasContentLength := True;
-        end
-        else if Name = 'transfer-encoding' then
-        begin
-          Inc(TransferEncodingCount);
-          var LowerVal := LowerCase(Value);
-          if Pos('chunked', LowerVal) > 0 then
-            HasChunked := True;
-
-          if (Pos(',', LowerVal) > 0) and (Pos('chunked', LowerVal) > 0) then
-          begin
-            Result := stRequestSmuggling;
-            Exit;
-          end;
-        end;
-      end;
-    end;
-
-    if ContentLengthCount > 1 then
-    begin
-      Result := stRequestSmuggling;
-      Exit;
-    end;
-    if HasContentLength and HasChunked then
-    begin
-      Result := stRequestSmuggling;
-      Exit;
-    end;
-
-    if TransferEncodingCount > 1 then
-    begin
-      Result := stRequestSmuggling;
-      Exit;
-    end;
-  finally
-    ContentLengthValues.Free;
-  end;
-end;
-
-constructor TContentEncodingHandler.Create;
-begin
-  inherited Create;
-end;
-
-destructor TContentEncodingHandler.Destroy;
-begin
-  inherited Destroy;
-end;
-
-function TContentEncodingHandler.GetEncodingFromString(const EncodingStr: string): TContentEncoding;
-var
-  LowerEncoding: string;
-begin
-  LowerEncoding := LowerCase(Trim(EncodingStr));
-  if LowerEncoding = 'gzip' then
-    Result := ceGzip
-  else if LowerEncoding = 'deflate' then
-    Result := ceDeflate
-  else if LowerEncoding = 'compress' then
-    Result := ceCompress
-  else if LowerEncoding = 'br' then
-    Result := ceBrotli
-  else if LowerEncoding = 'identity' then
-    Result := ceIdentity
-  else
-    Result := ceNone;
-end;
-
-function TContentEncodingHandler.ParseContentEncoding(const EncodingHeader: string): TArray<TContentEncoding>;
-var
-  Encodings: TStringList;
-  I: Integer;
-  EncodingStr: string;
-begin
-  SetLength(Result, 0);
-  if Trim(EncodingHeader) = '' then
-    Exit;
-  Encodings := TStringList.Create;
-  try
-    Encodings.Delimiter := ',';
-    Encodings.DelimitedText := EncodingHeader;
-    SetLength(Result, Encodings.Count);
-    for I := 0 to Encodings.Count - 1 do
-    begin
-      EncodingStr := Trim(Encodings[I]);
-      Result[I] := GetEncodingFromString(EncodingStr);
-    end;
-  finally
-    Encodings.Free;
-  end;
-end;
-
-function TContentEncodingHandler.DecompressGzip(const Data: TBytes): TBytes;
-const
-  MAX_DECOMPRESSED_SIZE = 4 * 1024 * 1024;
-var
-  InStream: TBytesStream;
-  OutStream: TBytesStream;
-  Decompressor: TZDecompressionStream;
-  Buffer: array[0..65535] of Byte;
-  BytesRead: Integer;
-  TotalRead: Int64;
-begin
-  if Length(Data) = 0 then
-  begin
-    SetLength(Result, 0);
-    Exit;
-  end;
-  try
-    InStream := TBytesStream.Create(Data);
-    try
-      OutStream := TBytesStream.Create;
-      try
-        Decompressor := TZDecompressionStream.Create(InStream, 15 + 16);
-        try
-          TotalRead := 0;
-          repeat
-            BytesRead := Decompressor.Read(Buffer[0], SizeOf(Buffer));
-            if BytesRead > 0 then
-            begin
-              TotalRead := TotalRead + BytesRead;
-              if TotalRead > MAX_DECOMPRESSED_SIZE then
-              begin
-                SetLength(Result, 0);
-                Exit;
-              end;
-              OutStream.WriteBuffer(Buffer[0], BytesRead);
-            end;
-          until BytesRead <= 0;
-        finally
-          Decompressor.Free;
-        end;
-        Result := Copy(OutStream.Bytes, 0, OutStream.Size);
-      finally
-        OutStream.Free;
-      end;
-    finally
-      InStream.Free;
-    end;
-  except
-    on E: Exception do
-      SetLength(Result, 0);
-  end;
-end;
-
-function TContentEncodingHandler.DecompressDeflate(const Data: TBytes): TBytes;
-var
-  InStream: TBytesStream;
-  OutStream: TBytesStream;
-  Decompressor: TZDecompressionStream;
-begin
-  if Length(Data) = 0 then
-  begin
-    SetLength(Result, 0);
-    Exit;
-  end;
-  try
-    InStream := TBytesStream.Create(Data);
-    try
-      OutStream := TBytesStream.Create;
-      try
-        Decompressor := TZDecompressionStream.Create(InStream, 15);
-        try
-          OutStream.CopyFrom(Decompressor, 0);
-        finally
-          Decompressor.Free;
-        end;
-        Result := Copy(OutStream.Bytes, 0, OutStream.Size);
-      finally
-        OutStream.Free;
-      end;
-    finally
-      InStream.Free;
-    end;
-  except
-    on E: Exception do
-    begin
-      try
-        InStream := TBytesStream.Create(Data);
-        try
-          OutStream := TBytesStream.Create;
-          try
-            Decompressor := TZDecompressionStream.Create(InStream, -15);
-            try
-              OutStream.CopyFrom(Decompressor, 0);
-            finally
-              Decompressor.Free;
-            end;
-            Result := Copy(OutStream.Bytes, 0, OutStream.Size);
-          finally
-            OutStream.Free;
-          end;
-        finally
-          InStream.Free;
-        end;
-      except
-        SetLength(Result, Length(Data));
-        Move(Data[0], Result[0], Length(Data));
-      end;
-    end;
-  end;
-end;
-
-function TContentEncodingHandler.DecompressBrotli(const Data: TBytes): TBytes;
-begin
-  try
-    SetLength(Result, Length(Data));
-    Move(Data[0], Result[0], Length(Data));
-  except
-    on E: Exception do
-    begin
-      SetLength(Result, Length(Data));
-      Move(Data[0], Result[0], Length(Data));
-    end;
-  end;
-end;
-
-function TContentEncodingHandler.DecompressData(const Data: TBytes; Encoding: TContentEncoding): TBytes;
-begin
-  try
-    case Encoding of
-      ceGzip: Result := DecompressGzip(Data);
-      ceDeflate: Result := DecompressDeflate(Data);
-      ceBrotli: Result := DecompressBrotli(Data);
-      ceCompress: Result := DecompressDeflate(Data);
-      ceIdentity, ceNone:
-        begin
-          SetLength(Result, Length(Data));
-          Move(Data[0], Result[0], Length(Data));
-        end;
-    else
-      begin
-        SetLength(Result, Length(Data));
-        Move(Data[0], Result[0], Length(Data));
-      end;
-    end;
-  except
-    on E: Exception do
-    begin
-      SetLength(Result, Length(Data));
-      Move(Data[0], Result[0], Length(Data));
-    end;
-  end;
-end;
-
-function TContentEncodingHandler.GetEncodingName(Encoding: TContentEncoding): string;
-begin
-  case Encoding of
-    ceGzip: Result := 'gzip';
-    ceDeflate: Result := 'deflate';
-    ceCompress: Result := 'compress';
-    ceBrotli: Result := 'br';
-    ceIdentity: Result := 'identity';
-  else
-    Result := 'none';
-  end;
-end;
-
-function TContentEncodingHandler.IsCompressionSupported(Encoding: TContentEncoding): Boolean;
-begin
-  Result := Encoding in [ceGzip, ceDeflate, ceIdentity, ceNone];
-end;
-
-constructor TRequestRecovery.Create(MaxAttempts: Integer);
-begin
-  inherited Create;
-  FMaxRecoveryAttempts := MaxAttempts;
-  FRecoveryActions := TList<TRecoveryAction>.Create;
-  FErrorLog := TStringList.Create;
-  FRecoveryAttempts := 0;
-end;
-
-destructor TRequestRecovery.Destroy;
-begin
-  try
-    FRecoveryActions.Free;
-    FErrorLog.Free;
-  finally
-    inherited Destroy;
-  end;
-end;
-
-function TRequestRecovery.CanRecover(const Error: string): Boolean;
-var
-  RecoverableErrors: TArray<string>;
-  ErrorPattern: string;
-begin
-  Result := False;
-  if FRecoveryAttempts >= FMaxRecoveryAttempts then
-    Exit;
-  RecoverableErrors := [
-    'oversized', 'malformed header', 'invalid encoding',
-    'suspicious pattern', 'unknown character', 'truncated'
-  ];
-  for ErrorPattern in RecoverableErrors do
-  begin
-    if Pos(LowerCase(ErrorPattern), LowerCase(Error)) > 0 then
-    begin
-      Result := True;
-      Exit;
-    end;
-  end;
-end;
-
-function TRequestRecovery.SuggestRecoveryAction(const Error: string; const Context: string): TRecoveryAction;
-var
-  LowerError: string;
-begin
-  LowerError := LowerCase(Error);
-  if Pos('oversized', LowerError) > 0 then
-    Result := raTruncateValue
-  else if Pos('malformed', LowerError) > 0 then
-    Result := raSkipHeader
-  else if Pos('suspicious', LowerError) > 0 then
-    Result := raSanitize
-  else if Pos('invalid encoding', LowerError) > 0 then
-    Result := raSanitize
-  else if Pos('unknown character', LowerError) > 0 then
-    Result := raSanitize
-  else if Pos('truncated', LowerError) > 0 then
-    Result := raContinue
-  else
-    Result := raAbort;
-end;
-
-procedure TRequestRecovery.LogRecoveryAttempt(const Action: TRecoveryAction; const Details: string);
-var
-  ActionStr: string;
-  LogEntry: string;
-begin
-  try
-    Inc(FRecoveryAttempts);
-    case Action of
-      raAbort: ActionStr := 'ABORT';
-      raSkipHeader: ActionStr := 'SKIP_HEADER';
-      raTruncateValue: ActionStr := 'TRUNCATE';
-      raSanitize: ActionStr := 'SANITIZE';
-      raContinue: ActionStr := 'CONTINUE';
-    else
-      ActionStr := 'UNKNOWN';
-    end;
-    LogEntry := Format('[%s] Attempt %d: %s - %s',
-                      [FormatDateTime('hh:nn:ss.zzz', Now),
-                       FRecoveryAttempts, ActionStr, Details]);
-    FErrorLog.Add(LogEntry);
-    FRecoveryActions.Add(Action);
-  except
-    on E: Exception do
-      Logger.Warn('Failed to log recovery attempt: ' + E.Message);
-  end;
-end;
-
-function TRequestRecovery.GetRecoveryLog: string;
-begin
-  try
-    Result := FErrorLog.Text;
-  except
-    Result := 'Error retrieving recovery log';
-  end;
-end;
-
-procedure TRequestRecovery.Clear;
-begin
-  try
-    if Assigned(FRecoveryActions) then
-      FRecoveryActions.Clear;
-    if Assigned(FErrorLog) then
-      FErrorLog.Clear;
-    FRecoveryAttempts := 0;
-  except
-    on E: Exception do
-      Logger.Warn('Failed to clear request recovery: ' + E.Message);
-  end;
-end;
-
-constructor THttpHeaders.Create(ValidationLevel: TValidationLevel);
-begin
-  inherited Create;
-
-  FHeaders := nil;
-  FPooledLists := nil;
-  FSlotCount := 0;
-  FUseDict := False;
-  FValidationLevel := ValidationLevel;
-  FContentEncodingHandler := TContentEncodingHandler.Create;
-end;
-
-destructor THttpHeaders.Destroy;
-var
-  Pair: TPair<string, TStringList>;
-  I: Integer;
-begin
-  try
-    if Assigned(FHeaders) then
-    begin
-      for Pair in FHeaders do
-        Pair.Value.Free;
-      FreeAndNil(FHeaders);
-    end;
-    if Assigned(FPooledLists) then
-    begin
-      for I := 0 to FPooledLists.Count - 1 do
-        FPooledLists[I].Free;
-      FreeAndNil(FPooledLists);
-    end;
-    FreeAndNil(FContentEncodingHandler);
-  finally
-    inherited Destroy;
-  end;
-end;
-
-function THttpHeaders.NormalizeHeaderName(const HeaderName: string): string;
-var
-  Len: Integer;
-begin
-  Len := Length(HeaderName);
-  case Len of
-    4:
-      if (HeaderName = 'Host') or (HeaderName = 'host') then
-        Exit('host');
-    6:
-      if (HeaderName = 'Accept') or (HeaderName = 'accept') then
-        Exit('accept')
-      else if (HeaderName = 'Origin') or (HeaderName = 'origin') then
-        Exit('origin')
-      else if (HeaderName = 'Cookie') or (HeaderName = 'cookie') then
-        Exit('cookie');
-    7:
-      if (HeaderName = 'Referer') or (HeaderName = 'referer') then
-        Exit('referer');
-    10:
-      if (HeaderName = 'Connection') or (HeaderName = 'connection') then
-        Exit('connection')
-      else if (HeaderName = 'User-Agent') or (HeaderName = 'user-agent') then
-        Exit('user-agent');
-    12:
-      if (HeaderName = 'Content-Type') or (HeaderName = 'content-type') then
-        Exit('content-type');
-    13:
-      if (HeaderName = 'Cache-Control') or (HeaderName = 'cache-control') then
-        Exit('cache-control')
-      else if (HeaderName = 'Authorization') or (HeaderName = 'authorization') then
-        Exit('authorization');
-    14:
-      if (HeaderName = 'Content-Length') or (HeaderName = 'content-length') then
-        Exit('content-length');
-    15:
-      if (HeaderName = 'Accept-Encoding') or (HeaderName = 'accept-encoding') then
-        Exit('accept-encoding');
-    17:
-      if (HeaderName = 'Transfer-Encoding') or (HeaderName = 'transfer-encoding') then
-        Exit('transfer-encoding');
-  end;
-  Result := LowerCase(Trim(HeaderName));
-end;
-
-function THttpHeaders.ParseFoldedHeader(const Lines: TStringList; StartIndex: Integer;
-                                        out EndIndex: Integer): string;
-var
-  I: Integer;
-  Line: string;
-  FirstLine: Boolean;
-begin
-  Result := '';
-  EndIndex := StartIndex;
-  FirstLine := True;
-  try
-    for I := StartIndex to Lines.Count - 1 do
-    begin
-      Line := Lines[I];
-      if (Length(Line) > 0) and CharInSet(Line[1], [' ', #9]) then
-      begin
-        if not FirstLine then
-          Result := Result + ' ';
-        Result := Result + Trim(Line);
-        EndIndex := I;
-      end
-      else
-      begin
-        if FirstLine then
-        begin
-          Result := Line;
-          EndIndex := I;
-          FirstLine := False;
-        end
-        else
-          Break;
-      end;
-    end;
-  except
-    on E: Exception do
-    begin
-      Result := Lines[StartIndex];
-      EndIndex := StartIndex;
-    end;
-  end;
-end;
-
-function THttpHeaders.ProcessInternationalHeader(const Value: string): string;
-var
-  I: Integer;
-  C: Char;
-  ByteValue: Byte;
-begin
-  Result := '';
-  try
-    for I := 1 to Length(Value) do
-    begin
-      C := Value[I];
-      ByteValue := Ord(C);
-
-      if ByteValue <= 127 then
-        Result := Result + C
-      else
-      begin
-        case FValidationLevel of
-          vlStrict:
-            Continue;
-          vlModerate:
-            Result := Result + '?';
-          vlPermissive:
-            Result := Result + C;
-        end;
-      end;
-    end;
-    if Pos('=?', Result) > 0 then
-    begin
-      Result := StringReplace(Result, '=?UTF-8?B?', '', [rfReplaceAll, rfIgnoreCase]);
-      Result := StringReplace(Result, '=?UTF-8?Q?', '', [rfReplaceAll, rfIgnoreCase]);
-      Result := StringReplace(Result, '?=', '', [rfReplaceAll]);
-    end;
-  except
-    Result := Value;
-  end;
-end;
-
-procedure THttpHeaders.ValidateAndAdd(const Name, Value: string);
-var
-  ErrorMsg: string;
-  SanitizedValue: string;
-  IsContentTypeHeader: Boolean;
-  IsKnownSafeHeader: Boolean;
-  IsAcceptHeader: Boolean;
-begin
-  try
-    IsContentTypeHeader := (LowerCase(Name) = 'content-type');
-    IsAcceptHeader := (LowerCase(Name) = 'accept');
-    IsKnownSafeHeader := IsContentTypeHeader or
-                        IsAcceptHeader or
-                        (LowerCase(Name) = 'user-agent') or
-                        (LowerCase(Name) = 'host') or
-                        (LowerCase(Name) = 'authorization') or
-                        (LowerCase(Name) = 'cache-control') or
-                        (LowerCase(Name) = 'connection') or
-                        (LowerCase(Name) = 'content-length') or
-                        (LowerCase(Name) = 'accept-language') or
-                        (LowerCase(Name) = 'accept-encoding') or
-                        (LowerCase(Name) = 'referer') or
-                        (LowerCase(Name) = 'origin');
-    if not THeaderValidator.ValidateHeaderName(Name, ErrorMsg) then
-    begin
-      case FValidationLevel of
-        vlStrict:
-          raise Exception.Create('Invalid header name: ' + ErrorMsg);
-        vlModerate:
-            raise Exception.Create('Invalid header name rejected: ' + ErrorMsg);
-        vlPermissive:
-          Logger.Info('  -> Permissive: Accepting invalid header name: ' + Name + ' (' + ErrorMsg + ')');
-      end;
-    end;
-    if IsKnownSafeHeader then
-    begin
-      if IsContentTypeHeader then
-      begin
-        if (Pos('multipart/', LowerCase(Value)) > 0) or
-           (Pos('application/', LowerCase(Value)) > 0) or
-           (Pos('text/', LowerCase(Value)) > 0) then
-        begin
-          AddHeader(Name, Value);
-          Exit;
-        end;
-      end
-      else if IsAcceptHeader then
-      begin
-        if (Pos('text/', LowerCase(Value)) > 0) or
-           (Pos('application/', LowerCase(Value)) > 0) or
-           (Pos('*/*', LowerCase(Value)) > 0) or
-           (Pos('q=0.', LowerCase(Value)) > 0) then
-        begin
-          AddHeader(Name, Value);
-          Exit;
-        end;
-      end
-      else if SameText(Name, 'Authorization') then
-      begin
-        AddHeader(Name, Value);
-        Exit;
-      end
-      else
-      begin
-        if not THeaderValidator.HasSuspiciousPatterns(Value) then
-        begin
-          AddHeader(Name, Value);
-          Exit;
-        end;
-      end;
-    end;
-
-    if not SameText(Name, 'Authorization') and THeaderValidator.HasSuspiciousPatterns(Value) then
-    begin
-      case FValidationLevel of
-        vlStrict:
-          raise Exception.Create('Suspicious patterns detected in header value: ' + Name);
-        vlModerate:
-          begin
-            Logger.Error('  -> Moderate: SECURITY THREAT - I reject suspicious headline');
-            raise Exception.Create('Security threat detected in header value: ' + Name);
-          end;
-        vlPermissive:
-          Logger.Info('  -> Permissive: I accept the suspicious header');
-      end;
-    end;
-    if THeaderValidator.HasSuspiciousPatterns(Name) then
-    begin
-      case FValidationLevel of
-        vlStrict:
-          raise Exception.Create('Suspicious patterns detected in header name: ' + Name);
-        vlModerate:
-          begin
-            Logger.Error('  -> Moderate: SECURITY RISK - I reject suspicious header name');
-            raise Exception.Create('Security threat detected in header name: ' + Name);
-          end;
-        vlPermissive:
-          Logger.Info('  -> Permissive: I accept the suspicious header name');
-      end;
-    end;
-    SanitizedValue := ProcessInternationalHeader(Value);
-    if not THeaderValidator.ValidateHeaderValue(Name, SanitizedValue, ErrorMsg) then
-    begin
-      case FValidationLevel of
-        vlStrict:
-          raise Exception.Create('Invalid header value: ' + ErrorMsg);
-        vlModerate:
-          begin
-            SanitizedValue := THeaderValidator.SanitizeHeaderValue(SanitizedValue);
-          end;
-        vlPermissive:
-          Logger.Info('  -> Permissive: Accepting invalid header value for: ' + Name + ' (' + ErrorMsg + ')');
-      end;
-    end;
-    AddHeader(Name, SanitizedValue);
-  except
-    on E: Exception do
-    begin
-      if (Pos('Security threat', E.Message) > 0) or
-         (Pos('Suspicious patterns', E.Message) > 0) or
-         (Pos('Invalid header name', E.Message) > 0) then
-           raise;
-      if FValidationLevel = vlStrict then
-         raise;
-    end;
-  end;
-end;
-
-procedure THttpHeaders.EnsureDictMode;
-var
-  I: Integer;
-  HeaderValues: TStringList;
-begin
-  if FUseDict then
-    Exit;
-  FUseDict := True;
-  if not Assigned(FHeaders) then
-    FHeaders := TObjectDictionary<string, TStringList>.Create([]);
-  if not Assigned(FPooledLists) then
-    FPooledLists := TList<TStringList>.Create;
-  for I := 0 to FSlotCount - 1 do
-  begin
-    if not FHeaders.TryGetValue(FSlotNames[I], HeaderValues) then
-    begin
-      if Assigned(FPooledLists) and (FPooledLists.Count > 0) then
-      begin
-        HeaderValues := FPooledLists[FPooledLists.Count - 1];
-        FPooledLists.Delete(FPooledLists.Count - 1);
-      end
-      else
-        HeaderValues := TStringList.Create;
-      FHeaders.Add(FSlotNames[I], HeaderValues);
-    end;
-    HeaderValues.Add(FSlotValues[I]);
-    FSlotNames[I] := '';
-    FSlotValues[I] := '';
-  end;
-  FSlotCount := 0;
-end;
-
-procedure THttpHeaders.AddHeader(const Name, Value: string);
-var
-  NormalizedName: string;
-  CleanValue: string;
-begin
-  NormalizedName := NormalizeHeaderName(Name);
-  if NormalizedName = '' then
-    Exit;
-  if (Length(Value) = 0) or ((Value[1] > ' ') and (Value[Length(Value)] > ' ')) then
-    CleanValue := Value
-  else
-    CleanValue := Trim(Value);
-  AddNormalizedHeader(NormalizedName, CleanValue);
-end;
-
-procedure THttpHeaders.AddNormalizedHeader(const NormalizedName, CleanValue: string);
-var
-  HeaderValues: TStringList;
-  I: Integer;
-begin
-  if NormalizedName = '' then
-    Exit;
-  if not FUseDict then
-  begin
-    if FSlotCount = 0 then
-    begin
-      FSlotNames[0] := NormalizedName;
-      FSlotValues[0] := CleanValue;
-      FSlotCount := 1;
-      Exit;
-    end;
-    for I := 0 to FSlotCount - 1 do
-    begin
-      if FSlotNames[I] = NormalizedName then
-      begin
-        EnsureDictMode;
-        Break;
-      end;
-    end;
-    if not FUseDict then
-    begin
-      if FSlotCount < 16 then
-      begin
-        FSlotNames[FSlotCount] := NormalizedName;
-        FSlotValues[FSlotCount] := CleanValue;
-        Inc(FSlotCount);
-        Exit;
-      end;
-      EnsureDictMode;
-    end;
-  end;
-  try
-    if not FHeaders.TryGetValue(NormalizedName, HeaderValues) then
-    begin
-      if Assigned(FPooledLists) and (FPooledLists.Count > 0) then
-      begin
-        HeaderValues := FPooledLists[FPooledLists.Count - 1];
-        FPooledLists.Delete(FPooledLists.Count - 1);
-      end
-      else
-        HeaderValues := TStringList.Create;
-      FHeaders.Add(NormalizedName, HeaderValues);
-    end;
-    HeaderValues.Add(CleanValue);
-  except
-    on E: Exception do
-    begin
-      Logger.Error('Error adding header "%s": %s', [NormalizedName, E.Message]);
-      raise Exception.CreateFmt('Error adding header "%s": %s', [NormalizedName, E.Message]);
-    end;
-  end;
-end;
-
-procedure THttpHeaders.AddMultipleValues(const Name: string; const Values: TArray<string>);
-var
-  I: Integer;
-begin
-  try
-    for I := 0 to Length(Values) - 1 do
-      AddHeader(Name, Values[I]);
-  except
-    on E: Exception do
-    begin
-      Logger.Error('Error adding multiple values for header "%s": %s', [Name, E.Message]);
-      raise Exception.CreateFmt('Error adding multiple values for header "%s": %s', [Name, E.Message]);
-    end;
-  end;
-end;
-
-function THttpHeaders.GetHeader(const Name: string): string;
-var
-  NormalizedName: string;
-  HeaderValues: TStringList;
-  I: Integer;
-begin
-  Result := '';
-  try
-    NormalizedName := NormalizeHeaderName(Name);
-    if not FUseDict then
-    begin
-      for I := 0 to FSlotCount - 1 do
-      begin
-        if FSlotNames[I] = NormalizedName then
-          Exit(FSlotValues[I]);
-      end;
-      Exit('');
-    end;
-    if FHeaders.TryGetValue(NormalizedName, HeaderValues) and (HeaderValues.Count > 0) then
-      Result := HeaderValues[0];
-  except
-    Result := '';
-  end;
-end;
-
-function THttpHeaders.GetHeaderValues(const Name: string): TArray<string>;
-var
-  NormalizedName: string;
-  HeaderValues: TStringList;
-  I: Integer;
-begin
-  SetLength(Result, 0);
-  try
-    NormalizedName := NormalizeHeaderName(Name);
-    if not FUseDict then
-    begin
-      for I := 0 to FSlotCount - 1 do
-      begin
-        if FSlotNames[I] = NormalizedName then
-        begin
-          SetLength(Result, 1);
-          Result[0] := FSlotValues[I];
-          Exit;
-        end;
-      end;
-      Exit;
-    end;
-    if FHeaders.TryGetValue(NormalizedName, HeaderValues) then
-    begin
-      SetLength(Result, HeaderValues.Count);
-      for I := 0 to HeaderValues.Count - 1 do
-        Result[I] := HeaderValues[I];
-    end;
-  except
-    SetLength(Result, 0);
-  end;
-end;
-
-
-function THttpHeaders.HasHeader(const Name: string): Boolean;
-var
-  NormalizedName: string;
-  I: Integer;
-begin
-  try
-    NormalizedName := NormalizeHeaderName(Name);
-    if not FUseDict then
-    begin
-      for I := 0 to FSlotCount - 1 do
-      begin
-        if FSlotNames[I] = NormalizedName then
-          Exit(True);
-      end;
-      Exit(False);
-    end;
-    Result := FHeaders.ContainsKey(NormalizedName);
-  except
-    Result := False;
-  end;
-end;
-
-function THttpHeaders.GetFirstValue(const Name: string): string;
-var
-  Values: TArray<string>;
-begin
-  try
-    Values := GetHeaderValues(Name);
-    if Length(Values) > 0 then
-      Result := Values[0]
-    else
-      Result := '';
-  except
-    Result := '';
-  end;
-end;
-
-function THttpHeaders.GetLastValue(const Name: string): string;
-var
-  Values: TArray<string>;
-begin
-  try
-    Values := GetHeaderValues(Name);
-    if Length(Values) > 0 then
-      Result := Values[Length(Values) - 1]
-    else
-      Result := '';
-  except
-    Result := '';
-  end;
-end;
-
-procedure THttpHeaders.Clear;
-var
-  Pair: TPair<string, TStringList>;
-  I: Integer;
-begin
-  try
-    if not FUseDict then
-    begin
-      for I := 0 to FSlotCount - 1 do
-      begin
-        FSlotNames[I] := '';
-        FSlotValues[I] := '';
-      end;
-      FSlotCount := 0;
-      Exit;
-    end;
-    if Assigned(FHeaders) then
-    begin
-      for Pair in FHeaders do
-      begin
-        if Assigned(FPooledLists) and (FPooledLists.Count < 16) then
-        begin
-          Pair.Value.Clear;
-          FPooledLists.Add(Pair.Value);
-        end
-        else
-          Pair.Value.Free;
-      end;
-      FHeaders.Clear;
-    end;
-    FUseDict := False;
-  except
-
-  end;
-end;
-
-function THttpHeaders.GetHeaderNames: TArray<string>;
-var
-  I: Integer;
-begin
-  try
-    if not FUseDict then
-    begin
-      SetLength(Result, FSlotCount);
-      for I := 0 to FSlotCount - 1 do
-        Result[I] := FSlotNames[I];
-      Exit;
-    end;
-    Result := FHeaders.Keys.ToArray;
-  except
-    SetLength(Result, 0);
-  end;
-end;
-
-function THttpHeaders.Count: Integer;
-begin
-  try
-    if not FUseDict then
-      Exit(FSlotCount);
-    Result := FHeaders.Count;
-  except
-    Result := 0;
-  end;
-end;
-
-function THttpHeaders.GetContentLength: string;
-begin
-  Result := GetHeader('Content-Length');
-end;
-
-function THttpHeaders.GetContentType: string;
-begin
-  Result := GetHeader('Content-Type');
-end;
-
-function THttpHeaders.GetContentEncoding: string;
-begin
-  Result := GetHeader('Content-Encoding');
-end;
-
-function THttpHeaders.GetUserAgent: string;
-begin
-  Result := GetHeader('User-Agent');
-end;
-
-function THttpHeaders.GetHost: string;
-begin
-  Result := GetHeader('Host');
-end;
-
-function THttpHeaders.GetAuthorization: string;
-begin
-  Result := GetHeader('Authorization');
-end;
-
-function THttpHeaders.GetCookie: string;
-begin
-  Result := GetHeader('Cookie');
-end;
-
-function THttpHeaders.GetReferer: string;
-begin
-  Result := GetHeader('Referer');
-end;
-
-function THttpHeaders.GetTransferEncoding: string;
-begin
-  Result := GetHeader('Transfer-Encoding');
-end;
-
-function THttpHeaders.GetConnection: string;
-begin
-  Result := GetHeader('Connection');
-end;
-
-function THttpHeaders.DetectSecurityThreats: TArray<TSecurityThreat>;
-var
-  Threats: TList<TSecurityThreat>;
-  HeaderName: string;
-  HeaderValues: TStringList;
-  I: Integer;
-  AllHeaders: TStringList;
-begin
-  if not FUseDict then
-    EnsureDictMode;
-  Threats := TList<TSecurityThreat>.Create;
-  AllHeaders := TStringList.Create;
-  try
-    for HeaderName in FHeaders.Keys do
-    begin
-      if FHeaders.TryGetValue(HeaderName, HeaderValues) then
-      begin
-        for I := 0 to HeaderValues.Count - 1 do
-          AllHeaders.Add(HeaderName + ': ' + HeaderValues[I]);
-      end;
-    end;
-    if THeaderValidator.DetectRequestSmuggling(AllHeaders) <> stNone then
-       Threats.Add(stRequestSmuggling);
-    for HeaderName in FHeaders.Keys do
-    begin
-      if FHeaders.TryGetValue(HeaderName, HeaderValues) then
-      begin
-        for I := 0 to HeaderValues.Count - 1 do
-        begin
-          if THeaderValidator.HasSuspiciousPatterns(HeaderValues[I]) then
-             Threats.Add(stHeaderInjection);
-        end;
-        if HeaderValues.Count > 10 then
-           Threats.Add(stOversizeAttack);
-      end;
-      if not THeaderValidator.IsSafeHeaderName(HeaderName) then
-         Threats.Add(stSuspiciousHeaders);
-    end;
-    Result := Threats.ToArray;
-  finally
-    Threats.Free;
-    AllHeaders.Free;
-  end;
-end;
-
-function THttpHeaders.SanitizeHeaders: Integer;
-var
-  HeaderName: string;
-  HeaderValues: TStringList;
-  I: Integer;
-  OriginalValue, SanitizedValue: string;
-begin
-  Result := 0;
-  if not FUseDict then
-    EnsureDictMode;
-  try
-    for HeaderName in FHeaders.Keys do
-    begin
-      if FHeaders.TryGetValue(HeaderName, HeaderValues) then
-      begin
-        for I := 0 to HeaderValues.Count - 1 do
-        begin
-          OriginalValue := HeaderValues[I];
-          SanitizedValue := THeaderValidator.SanitizeHeaderValue(OriginalValue);
-          if SanitizedValue <> OriginalValue then
-          begin
-            HeaderValues[I] := SanitizedValue;
-            Inc(Result);
-          end;
-        end;
-      end;
-    end;
-  except
-    on E: Exception do
-    begin
-      Logger.Error('[HttpHeaders.SanitizeHeaders] Exception during header sanitization: %s (%s)', [E.Message, E.ClassName]);
-    end;
-  end;
-end;
-
-function THttpHeaders.GetContentEncodings: TArray<TContentEncoding>;
-var
-  ContentEncodingHeader: string;
-begin
-  try
-    ContentEncodingHeader := GetHeader('Content-Encoding');
-    if ContentEncodingHeader = '' then
-    begin
-      SetLength(Result, 0);
-      Exit;
-    end;
-    Result := FContentEncodingHandler.ParseContentEncoding(ContentEncodingHeader);
-  except
-    SetLength(Result, 0);
-  end;
-end;
-
-function THttpHeaders.IsCompressionUsed: Boolean;
-var
-  Encodings: TArray<TContentEncoding>;
-  Encoding: TContentEncoding;
-begin
-  Result := False;
-  try
-    Encodings := GetContentEncodings;
-    for Encoding in Encodings do
-    begin
-      if Encoding in [ceGzip, ceDeflate, ceCompress, ceBrotli] then
-      begin
-        Result := True;
-        Exit;
-      end;
-    end;
-  except
-    Result := False;
-  end;
-end;
-
-constructor THttpRequestInfo.Create;
-begin
-  inherited Create;
-  FQueryParameters := TDictionary<string, string>.Create;
-  FUriValidationErrors := TStringList.Create;
-  Clear;
-end;
-
-destructor THttpRequestInfo.Destroy;
-begin
-  try
-    FUriValidationErrors.Free;
-    FQueryParameters.Free;
-  finally
-    inherited Destroy;
-  end;
-end;
-
-procedure THttpRequestInfo.Clear;
-begin
-  FMethod := hmUnknown;
-  FVersion := hvUnknown;
-  FUri := '';
-  FRawUri := '';
-  FNormalizedUri := '';
-  FQueryString := '';
-  FPath := '';
-  FFragment := '';
-  FScheme := '';
-  FAuthority := '';
-  FTransferEncoding := teNone;
-  FConnectionType := ctKeepAlive;
-  FContentLength := -1;
-  if Length(FContentEncodings) > 0 then
-    SetLength(FContentEncodings, 0);
-  FIsSecure := False;
-  if FUriValidationErrors.Count > 0 then
-    FUriValidationErrors.Clear;
-end;
-
-function THttpRequestInfo.StringToHttpMethod(const MethodStr: string): THttpMethod;
-var
-  UpperMethod: string;
-begin
-  try
-    UpperMethod := UpperCase(Trim(MethodStr));
-    if UpperMethod = 'GET' then
-      Result := hmGET
-    else if UpperMethod = 'POST' then
-      Result := hmPOST
-    else if UpperMethod = 'PUT' then
-      Result := hmPUT
-    else if UpperMethod = 'DELETE' then
-      Result := hmDELETE
-    else if UpperMethod = 'HEAD' then
-      Result := hmHEAD
-    else if UpperMethod = 'OPTIONS' then
-      Result := hmOPTIONS
-    else if UpperMethod = 'PATCH' then
-      Result := hmPATCH
-    else if UpperMethod = 'TRACE' then
-      Result := hmTRACE
-    else if UpperMethod = 'CONNECT' then
-      Result := hmCONNECT
-    else
-      Result := hmUnknown;
-  except
-    Result := hmUnknown;
-  end;
-end;
-
-function THttpRequestInfo.StringToHttpVersion(const VersionStr: string): THttpVersion;
-var
-  UpperVersion: string;
-begin
-  try
-    UpperVersion := UpperCase(Trim(VersionStr));
-    if UpperVersion = 'HTTP/1.0' then
-      Result := hvHTTP10
-    else if UpperVersion = 'HTTP/1.1' then
-      Result := hvHTTP11
-    else if UpperVersion = 'HTTP/2.0' then
-      Result := hvHTTP20
-    else if UpperVersion = 'HTTP/2' then
-      Result := hvHTTP20
-    else Result := hvUnknown;
-  except
-    Result := hvUnknown;
-  end;
-end;
-
-function THttpRequestInfo.ParseTransferEncoding(const EncodingStr: string): TTransferEncoding;
-var
-  LowerEncoding: string;
-begin
-  try
-    LowerEncoding := LowerCase(Trim(EncodingStr));
-    if LowerEncoding = 'chunked' then
-      Result := teChunked
-    else if LowerEncoding = 'compress' then
-      Result := teCompress
-    else if LowerEncoding = 'deflate' then
-      Result := teDeflate
-    else if LowerEncoding = 'gzip' then
-      Result := teGzip
-    else if LowerEncoding = 'identity' then
-      Result := teIdentity
-    else
-      Result := teNone;
-  except
-    Result := teNone;
-  end;
-end;
-
-function THttpRequestInfo.ParseConnectionType(const ConnectionStr: string): TConnectionType;
-var
-  LowerConnection: string;
-begin
-  try
-    LowerConnection := LowerCase(Trim(ConnectionStr));
-    if LowerConnection = 'close' then
-      Result := ctClose
-    else if LowerConnection = 'upgrade' then
-      Result := ctUpgrade
-    else
-      Result := ctKeepAlive;
-  except
-    Result := ctKeepAlive;
-  end;
-end;
-
-procedure THttpRequestInfo.ParseQueryString(const AQueryString: string; ADictionary: TDictionary<string, string>);
-var
-  StartIndex: Integer;
-  PairEndIndex: Integer;
-  SeparatorPos: Integer;
-  Key, Value: string;
-begin
-  if not Assigned(ADictionary) then
-     raise EArgumentNilException.Create('ADictionary cannot be nil');
-  ADictionary.Clear;
-  if AQueryString.Trim = '' then
-    Exit;
-
-  StartIndex := 1;
-  while StartIndex <= Length(AQueryString) do
-  begin
-    PairEndIndex := Pos('&', AQueryString, StartIndex);
-    if PairEndIndex = 0 then
-       PairEndIndex := Length(AQueryString) + 1;
-    SeparatorPos := PosEx('=', AQueryString, StartIndex);
-    if (SeparatorPos > 0) and (SeparatorPos < PairEndIndex) then
-    begin
-      Key := TNetEncoding.URL.Decode(Copy(AQueryString, StartIndex, SeparatorPos - StartIndex));
-      Value := TNetEncoding.URL.Decode(Copy(AQueryString, SeparatorPos + 1, PairEndIndex - SeparatorPos - 1));
-    end
-    else
-    begin
-      Key := TNetEncoding.URL.Decode(Copy(AQueryString, StartIndex, PairEndIndex - StartIndex));
-      Value := '';
-    end;
-    if Key <> '' then
-      ADictionary.AddOrSetValue(Key, Value);
-
-    StartIndex := PairEndIndex + 1;
-  end;
-end;
-
-procedure THttpRequestInfo.ParseUri(const RawUri: string);
-var
-  QuestionPos, HashPos, SchemeEnd, AuthorityStart, PathStart: Integer;
-  WorkingUri: string;
-  ErrorMsg: string;
-  I, RawLen: Integer;
-  Ch, PrevCh: Char;
-  IsSimpleCleanPath: Boolean;
-begin
-  try
-    if RawUri = '/' then
-    begin
-      FRawUri := '/';
-      FUri := '/';
-      FPath := '/';
-      FNormalizedUri := '/';
-      FQueryString := '';
-      FFragment := '';
-      FScheme := '';
-      FAuthority := '';
-      if FUriValidationErrors.Count > 0 then
-        FUriValidationErrors.Clear;
-      Exit;
-    end;
-    RawLen := Length(RawUri);
-    if (RawLen > 1) and (RawLen <= 512) and (RawUri[1] = '/') then
-    begin
-      IsSimpleCleanPath := True;
-      PrevCh := '/';
-      for I := 2 to RawLen do
-      begin
-        Ch := RawUri[I];
-        if not (((Ch >= 'a') and (Ch <= 'z')) or ((Ch >= 'A') and (Ch <= 'Z')) or
-                ((Ch >= '0') and (Ch <= '9')) or (Ch = '/') or (Ch = '-') or
-                (Ch = '_') or (Ch = '.')) then
-        begin
-          IsSimpleCleanPath := False;
-          Break;
-        end;
-        if ((Ch = '.') and ((PrevCh = '.') or (PrevCh = '/'))) or
-           ((Ch = '/') and (PrevCh = '/')) then
-        begin
-          IsSimpleCleanPath := False;
-          Break;
-        end;
-        PrevCh := Ch;
-      end;
-      if IsSimpleCleanPath then
-      begin
-        FRawUri := RawUri;
-        FUri := RawUri;
-        FPath := RawUri;
-        FNormalizedUri := RawUri;
-        FQueryString := '';
-        FFragment := '';
-        FScheme := '';
-        FAuthority := '';
-        if FUriValidationErrors.Count > 0 then
-          FUriValidationErrors.Clear;
-        if (RawLen >= 6) and THeaderValidator.HasSuspiciousPatterns(FPath) then
-          FUriValidationErrors.Add('Suspicious patterns detected in path');
-        Exit;
-      end;
-    end;
-    FRawUri := Trim(RawUri);
-    FUri := FRawUri;
-    FUriValidationErrors.Clear;
-    if (Pos('%00', FRawUri) > 0) or (Pos(#0, FRawUri) > 0) then
-       FUriValidationErrors.Add('Null byte injection attempt detected in URI');
-    if Length(FRawUri) = 0 then
-    begin
-      FUriValidationErrors.Add('URI cannot be empty');
-      FPath := '/'; Exit;
-    end;
-    WorkingUri := FRawUri;
-    HashPos := Pos('#', WorkingUri);
-    if HashPos > 0 then
-    begin
-      FFragment := Copy(WorkingUri, HashPos + 1, Length(WorkingUri));
-      WorkingUri := Copy(WorkingUri, 1, HashPos - 1);
-      if not TUriValidator.IsValidFragment(FFragment) then
-        FUriValidationErrors.Add('Invalid fragment: ' + FFragment);
-    end else FFragment := '';
-    QuestionPos := Pos('?', WorkingUri);
-    if QuestionPos > 0 then
-    begin
-      FQueryString := Copy(WorkingUri, QuestionPos + 1, Length(WorkingUri));
-      WorkingUri := Copy(WorkingUri, 1, QuestionPos - 1);
-      if not TUriValidator.IsValidQuery(FQueryString) then
-        FUriValidationErrors.Add('Invalid query string: ' + FQueryString);
-      ParseQueryString(FQueryString, FQueryParameters);
-    end else FQueryString := '';
-    SchemeEnd := Pos('://', WorkingUri);
-    if SchemeEnd > 0 then
-    begin
-      FScheme := Copy(WorkingUri, 1, SchemeEnd - 1);
-      AuthorityStart := SchemeEnd + 3;
-      PathStart := Pos('/', WorkingUri, AuthorityStart);
-      if PathStart > 0 then
-      begin
-        FAuthority := Copy(WorkingUri, AuthorityStart, PathStart - AuthorityStart);
-        FPath := Copy(WorkingUri, PathStart, Length(WorkingUri));
-      end else
-      begin
-        FAuthority := Copy(WorkingUri, AuthorityStart, Length(WorkingUri));
-        FPath := '/';
-      end;
-    end else
-    begin
-      FScheme := '';
-      FAuthority := '';
-      FPath := WorkingUri;
-    end;
-    if not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
-      FUriValidationErrors.Add('Path validation: ' + ErrorMsg);
-    FNormalizedUri := TUriValidator.NormalizeURI(FRawUri);
-    if FPath = '' then FPath := '/';
-    ValidateUriComponents;
-  except
-    on E: Exception do
-    begin
-      FUriValidationErrors.Add('Parse error: ' + E.Message);
-      FPath := '/'; FQueryString := ''; FFragment := ''; FScheme := ''; FAuthority := '';
-    end;
-  end;
-end;
-
-procedure THttpRequestInfo.ValidateUriComponents;
-var
-  DecodedQuery, DecodedPath, LowerPath, LowerRaw: string;
-  HasPercentPath, HasPercentRaw: Boolean;
-  Params: TArray<string>;
-  Param: string;
-begin
-  try
-    if Length(FPath) > 2048 then
-       FUriValidationErrors.Add('Path too long (>2048 characters)');
-    if Length(FQueryString) > 4096 then
-       FUriValidationErrors.Add('Query string too long (>4096 characters)');
-    if Length(FFragment) > 1024 then
-       FUriValidationErrors.Add('Fragment too long (>1024 characters)');
-
-    HasPercentPath := Pos('%', FPath) > 0;
-    HasPercentRaw := HasPercentPath or (Pos('%', FRawUri) > 0);
-
-    if Pos('..', FPath) > 0 then
-      FUriValidationErrors.Add('Path traversal attempt detected')
-    else if HasPercentPath then
-    begin
-      LowerPath := LowerCase(FPath);
-      if (Pos('%2e%2e', LowerPath) > 0) or (Pos('%252e', LowerPath) > 0) or (Pos('%c0%af', LowerPath) > 0) then
-        FUriValidationErrors.Add('Path traversal attempt detected');
-    end;
-
-    if (Pos(#0, FRawUri) > 0) or (HasPercentRaw and (Pos('%00', FRawUri) > 0)) then
-      FUriValidationErrors.Add('Null byte injection attempt detected');
-
-    if (Pos(#10, FRawUri) > 0) or (Pos(#13, FRawUri) > 0) then
-      FUriValidationErrors.Add('CRLF injection attempt detected')
-    else if HasPercentRaw then
-    begin
-      LowerRaw := LowerCase(FRawUri);
-      if (Pos('%0a', LowerRaw) > 0) or (Pos('%0d', LowerRaw) > 0) then
-        FUriValidationErrors.Add('CRLF injection attempt detected');
-    end;
-
-    if FQueryString <> '' then
-    begin
-      if THeaderValidator.HasSuspiciousPatterns(FQueryString) then
-        FUriValidationErrors.Add('Potential attack detected in query string')
-      else if (Pos('%', FQueryString) > 0) or (Pos('+', FQueryString) > 0) then
-      begin
-        DecodedQuery := TNetEncoding.URL.Decode(FQueryString);
-        if THeaderValidator.HasSuspiciousPatterns(DecodedQuery) then
-          FUriValidationErrors.Add('Potential attack detected in query string');
-      end;
-      if Length(FQueryString) > 1024 then
-      begin
-        Params := FQueryString.Split(['&']);
-        for Param in Params do
-        begin
-          if Length(Param) > 1024 then
-          begin
-            FUriValidationErrors.Add('Query parameter too long: ' + Copy(Param, 1, 50) + '...');
-            Break;
-          end;
-        end;
-      end;
-    end;
-
-    if FPath <> '' then
-    begin
-      if THeaderValidator.HasSuspiciousPatterns(FPath) then
-        FUriValidationErrors.Add('Potential attack detected in path')
-      else if HasPercentPath then
-      begin
-        DecodedPath := TNetEncoding.URL.Decode(FPath);
-        if THeaderValidator.HasSuspiciousPatterns(DecodedPath) then
-          FUriValidationErrors.Add('Potential attack detected in path');
-      end;
-    end;
-  except
-    on E: Exception do
-    begin
-      Logger.Info(Format('DEBUG: Exception in ValidateUriComponents: %s', [E.Message]));
-      FUriValidationErrors.Add('Validation error: ' + E.Message);
-    end;
-  end;
-end;
-
-function AsciiEqualsStrPtr(P: PByte; Len: Integer; const S: string): Boolean; inline;
-var
-  I: Integer;
-begin
-  if Length(S) <> Len then
-    Exit(False);
-  for I := 0 to Len - 1 do
-  begin
-    if Ord(S[I + 1]) <> P[I] then
-      Exit(False);
-  end;
-  Result := True;
-end;
-
-function THttpRequestInfo.ParseRequestLinePtr(LinePtr: PByte; LineLen: Integer; var CachedUri: string): Boolean;
-var
-  MethodVal: THttpMethod;
-  MethodLen: Integer;
-  UriStart, UriEnd, UriLen, I: Integer;
-  B, PrevB: Byte;
-  UriStr: string;
-begin
-  Result := False;
-  if (LinePtr = nil) or (LineLen < 14) then
-    Exit;
-
-  if (LinePtr[LineLen - 9] <> Ord(' ')) or (LinePtr[LineLen - 8] <> Ord('H')) or
-     (LinePtr[LineLen - 7] <> Ord('T')) or (LinePtr[LineLen - 6] <> Ord('T')) or
-     (LinePtr[LineLen - 5] <> Ord('P')) or (LinePtr[LineLen - 4] <> Ord('/')) or
-     (LinePtr[LineLen - 3] <> Ord('1')) or (LinePtr[LineLen - 2] <> Ord('.')) then
-    Exit;
-
-  if LinePtr[LineLen - 1] = Ord('1') then
-    FVersion := hvHTTP11
-  else if LinePtr[LineLen - 1] = Ord('0') then
-    FVersion := hvHTTP10
-  else
-    Exit;
-
-  if (LinePtr[0] = Ord('G')) and (LinePtr[1] = Ord('E')) and (LinePtr[2] = Ord('T')) and (LinePtr[3] = Ord(' ')) then
-  begin
-    MethodVal := hmGET;
-    MethodLen := 4;
-  end
-  else if (LinePtr[0] = Ord('P')) and (LinePtr[1] = Ord('O')) and (LinePtr[2] = Ord('S')) and (LinePtr[3] = Ord('T')) and (LinePtr[4] = Ord(' ')) then
-  begin
-    MethodVal := hmPOST;
-    MethodLen := 5;
-  end
-  else if (LinePtr[0] = Ord('H')) and (LinePtr[1] = Ord('E')) and (LinePtr[2] = Ord('A')) and (LinePtr[3] = Ord('D')) and (LinePtr[4] = Ord(' ')) then
-  begin
-    MethodVal := hmHEAD;
-    MethodLen := 5;
-  end
-  else if (LinePtr[0] = Ord('P')) and (LinePtr[1] = Ord('U')) and (LinePtr[2] = Ord('T')) and (LinePtr[3] = Ord(' ')) then
-  begin
-    MethodVal := hmPUT;
-    MethodLen := 4;
-  end
-  else
-    Exit;
-
-  UriStart := MethodLen;
-  UriEnd := LineLen - 10;
-  UriLen := UriEnd - UriStart + 1;
-  if (UriLen <= 0) or (UriLen > 512) or (LinePtr[UriStart] <> Ord('/')) then
-    Exit;
-
-  if UriLen = 1 then
-  begin
-    FMethod := MethodVal;
-    FRawUri := '/';
-    FUri := '/';
-    FPath := '/';
-    FNormalizedUri := '/';
-    FQueryString := '';
-    FFragment := '';
-    FScheme := '';
-    FAuthority := '';
-    if FUriValidationErrors.Count > 0 then
-      FUriValidationErrors.Clear;
-    Result := True;
-    Exit;
-  end;
-
-  if AsciiEqualsStrPtr(LinePtr + UriStart, UriLen, CachedUri) then
-  begin
-    FMethod := MethodVal;
-    FRawUri := CachedUri;
-    FUri := CachedUri;
-    FPath := CachedUri;
-    FNormalizedUri := CachedUri;
-    FQueryString := '';
-    FFragment := '';
-    FScheme := '';
-    FAuthority := '';
-    if FUriValidationErrors.Count > 0 then
-      FUriValidationErrors.Clear;
-    Result := True;
-    Exit;
-  end;
-
-  PrevB := Ord('/');
-  for I := UriStart + 1 to UriEnd do
-  begin
-    B := LinePtr[I];
-    if not (((B >= Ord('a')) and (B <= Ord('z'))) or ((B >= Ord('A')) and (B <= Ord('Z'))) or
-            ((B >= Ord('0')) and (B <= Ord('9'))) or (B = Ord('/')) or (B = Ord('-')) or
-            (B = Ord('_')) or (B = Ord('.'))) then
-      Exit;
-    if ((B = Ord('.')) and ((PrevB = Ord('.')) or (PrevB = Ord('/')))) or
-       ((B = Ord('/')) and (PrevB = Ord('/'))) then
-      Exit;
-    PrevB := B;
-  end;
-
-  if (UriLen >= 6) and THeaderValidator.HasSuspiciousPatternsPtr(LinePtr + UriStart, UriLen) then
-    Exit;
-
-  SetLength(UriStr, UriLen);
-  for I := 0 to UriLen - 1 do
-    UriStr[I + 1] := Char(LinePtr[UriStart + I]);
-  CachedUri := UriStr;
-
-  FMethod := MethodVal;
-  FRawUri := UriStr;
-  FUri := UriStr;
-  FPath := UriStr;
-  FNormalizedUri := UriStr;
-  FQueryString := '';
-  FFragment := '';
-  FScheme := '';
-  FAuthority := '';
-  if FUriValidationErrors.Count > 0 then
-    FUriValidationErrors.Clear;
-  Result := True;
-end;
-
-procedure THttpRequestInfo.ParseRequestLine(const RequestLine: string);
-var
-  MethodStr, UriStr, VerStr: string;
-  ErrorMsg: string;
-  SpacePos1, SpacePos2, Len: Integer;
-begin
-  try
-    Len := Length(RequestLine);
-    if (Len >= 14) and (RequestLine[1] = 'G') and (RequestLine[2] = 'E') and (RequestLine[3] = 'T') and (RequestLine[4] = ' ') and
-       (RequestLine[Len - 8] = ' ') and (RequestLine[Len - 7] = 'H') and (RequestLine[Len - 6] = 'T') and (RequestLine[Len - 5] = 'T') and
-       (RequestLine[Len - 4] = 'P') and (RequestLine[Len - 3] = '/') and (RequestLine[Len - 2] = '1') and (RequestLine[Len - 1] = '.') and
-       ((RequestLine[Len] = '1') or (RequestLine[Len] = '0')) then
-    begin
-      FMethod := hmGET;
-      if RequestLine[Len] = '1' then
-        FVersion := hvHTTP11
-      else
-        FVersion := hvHTTP10;
-      if (Len = 14) and (RequestLine[5] = '/') then
-        ParseUri('/')
-      else
-      begin
-        UriStr := Copy(RequestLine, 5, Len - 13);
-        ParseUri(UriStr);
-      end;
-      if (FPath <> '/') and (FUriValidationErrors.Count > 0) and not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
-        raise Exception.Create('Invalid URI path: ' + ErrorMsg);
-      Exit;
-    end;
-    SpacePos1 := Pos(' ', RequestLine);
-    if SpacePos1 = 0 then
-       raise Exception.Create('Invalid HTTP request line - missing first space');
-    SpacePos2 := Pos(' ', RequestLine, SpacePos1 + 1);
-    if SpacePos2 = 0 then
-       raise Exception.Create('Invalid HTTP request line - missing second space');
-    MethodStr := Copy(RequestLine, 1, SpacePos1 - 1);
-    UriStr := Copy(RequestLine, SpacePos1 + 1, SpacePos2 - SpacePos1 - 1);
-    VerStr := Copy(RequestLine, SpacePos2 + 1, Len - SpacePos2);
-    if MethodStr = 'GET' then
-      FMethod := hmGET
-    else if MethodStr = 'POST' then
-      FMethod := hmPOST
-    else
-      FMethod := StringToHttpMethod(MethodStr);
-    if FMethod = hmUnknown then
-       raise Exception.CreateFmt('Unknown HTTP method: %s', [MethodStr]);
-    ParseUri(UriStr);
-    if VerStr = 'HTTP/1.1' then
-      FVersion := hvHTTP11
-    else if VerStr = 'HTTP/1.0' then
-      FVersion := hvHTTP10
-    else
-      FVersion := StringToHttpVersion(VerStr);
-    if FVersion = hvUnknown then
-       raise Exception.CreateFmt('Unsupported HTTP version: %s', [VerStr]);
-    if (FPath <> '/') and not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
-      raise Exception.Create('Invalid URI path: ' + ErrorMsg);
-  except
-    on E: Exception do
-      raise Exception.CreateFmt('Error parsing request line: %s', [E.Message]);
-  end;
-end;
-
-procedure THttpRequestInfo.ParseFromHeaders(Headers: THttpHeaders);
-var
-  ContentLengthStr: string;
-  TransferEncodingStr: string;
-  ConnectionStr: string;
-  ContentEncodingStr: string;
-  HostHeader: string;
-  SlotName: string;
-  I: Integer;
-begin
-  try
-    if not Headers.FUseDict then
-    begin
-      TransferEncodingStr := '';
-      ConnectionStr := '';
-      ContentLengthStr := '';
-      ContentEncodingStr := '';
-      HostHeader := '';
-      for I := 0 to Headers.FSlotCount - 1 do
-      begin
-        SlotName := Headers.FSlotNames[I];
-        if SlotName = 'host' then
-          HostHeader := Headers.FSlotValues[I]
-        else if SlotName = 'connection' then
-          ConnectionStr := Headers.FSlotValues[I]
-        else if SlotName = 'content-length' then
-          ContentLengthStr := Headers.FSlotValues[I]
-        else if SlotName = 'transfer-encoding' then
-          TransferEncodingStr := Headers.FSlotValues[I]
-        else if SlotName = 'content-encoding' then
-          ContentEncodingStr := Headers.FSlotValues[I];
-      end;
-      if TransferEncodingStr = '' then
-        FTransferEncoding := teNone
-      else
-        FTransferEncoding := ParseTransferEncoding(TransferEncodingStr);
-      if ConnectionStr = 'keep-alive' then
-        FConnectionType := ctKeepAlive
-      else if ConnectionStr = 'close' then
-        FConnectionType := ctClose
-      else
-        FConnectionType := ParseConnectionType(ConnectionStr);
-      if ContentEncodingStr = '' then
-        SetLength(FContentEncodings, 0)
-      else
-        FContentEncodings := Headers.GetContentEncodings;
-    end
-    else
-    begin
-      TransferEncodingStr := Headers.TransferEncoding;
-      FTransferEncoding := ParseTransferEncoding(TransferEncodingStr);
-      ConnectionStr := Headers.Connection;
-      FConnectionType := ParseConnectionType(ConnectionStr);
-      ContentLengthStr := Headers.ContentLength;
-      FContentEncodings := Headers.GetContentEncodings;
-      HostHeader := Headers.Host;
-    end;
-    if FVersion = hvHTTP10 then
-       FConnectionType := ctClose;
-    if ContentLengthStr <> '' then
-    begin
-      FContentLength := StrToInt64Def(ContentLengthStr, -1);
-      if FContentLength < 0 then
-         raise Exception.Create('Invalid Content-Length value: ' + ContentLengthStr);
-    end
-    else
-      FContentLength := -1;
-
-    if (FVersion = hvHTTP11) and (HostHeader = '') then
-      raise Exception.Create('HTTP/1.1 requires Host header');
-
-    FIsSecure := (FScheme <> '') and SameText(FScheme, 'https');
-  except
-    on E: Exception do
-       raise Exception.CreateFmt('Header parsing error: %s', [E.Message]);
-  end;
-end;
-
-function THttpRequestInfo.MethodToString: string;
-begin
-  case FMethod of
-    hmGET: Result := 'GET';
-    hmPOST: Result := 'POST';
-    hmPUT: Result := 'PUT';
-    hmDELETE: Result := 'DELETE';
-    hmHEAD: Result := 'HEAD';
-    hmOPTIONS: Result := 'OPTIONS';
-    hmPATCH: Result := 'PATCH';
-    hmTRACE: Result := 'TRACE';
-    hmCONNECT: Result := 'CONNECT';
-  else
-    Result := 'UNKNOWN';
-  end;
-end;
-
-function THttpRequestInfo.VersionToString: string;
-begin
-  case FVersion of
-    hvHTTP10: Result := 'HTTP/1.0';
-    hvHTTP11: Result := 'HTTP/1.1';
-    hvHTTP20: Result := 'HTTP/2.0';
-  else
-    Result := 'UNKNOWN';
-  end;
-end;
-
-function THttpRequestInfo.HasBody: Boolean;
-begin
-  Result := (FMethod in [hmPOST, hmPUT, hmPATCH]) or
-           (FContentLength > 0) or
-           (FTransferEncoding <> teNone);
-end;
-
-function THttpRequestInfo.IsMethodSafe: Boolean;
-begin
-  Result := FMethod in [hmGET, hmHEAD, hmOPTIONS, hmTRACE];
-end;
-
-function THttpRequestInfo.IsMethodIdempotent: Boolean;
-begin
-  Result := FMethod in [hmGET, hmHEAD, hmPUT, hmDELETE, hmOPTIONS, hmTRACE];
-end;
-
-function THttpRequestInfo.IsUriValid: Boolean;
-begin
-  Result := FUriValidationErrors.Count = 0;
-end;
-
-function THttpRequestInfo.GetUriValidationSummary: string;
-begin
-  if FUriValidationErrors.Count = 0 then
-    Result := 'URI validation passed'
-  else
-    Result := Format('URI validation failed (%d errors): %s',
-                    [FUriValidationErrors.Count, FUriValidationErrors.Text]);
+  Result := GRequestTypes.IsHexDigit(c);
 end;
 
 constructor TRequest.Create(ASocket: TSocket; const ARemoteAddr: TSockAddrIn;
@@ -3462,7 +300,6 @@ begin
         FreeAndNil(FBodyStream);
         FreeAndNil(FDecompressedBodyStream);
       except
-
       end;
       raise Exception.CreateFmt('Error creating TRequest: %s', [E.Message]);
     end;
@@ -3519,7 +356,6 @@ begin
       FDecompressedBodyStream.Size := 0;
     end;
   except
-
   end;
 end;
 
@@ -3585,6 +421,7 @@ end;
 procedure TRequest.SetError(const ErrorMsg: string; Threat: TSecurityThreat);
 var
   i: Integer;
+  OldLen: Integer;
   ThreatsStr: string;
 begin
   FErrorParsing := True;
@@ -3597,7 +434,7 @@ begin
   begin
     if not HasExistingThreat(Threat) then
     begin
-      var OldLen := Length(FSecurityThreats);
+      OldLen := Length(FSecurityThreats);
       SetLength(FSecurityThreats, OldLen + 1);
       FSecurityThreats[OldLen] := Threat;
     end;
@@ -3824,12 +661,14 @@ begin
 end;
 
 function TRequest.IsComplete: Boolean;
+var
+  BodyComplete: Boolean;
 begin
   try
     Result := (FState = rsComplete) and not FErrorParsing;
     if Result and (FExpectedBodySize > 0) then
     begin
-      var BodyComplete := (FBodyBytesReceived >= FExpectedBodySize);
+      BodyComplete := (FBodyBytesReceived >= FExpectedBodySize);
       if not BodyComplete then
       begin
         Logger.Error('DEBUG: Request not complete - body size mismatch: %d/%d', [FBodyBytesReceived, FExpectedBodySize]);
@@ -3839,9 +678,7 @@ begin
     if Result and Assigned(FBodyParser) then
     begin
       if not FBodyParser.IsComplete then
-      begin
         Result := False;
-      end;
     end;
   except
     on E: Exception do
@@ -3869,7 +706,7 @@ end;
 
 function TRequest.CanAcceptMoreData: Boolean;
 begin
-  Result := (FState in [rsWaitingHeaders, rsParsingHeaders, rsWaitingBody]) and  not FErrorParsing;
+  Result := (FState in [rsWaitingHeaders, rsParsingHeaders, rsWaitingBody]) and not FErrorParsing;
 end;
 
 function TRequest.IsSecure: Boolean;
@@ -3904,19 +741,19 @@ begin
   HasContentLength := False;
   HasChunked := False;
 
-  if not FHeaders.FUseDict then
+  if not FHeaders.UseDict then
   begin
-    if FHeaders.FSlotCount > FMaxHeaderCount then
+    if FHeaders.SlotCount > FMaxHeaderCount then
     begin
       if not HasExistingThreat(stOversizeAttack) then
         FSecurityThreats := FSecurityThreats + [stOversizeAttack];
       if FErrorMessage = '' then
-        FErrorMessage := Format('Too many headers: %d exceeds maximum of %d', [FHeaders.FSlotCount, FMaxHeaderCount]);
+        FErrorMessage := Format('Too many headers: %d exceeds maximum of %d', [FHeaders.SlotCount, FMaxHeaderCount]);
     end;
-    for I := 0 to FHeaders.FSlotCount - 1 do
+    for I := 0 to FHeaders.SlotCount - 1 do
     begin
-      LowerKey := FHeaders.FSlotNames[I];
-      Value := FHeaders.FSlotValues[I];
+      LowerKey := FHeaders.GetSlotName(I);
+      Value := FHeaders.GetSlotValue(I);
       if LowerKey = 'host' then
         Inc(HostCount)
       else if LowerKey = 'content-length' then
@@ -3973,15 +810,15 @@ begin
   end
   else
   begin
-    if FHeaders.FHeaders.Count > FMaxHeaderCount then
+    if FHeaders.Headers.Count > FMaxHeaderCount then
     begin
       if not HasExistingThreat(stOversizeAttack) then
         FSecurityThreats := FSecurityThreats + [stOversizeAttack];
       if FErrorMessage = '' then
-        FErrorMessage := Format('Too many headers: %d exceeds maximum of %d', [FHeaders.FHeaders.Count, FMaxHeaderCount]);
+        FErrorMessage := Format('Too many headers: %d exceeds maximum of %d', [FHeaders.Headers.Count, FMaxHeaderCount]);
     end;
 
-    for Pair in FHeaders.FHeaders do
+    for Pair in FHeaders.Headers do
     begin
       LowerKey := Pair.Key;
       Values := Pair.Value;
@@ -4441,268 +1278,6 @@ begin
     Result := Format('%d security threats detected', [Length(FSecurityThreats)]);
 end;
 
-function MatchKnownHeaderSlice(const S: string; StartIdx, NameLen: Integer; out CanonicalName: string): Boolean;
-begin
-  Result := False;
-  case NameLen of
-    4:
-      if ((Ord(S[StartIdx]) or $20) = Ord('h')) and
-         ((Ord(S[StartIdx + 1]) or $20) = Ord('o')) and
-         ((Ord(S[StartIdx + 2]) or $20) = Ord('s')) and
-         ((Ord(S[StartIdx + 3]) or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'host';
-        Exit(True);
-      end;
-    6:
-      if ((Ord(S[StartIdx]) or $20) = Ord('a')) and
-         ((Ord(S[StartIdx + 1]) or $20) = Ord('c')) and
-         ((Ord(S[StartIdx + 2]) or $20) = Ord('c')) and
-         ((Ord(S[StartIdx + 3]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 4]) or $20) = Ord('p')) and
-         ((Ord(S[StartIdx + 5]) or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'accept';
-        Exit(True);
-      end;
-    10:
-      if ((Ord(S[StartIdx]) or $20) = Ord('u')) and
-         (S[StartIdx + 4] = '-') and
-         ((Ord(S[StartIdx + 1]) or $20) = Ord('s')) and
-         ((Ord(S[StartIdx + 2]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 3]) or $20) = Ord('r')) and
-         ((Ord(S[StartIdx + 5]) or $20) = Ord('a')) and
-         ((Ord(S[StartIdx + 6]) or $20) = Ord('g')) and
-         ((Ord(S[StartIdx + 7]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 8]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 9]) or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'user-agent';
-        Exit(True);
-      end
-      else if ((Ord(S[StartIdx]) or $20) = Ord('c')) and
-              ((Ord(S[StartIdx + 1]) or $20) = Ord('o')) and
-              ((Ord(S[StartIdx + 2]) or $20) = Ord('n')) and
-              ((Ord(S[StartIdx + 3]) or $20) = Ord('n')) and
-              ((Ord(S[StartIdx + 4]) or $20) = Ord('e')) and
-              ((Ord(S[StartIdx + 5]) or $20) = Ord('c')) and
-              ((Ord(S[StartIdx + 6]) or $20) = Ord('t')) and
-              ((Ord(S[StartIdx + 7]) or $20) = Ord('i')) and
-              ((Ord(S[StartIdx + 8]) or $20) = Ord('o')) and
-              ((Ord(S[StartIdx + 9]) or $20) = Ord('n')) then
-      begin
-        CanonicalName := 'connection';
-        Exit(True);
-      end;
-    12:
-      if ((Ord(S[StartIdx]) or $20) = Ord('c')) and
-         (S[StartIdx + 7] = '-') and
-         ((Ord(S[StartIdx + 8]) or $20) = Ord('t')) and
-         ((Ord(S[StartIdx + 9]) or $20) = Ord('y')) and
-         ((Ord(S[StartIdx + 10]) or $20) = Ord('p')) and
-         ((Ord(S[StartIdx + 11]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 1]) or $20) = Ord('o')) and
-         ((Ord(S[StartIdx + 2]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 3]) or $20) = Ord('t')) and
-         ((Ord(S[StartIdx + 4]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 5]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 6]) or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'content-type';
-        Exit(True);
-      end;
-    14:
-      if ((Ord(S[StartIdx]) or $20) = Ord('c')) and
-         (S[StartIdx + 7] = '-') and
-         ((Ord(S[StartIdx + 8]) or $20) = Ord('l')) and
-         ((Ord(S[StartIdx + 9]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 10]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 11]) or $20) = Ord('g')) and
-         ((Ord(S[StartIdx + 12]) or $20) = Ord('t')) and
-         ((Ord(S[StartIdx + 13]) or $20) = Ord('h')) and
-         ((Ord(S[StartIdx + 1]) or $20) = Ord('o')) and
-         ((Ord(S[StartIdx + 2]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 3]) or $20) = Ord('t')) and
-         ((Ord(S[StartIdx + 4]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 5]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 6]) or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'content-length';
-        Exit(True);
-      end;
-    15:
-      if ((Ord(S[StartIdx]) or $20) = Ord('a')) and
-         (S[StartIdx + 6] = '-') and
-         ((Ord(S[StartIdx + 7]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 8]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 9]) or $20) = Ord('c')) and
-         ((Ord(S[StartIdx + 10]) or $20) = Ord('o')) and
-         ((Ord(S[StartIdx + 11]) or $20) = Ord('d')) and
-         ((Ord(S[StartIdx + 12]) or $20) = Ord('i')) and
-         ((Ord(S[StartIdx + 13]) or $20) = Ord('n')) and
-         ((Ord(S[StartIdx + 14]) or $20) = Ord('g')) and
-         ((Ord(S[StartIdx + 1]) or $20) = Ord('c')) and
-         ((Ord(S[StartIdx + 2]) or $20) = Ord('c')) and
-         ((Ord(S[StartIdx + 3]) or $20) = Ord('e')) and
-         ((Ord(S[StartIdx + 4]) or $20) = Ord('p')) and
-         ((Ord(S[StartIdx + 5]) or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'accept-encoding';
-        Exit(True);
-      end;
-  end;
-end;
-
-procedure AsciiBytesToStr(P: PByte; Len: Integer; out S: string);
-var
-  I: Integer;
-  PDst: PWideChar;
-begin
-  if Len <= 0 then
-  begin
-    S := '';
-    Exit;
-  end;
-  SetLength(S, Len);
-  PDst := PWideChar(Pointer(S));
-  for I := 0 to Len - 1 do
-    PDst[I] := WideChar(P[I]);
-end;
-
-function MatchKnownHeaderPtr(P: PByte; NameLen: Integer; out CanonicalName: string): Boolean;
-begin
-  Result := False;
-  case NameLen of
-    4:
-      if ((P[0] or $20) = Ord('h')) and
-         ((P[1] or $20) = Ord('o')) and
-         ((P[2] or $20) = Ord('s')) and
-         ((P[3] or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'host';
-        Exit(True);
-      end;
-    6:
-      if ((P[0] or $20) = Ord('a')) and
-         ((P[1] or $20) = Ord('c')) and
-         ((P[2] or $20) = Ord('c')) and
-         ((P[3] or $20) = Ord('e')) and
-         ((P[4] or $20) = Ord('p')) and
-         ((P[5] or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'accept';
-        Exit(True);
-      end
-      else if ((P[0] or $20) = Ord('o')) and
-              ((P[1] or $20) = Ord('r')) and
-              ((P[2] or $20) = Ord('i')) and
-              ((P[3] or $20) = Ord('g')) and
-              ((P[4] or $20) = Ord('i')) and
-              ((P[5] or $20) = Ord('n')) then
-      begin
-        CanonicalName := 'origin';
-        Exit(True);
-      end;
-    7:
-      if ((P[0] or $20) = Ord('u')) and
-         ((P[1] or $20) = Ord('p')) and
-         ((P[2] or $20) = Ord('g')) and
-         ((P[3] or $20) = Ord('r')) and
-         ((P[4] or $20) = Ord('a')) and
-         ((P[5] or $20) = Ord('d')) and
-         ((P[6] or $20) = Ord('e')) then
-      begin
-        CanonicalName := 'upgrade';
-        Exit(True);
-      end;
-    10:
-      if ((P[0] or $20) = Ord('u')) and
-         (P[4] = Ord('-')) and
-         ((P[1] or $20) = Ord('s')) and
-         ((P[2] or $20) = Ord('e')) and
-         ((P[3] or $20) = Ord('r')) and
-         ((P[5] or $20) = Ord('a')) and
-         ((P[6] or $20) = Ord('g')) and
-         ((P[7] or $20) = Ord('e')) and
-         ((P[8] or $20) = Ord('n')) and
-         ((P[9] or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'user-agent';
-        Exit(True);
-      end
-      else if ((P[0] or $20) = Ord('c')) and
-              ((P[1] or $20) = Ord('o')) and
-              ((P[2] or $20) = Ord('n')) and
-              ((P[3] or $20) = Ord('n')) and
-              ((P[4] or $20) = Ord('e')) and
-              ((P[5] or $20) = Ord('c')) and
-              ((P[6] or $20) = Ord('t')) and
-              ((P[7] or $20) = Ord('i')) and
-              ((P[8] or $20) = Ord('o')) and
-              ((P[9] or $20) = Ord('n')) then
-      begin
-        CanonicalName := 'connection';
-        Exit(True);
-      end;
-    12:
-      if ((P[0] or $20) = Ord('c')) and
-         (P[7] = Ord('-')) and
-         ((P[8] or $20) = Ord('t')) and
-         ((P[9] or $20) = Ord('y')) and
-         ((P[10] or $20) = Ord('p')) and
-         ((P[11] or $20) = Ord('e')) and
-         ((P[1] or $20) = Ord('o')) and
-         ((P[2] or $20) = Ord('n')) and
-         ((P[3] or $20) = Ord('t')) and
-         ((P[4] or $20) = Ord('e')) and
-         ((P[5] or $20) = Ord('n')) and
-         ((P[6] or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'content-type';
-        Exit(True);
-      end;
-    14:
-      if ((P[0] or $20) = Ord('c')) and
-         (P[7] = Ord('-')) and
-         ((P[8] or $20) = Ord('l')) and
-         ((P[9] or $20) = Ord('e')) and
-         ((P[10] or $20) = Ord('n')) and
-         ((P[11] or $20) = Ord('g')) and
-         ((P[12] or $20) = Ord('t')) and
-         ((P[13] or $20) = Ord('h')) and
-         ((P[1] or $20) = Ord('o')) and
-         ((P[2] or $20) = Ord('n')) and
-         ((P[3] or $20) = Ord('t')) and
-         ((P[4] or $20) = Ord('e')) and
-         ((P[5] or $20) = Ord('n')) and
-         ((P[6] or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'content-length';
-        Exit(True);
-      end;
-    15:
-      if ((P[0] or $20) = Ord('a')) and
-         (P[6] = Ord('-')) and
-         ((P[7] or $20) = Ord('e')) and
-         ((P[8] or $20) = Ord('n')) and
-         ((P[9] or $20) = Ord('c')) and
-         ((P[10] or $20) = Ord('o')) and
-         ((P[11] or $20) = Ord('d')) and
-         ((P[12] or $20) = Ord('i')) and
-         ((P[13] or $20) = Ord('n')) and
-         ((P[14] or $20) = Ord('g')) and
-         ((P[1] or $20) = Ord('c')) and
-         ((P[2] or $20) = Ord('c')) and
-         ((P[3] or $20) = Ord('e')) and
-         ((P[4] or $20) = Ord('p')) and
-         ((P[5] or $20) = Ord('t')) then
-      begin
-        CanonicalName := 'accept-encoding';
-        Exit(True);
-      end;
-  end;
-end;
-
 function TRequest.FindHeadersEndPtr(DataPtr: PByte; Size: Integer): Integer;
 var
   I: Integer;
@@ -4728,7 +1303,8 @@ var
   IsFirstLine, HasNonSpace, IsKnownHeader, NeedFullSecurityAnalyze, HasContentEncoding: Boolean;
   HeaderCount, HostCount, ContentLengthCount, TransferEncodingCount: Integer;
   ContentLengthVal, ParsedCL: Int64;
-  ConnType: TConnectionType;
+  ConnType, FastConnType: TConnectionType;
+  FastEncodings: TArray<TContentEncoding>;
   B: Byte;
   Line, CurrentHeaderName, CurrentHeaderValue, ErrorMsg: string;
 begin
@@ -4960,17 +1536,15 @@ begin
   begin
     if Length(FSecurityThreats) > 0 then
       SetLength(FSecurityThreats, 0);
-    FRequestInfo.FTransferEncoding := teNone;
-    if FRequestInfo.FVersion = hvHTTP10 then
-      FRequestInfo.FConnectionType := ctClose
+    if FRequestInfo.Version = hvHTTP10 then
+      FastConnType := ctClose
     else
-      FRequestInfo.FConnectionType := ConnType;
-    FRequestInfo.FContentLength := ContentLengthVal;
+      FastConnType := ConnType;
     if HasContentEncoding then
-      FRequestInfo.FContentEncodings := FHeaders.GetContentEncodings
-    else if Length(FRequestInfo.FContentEncodings) > 0 then
-      SetLength(FRequestInfo.FContentEncodings, 0);
-    FRequestInfo.FIsSecure := False;
+      FastEncodings := FHeaders.GetContentEncodings
+    else
+      SetLength(FastEncodings, 0);
+    FRequestInfo.ApplyFastHeaderInfo(teNone, FastConnType, ContentLengthVal, FastEncodings, False);
     if ContentLengthVal <= 0 then
     begin
       FIsChunkedTransfer := False;
@@ -5011,218 +1585,189 @@ begin
   FState := rsParsingHeaders;
   if FHeadersEndPos <= 0 then
     FHeadersEndPos := FindHeadersEnd(FRawBuffer, FRawBufferSize);
-    if FHeadersEndPos = -1 then
+  if FHeadersEndPos = -1 then
+  begin
+    if FRawBufferSize >= FMaxHeaderSize then
+      SetError('Headers block size limit exceeded.', stOversizeAttack)
+    else
+      FState := rsWaitingHeaders;
+    Exit;
+  end;
+  HeadersBlockSize := FHeadersEndPos - 4;
+  if HeadersBlockSize <= 0 then
+  begin
+    SetError('Empty request detected', stMalformedURI);
+    Exit;
+  end;
+  SetLength(HeadersStr, HeadersBlockSize);
+  PSrc := @FRawBuffer[0];
+  PDst := PWideChar(Pointer(HeadersStr));
+  IsPureAscii := True;
+  for I := 0 to HeadersBlockSize - 1 do
+  begin
+    B := PSrc[I];
+    if B = 0 then
     begin
-      if FRawBufferSize >= FMaxHeaderSize then
-        SetError('Headers block size limit exceeded.', stOversizeAttack)
-      else
-        FState := rsWaitingHeaders;
+      SetError('Null byte detected in header block.', stHeaderInjection);
       Exit;
     end;
-    HeadersBlockSize := FHeadersEndPos - 4;
-    if HeadersBlockSize <= 0 then
+    if B >= $80 then
     begin
-      SetError('Empty request detected', stMalformedURI);
+      IsPureAscii := False;
+      Break;
+    end;
+    PDst[I] := WideChar(B);
+  end;
+  if not IsPureAscii then
+  begin
+    HeadersStr := TEncoding.UTF8.GetString(FRawBuffer, 0, HeadersBlockSize);
+    if Pos(#0, HeadersStr) > 0 then
+    begin
+      SetError('Null byte detected in header block.', stHeaderInjection);
       Exit;
     end;
-    SetLength(HeadersStr, HeadersBlockSize);
-    PSrc := @FRawBuffer[0];
-    PDst := PWideChar(Pointer(HeadersStr));
-    IsPureAscii := True;
-    for I := 0 to HeadersBlockSize - 1 do
+  end;
+  StrLen := Length(HeadersStr);
+  if StrLen = 0 then
+  begin
+    SetError('Empty request detected', stMalformedURI);
+    Exit;
+  end;
+  PosIdx := 1;
+  IsFirstLine := True;
+  while PosIdx <= StrLen do
+  begin
+    LineStart := PosIdx;
+    LineEnd := PosIdx;
+    while (LineEnd <= StrLen) and (HeadersStr[LineEnd] <> #10) and (HeadersStr[LineEnd] <> #13) do
+      Inc(LineEnd);
+    NextPos := LineEnd;
+    if (NextPos <= StrLen) and (HeadersStr[NextPos] = #13) then
+      Inc(NextPos);
+    if (NextPos <= StrLen) and (HeadersStr[NextPos] = #10) then
+      Inc(NextPos);
+    PosIdx := NextPos;
+    LineLen := LineEnd - LineStart;
+    if IsFirstLine then
     begin
-      B := PSrc[I];
-      if B = 0 then
+      IsFirstLine := False;
+      if LineLen > MAX_REQUEST_LINE_LENGTH then
       begin
-        SetError('Null byte detected in header block.', stHeaderInjection);
+        SetError(Format('Request line exceeds maximum length (%d bytes)', [MAX_REQUEST_LINE_LENGTH]), stOversizeAttack);
         Exit;
       end;
-      if B >= $80 then
+      Line := Copy(HeadersStr, LineStart, LineLen);
+      if ((LineLen >= 4) and (Line[1] = 'g') and (Line[2] = 'e') and (Line[3] = 't') and (Line[4] = ' ')) or
+         ((LineLen >= 5) and (Line[1] = 'p') and (Line[2] = 'o') and (Line[3] = 's') and (Line[4] = 't') and (Line[5] = ' ')) then
       begin
-        IsPureAscii := False;
-        Break;
-      end;
-      PDst[I] := WideChar(B);
-    end;
-    if not IsPureAscii then
-    begin
-      HeadersStr := TEncoding.UTF8.GetString(FRawBuffer, 0, HeadersBlockSize);
-      if Pos(#0, HeadersStr) > 0 then
-      begin
-        SetError('Null byte detected in header block.', stHeaderInjection);
+        SetError('RFC 9112 Violation in Request Line: ' + Line, stSuspiciousHeaders);
         Exit;
       end;
+      ParseRequestLine(Line);
+      if FErrorParsing then
+        Exit;
+      if FRequestInfo.Version = hvHTTP20 then
+      begin
+        SetError('RFC 9112 Violation in Request Line: ' + Line, stSuspiciousHeaders);
+        Exit;
+      end;
+      Continue;
     end;
-    StrLen := Length(HeadersStr);
-    if StrLen = 0 then
+    if LineLen > FMaxHeaderLineLength then
     begin
-      SetError('Empty request detected', stMalformedURI);
+      SetError(Format('Header line exceeds maximum length (%d bytes)', [FMaxHeaderLineLength]), stOversizeAttack);
       Exit;
     end;
-    PosIdx := 1;
-    IsFirstLine := True;
-    while PosIdx <= StrLen do
+    if LineLen = 0 then
+      Continue;
+    if (HeadersStr[LineStart] = ' ') or (HeadersStr[LineStart] = #9) then
     begin
-      LineStart := PosIdx;
-      LineEnd := PosIdx;
-      while (LineEnd <= StrLen) and (HeadersStr[LineEnd] <> #10) and (HeadersStr[LineEnd] <> #13) do
-        Inc(LineEnd);
-      NextPos := LineEnd;
-      if (NextPos <= StrLen) and (HeadersStr[NextPos] = #13) then
-        Inc(NextPos);
-      if (NextPos <= StrLen) and (HeadersStr[NextPos] = #10) then
-        Inc(NextPos);
-      PosIdx := NextPos;
-      LineLen := LineEnd - LineStart;
-      if IsFirstLine then
-      begin
-        IsFirstLine := False;
-        if LineLen > MAX_REQUEST_LINE_LENGTH then
-        begin
-          SetError(Format('Request line exceeds maximum length (%d bytes)', [MAX_REQUEST_LINE_LENGTH]), stOversizeAttack);
-          Exit;
-        end;
-        Line := Copy(HeadersStr, LineStart, LineLen);
-        if ((LineLen >= 4) and (Line[1] = 'g') and (Line[2] = 'e') and (Line[3] = 't') and (Line[4] = ' ')) or
-           ((LineLen >= 5) and (Line[1] = 'p') and (Line[2] = 'o') and (Line[3] = 's') and (Line[4] = 't') and (Line[5] = ' ')) then
-        begin
-          SetError('RFC 9112 Violation in Request Line: ' + Line, stSuspiciousHeaders);
-          Exit;
-        end;
-        ParseRequestLine(Line);
-        if FErrorParsing then
-          Exit;
-        if FRequestInfo.Version = hvHTTP20 then
-        begin
-          SetError('RFC 9112 Violation in Request Line: ' + Line, stSuspiciousHeaders);
-          Exit;
-        end;
-        Continue;
-      end;
-      if LineLen > FMaxHeaderLineLength then
-      begin
-        SetError(Format('Header line exceeds maximum length (%d bytes)', [FMaxHeaderLineLength]), stOversizeAttack);
-        Exit;
-      end;
-      if LineLen = 0 then
-        Continue;
-      if (HeadersStr[LineStart] = ' ') or (HeadersStr[LineStart] = #9) then
-      begin
-        HasNonSpace := False;
-        for I := LineStart to LineEnd - 1 do
-        begin
-          if HeadersStr[I] > ' ' then
-          begin
-            HasNonSpace := True;
-            Break;
-          end;
-        end;
-        if not HasNonSpace then
-          Continue;
-        SetError('Obsolete line folding (obs-fold) is not permitted: ' + Copy(HeadersStr, LineStart, LineLen), stRequestSmuggling);
-        Exit;
-      end;
-      ColonPos := 0;
+      HasNonSpace := False;
       for I := LineStart to LineEnd - 1 do
       begin
-        if HeadersStr[I] = ':' then
+        if HeadersStr[I] > ' ' then
         begin
-          ColonPos := I;
+          HasNonSpace := True;
           Break;
         end;
       end;
-      if ColonPos > 0 then
+      if not HasNonSpace then
+        Continue;
+      SetError('Obsolete line folding (obs-fold) is not permitted: ' + Copy(HeadersStr, LineStart, LineLen), stRequestSmuggling);
+      Exit;
+    end;
+    ColonPos := 0;
+    for I := LineStart to LineEnd - 1 do
+    begin
+      if HeadersStr[I] = ':' then
       begin
-        if (ColonPos > LineStart) and ((HeadersStr[ColonPos - 1] = ' ') or (HeadersStr[ColonPos - 1] = #9)) then
-        begin
-          SetError('Whitespace before colon in header name (RFC 9112): ' + Copy(HeadersStr, LineStart, LineLen), stRequestSmuggling);
-          Exit;
-        end;
-        NameStart := LineStart;
-        NameEnd := ColonPos - 1;
-        while (NameStart <= NameEnd) and (HeadersStr[NameStart] <= ' ') do
-          Inc(NameStart);
-        while (NameEnd >= NameStart) and (HeadersStr[NameEnd] <= ' ') do
-          Dec(NameEnd);
-        ValStart := ColonPos + 1;
-        ValEnd := LineEnd - 1;
-        while (ValStart <= ValEnd) and (HeadersStr[ValStart] <= ' ') do
-          Inc(ValStart);
-        while (ValEnd >= ValStart) and (HeadersStr[ValEnd] <= ' ') do
-          Dec(ValEnd);
-        IsKnownHeader := (NameEnd >= NameStart) and MatchKnownHeaderSlice(HeadersStr, NameStart, NameEnd - NameStart + 1, CurrentHeaderName);
-        if not IsKnownHeader then
-        begin
-          if NameEnd >= NameStart then
-            CurrentHeaderName := Copy(HeadersStr, NameStart, NameEnd - NameStart + 1)
-          else
-            CurrentHeaderName := '';
-          if not THeaderValidator.ValidateHeaderName(CurrentHeaderName, ErrorMsg) then
-          begin
-            SetError('Header name validation failed: ' + ErrorMsg, stHeaderInjection);
-            Exit;
-          end;
-        end;
-        if ValEnd >= ValStart then
-          CurrentHeaderValue := Copy(HeadersStr, ValStart, ValEnd - ValStart + 1)
-        else
-          CurrentHeaderValue := '';
-        if IsKnownHeader then
-          FHeaders.AddNormalizedHeader(CurrentHeaderName, CurrentHeaderValue)
-        else
-          FHeaders.AddHeader(CurrentHeaderName, CurrentHeaderValue);
-      end
-      else
-      begin
-        SetError('Malformed header line (CRLF Injection): ' + Copy(HeadersStr, LineStart, LineLen), stHeaderInjection);
-        Exit;
+        ColonPos := I;
+        Break;
       end;
     end;
-    if IsFirstLine then
+    if ColonPos > 0 then
     begin
-      SetError('Empty request detected', stMalformedURI);
+      if (ColonPos > LineStart) and ((HeadersStr[ColonPos - 1] = ' ') or (HeadersStr[ColonPos - 1] = #9)) then
+      begin
+        SetError('Whitespace before colon in header name (RFC 9112): ' + Copy(HeadersStr, LineStart, LineLen), stRequestSmuggling);
+        Exit;
+      end;
+      NameStart := LineStart;
+      NameEnd := ColonPos - 1;
+      while (NameStart <= NameEnd) and (HeadersStr[NameStart] <= ' ') do
+        Inc(NameStart);
+      while (NameEnd >= NameStart) and (HeadersStr[NameEnd] <= ' ') do
+        Dec(NameEnd);
+      ValStart := ColonPos + 1;
+      ValEnd := LineEnd - 1;
+      while (ValStart <= ValEnd) and (HeadersStr[ValStart] <= ' ') do
+        Inc(ValStart);
+      while (ValEnd >= ValStart) and (HeadersStr[ValEnd] <= ' ') do
+        Dec(ValEnd);
+      IsKnownHeader := (NameEnd >= NameStart) and MatchKnownHeaderSlice(HeadersStr, NameStart, NameEnd - NameStart + 1, CurrentHeaderName);
+      if not IsKnownHeader then
+      begin
+        if NameEnd >= NameStart then
+          CurrentHeaderName := Copy(HeadersStr, NameStart, NameEnd - NameStart + 1)
+        else
+          CurrentHeaderName := '';
+        if not THeaderValidator.ValidateHeaderName(CurrentHeaderName, ErrorMsg) then
+        begin
+          SetError('Header name validation failed: ' + ErrorMsg, stHeaderInjection);
+          Exit;
+        end;
+      end;
+      if ValEnd >= ValStart then
+        CurrentHeaderValue := Copy(HeadersStr, ValStart, ValEnd - ValStart + 1)
+      else
+        CurrentHeaderValue := '';
+      if IsKnownHeader then
+        FHeaders.AddNormalizedHeader(CurrentHeaderName, CurrentHeaderValue)
+      else
+        FHeaders.AddHeader(CurrentHeaderName, CurrentHeaderValue);
+    end
+    else
+    begin
+      SetError('Malformed header line (CRLF Injection): ' + Copy(HeadersStr, LineStart, LineLen), stHeaderInjection);
       Exit;
     end;
-    FRequestInfo.ParseFromHeaders(FHeaders);
-    if FErrorParsing then
-       Exit;
-    AnalyzeSecurity;
-    if HasSecurityThreats then
-    begin
-      FErrorParsing := True;
-      FState := rsError;
-      Exit;
-    end;
-    DetermineBodySize;
-end;
-
-class function THeaderValidator.ValidateHeaderValue(const AHeaderName, Value: string; out ErrorMsg: string): Boolean;
-var
-  I: Integer;
-  Ch: Char;
-begin
-  ErrorMsg := '';
-  for I := 1 to Length(Value) do
-  begin
-    Ch := Value[I];
-    if (Ch = #13) or (Ch = #10) then
-    begin
-      ErrorMsg := 'Invalid character (CR or LF) found inside header value. Possible CRLF Injection attack.';
-      Exit(False);
-    end;
-    if Ch = #0 then
-    begin
-      ErrorMsg := 'Invalid character (NULL) found in header value.';
-      Exit(False);
-    end;
   end;
-
-  if not ((Length(AHeaderName) = 13) and SameText(AHeaderName, 'Authorization')) and HasSuspiciousPatterns(Value) then
+  if IsFirstLine then
   begin
-    ErrorMsg := 'Suspicious patterns (potential XSS, SQLi) detected in header value.';
-    Exit(False);
+    SetError('Empty request detected', stMalformedURI);
+    Exit;
   end;
-  Result := True;
+  FRequestInfo.ParseFromHeaders(FHeaders);
+  if FErrorParsing then
+     Exit;
+  AnalyzeSecurity;
+  if HasSecurityThreats then
+  begin
+    FErrorParsing := True;
+    FState := rsError;
+    Exit;
+  end;
+  DetermineBodySize;
 end;
 
 procedure TRequest.ParseRequestLine(const FirstLine: string);
@@ -5314,9 +1859,7 @@ begin
     else
     begin
       if (FExpectedBodySize = 0) then
-      begin
         FState := rsComplete;
-      end;
     end;
   except
     on E: Exception do
@@ -5336,6 +1879,8 @@ begin
 end;
 
 procedure TRequest.DetermineBodySize;
+var
+  TempContentType: string;
 begin
   try
     FIsChunkedTransfer := (FRequestInfo.TransferEncoding = teChunked);
@@ -5372,7 +1917,7 @@ begin
       end;
       FState := rsWaitingBody;
       try
-        var TempContentType := FHeaders.ContentType;
+        TempContentType := FHeaders.ContentType;
         FBodyParser := THttpBodyParser.Create(
           TempContentType,
           FExpectedBodySize,
@@ -5417,7 +1962,6 @@ begin
       FExpectedBodySize := 0;
       FState := rsComplete;
     end;
-
   except
     on E: Exception do
       SetError(Format('Body size determination error: %s', [E.Message]));
@@ -5427,6 +1971,8 @@ end;
 procedure TRequest.ProcessBodyData(const Data: array of Byte; Size: Integer);
 var
   ActualDataToProcess: Integer;
+  RemainingSpace: Int64;
+  TempData: TBytes;
   ProcessedSuccessfully: Boolean;
   IsBodyComplete: Boolean;
   MainBytes: TBytes;
@@ -5440,7 +1986,7 @@ begin
     ActualDataToProcess := Size;
     if (FExpectedBodySize > 0) then
     begin
-      var RemainingSpace := FExpectedBodySize - FBodyBytesReceived;
+      RemainingSpace := FExpectedBodySize - FBodyBytesReceived;
       if RemainingSpace <= 0 then
       begin
         FState := rsComplete;
@@ -5469,7 +2015,6 @@ begin
     begin
       if ActualDataToProcess < Size then
       begin
-        var TempData: TBytes;
         SetLength(TempData, ActualDataToProcess);
         Move(Data[0], TempData[0], ActualDataToProcess);
         if FBodyParser.AppendData(TempData, ActualDataToProcess) then
@@ -5521,214 +2066,9 @@ begin
         FState := rsComplete;
       end;
     end;
-
   except
     on E: Exception do
       SetError(Format('Body data processing error: %s', [E.Message]));
-  end;
-end;
-
-function TRequest.GetBodyParser: THttpBodyParser;
-begin
-  Result := FBodyParser;
-end;
-
-function TRequest.GetBodyAsString: string;
-var
-  RawBytes: TBytes;
-  Enc: TContentEncoding;
-begin
-  try
-    if Assigned(FBodyParser) then
-      RawBytes := FBodyParser.GetMainPartAsBytes
-    else
-      RawBytes := GetBodyBytes;
-
-    if Length(RawBytes) > 0 then
-    begin
-      for Enc in FRequestInfo.ContentEncodings do
-      begin
-        if FContentEncodingHandler.IsCompressionSupported(Enc) then
-          RawBytes := FContentEncodingHandler.DecompressData(RawBytes, Enc);
-      end;
-      Result := TEncoding.UTF8.GetString(RawBytes);
-    end
-    else
-      Result := '';
-  except
-    on E: Exception do
-      Result := '';
-  end;
-end;
-
-function TRequest.GetBodyAsBytes: TBytes;
-var
-  Enc: TContentEncoding;
-begin
-  try
-    if Assigned(FBodyParser) then
-      Result := FBodyParser.GetMainPartAsBytes
-    else
-      Result := GetBodyBytes;
-
-    if Length(Result) > 0 then
-    begin
-      for Enc in FRequestInfo.ContentEncodings do
-      begin
-        if FContentEncodingHandler.IsCompressionSupported(Enc) then
-          Result := FContentEncodingHandler.DecompressData(Result, Enc);
-      end;
-    end;
-  except
-    on E: Exception do
-      SetLength(Result, 0);
-  end;
-end;
-
-function TRequest.GetBodyPart(Index: Integer): TBodyPart;
-begin
-  try
-    if Assigned(FBodyParser) then
-       Result := FBodyParser.GetPart(Index)
-    else
-      Result := nil;
-  except
-    on E: Exception do
-    begin
-      Result := nil;
-    end;
-  end;
-end;
-
-function TRequest.GetBodyPartByName(const Name: string): TBodyPart;
-begin
-  try
-    if Assigned(FBodyParser) then
-      Result := FBodyParser.GetPartByName(Name)
-    else
-      Result := nil;
-  except
-    on E: Exception do
-    begin
-      Result := nil;
-    end;
-  end;
-end;
-
-function TRequest.GetBodyPartCount: Integer;
-begin
-  try
-    if Assigned(FBodyParser) then
-      Result := FBodyParser.GetPartCount
-    else
-      Result := 0;
-  except
-    on E: Exception do
-    begin
-      Result := 0;
-    end;
-  end;
-end;
-
-function TRequest.GetHeadersSize: Integer;
-begin
-  try
-    if FHeadersEndPos >= 4 then
-      Result := FHeadersEndPos - 4
-    else
-      Result := 0;
-  except
-    on E: Exception do
-    begin
-      Result := 0;
-    end;
-  end;
-end;
-
-function TRequest.GetRequestSize: Int64;
-begin
-  try
-    Result := GetHeadersSize + FBodyBytesReceived;
-  except
-    Result := 0;
-  end;
-end;
-
-function TRequest.GetContentLength: Int64;
-var
-  ContentLengthStr: string;
-begin
-  try
-    if Assigned(FHeaders) then
-    begin
-      ContentLengthStr := FHeaders.ContentLength;
-      if ContentLengthStr <> '' then
-        Result := StrToInt64Def(ContentLengthStr, -1)
-      else
-        Result := -1;
-    end
-    else
-      Result := -1;
-  except
-    Result := -1;
-  end;
-end;
-
-function TRequest.GetBodyContentType: TBodyContentType;
-begin
-  try
-    if Assigned(FBodyParser) then
-      Result := FBodyParser.BodyType
-    else
-      Result := bctUnknown;
-  except
-    on E: Exception do
-    begin
-      Result := bctUnknown;
-    end;
-  end;
-end;
-
-procedure TRequest.ProcessRegularBody(const Data: array of Byte; Size: Integer);
-var
-  BytesToWrite: Integer;
-  DataBytes: TBytes;
-  DataString: string;
-begin
-  try
-    if Size > 0 then
-    begin
-      SetLength(DataBytes, Min(Size, 50));
-      Move(Data[0], DataBytes[0], Min(Size, 50));
-      DataString := TEncoding.UTF8.GetString(DataBytes);
-    end;
-    if FExpectedBodySize > 0 then
-    begin
-      BytesToWrite := Min(Size, FExpectedBodySize - FBodyBytesReceived);
-      if BytesToWrite > 0 then
-      begin
-        FBodyStream.WriteBuffer(Data[0], BytesToWrite);
-        FBodyBytesReceived := FBodyBytesReceived + BytesToWrite;
-      end;
-      if FBodyBytesReceived >= FExpectedBodySize then
-      begin
-        FState := rsComplete;
-      end;
-    end
-    else
-    begin
-      FBodyStream.WriteBuffer(Data[0], Size);
-      FBodyBytesReceived := FBodyBytesReceived + Size;
-      if FBodyBytesReceived > FMaxBodySize then
-      begin
-        SetError('Maximum body size exceeded');
-        Exit;
-      end;
-    end;
-
-  except
-    on E: Exception do
-      SetError(Format('Error processing regular body: %s', [E.Message]));
   end;
 end;
 
@@ -5824,6 +2164,197 @@ begin
   end;
 end;
 
+procedure TRequest.ProcessRegularBody(const Data: array of Byte; Size: Integer);
+var
+  BytesToWrite: Integer;
+  DataBytes: TBytes;
+  DataString: string;
+begin
+  try
+    if Size > 0 then
+    begin
+      SetLength(DataBytes, Min(Size, 50));
+      Move(Data[0], DataBytes[0], Min(Size, 50));
+      DataString := TEncoding.UTF8.GetString(DataBytes);
+    end;
+    if FExpectedBodySize > 0 then
+    begin
+      BytesToWrite := Min(Size, FExpectedBodySize - FBodyBytesReceived);
+      if BytesToWrite > 0 then
+      begin
+        FBodyStream.WriteBuffer(Data[0], BytesToWrite);
+        FBodyBytesReceived := FBodyBytesReceived + BytesToWrite;
+      end;
+      if FBodyBytesReceived >= FExpectedBodySize then
+        FState := rsComplete;
+    end
+    else
+    begin
+      FBodyStream.WriteBuffer(Data[0], Size);
+      FBodyBytesReceived := FBodyBytesReceived + Size;
+      if FBodyBytesReceived > FMaxBodySize then
+      begin
+        SetError('Maximum body size exceeded');
+        Exit;
+      end;
+    end;
+  except
+    on E: Exception do
+      SetError(Format('Error processing regular body: %s', [E.Message]));
+  end;
+end;
+
+function TRequest.GetBodyParser: THttpBodyParser;
+begin
+  Result := FBodyParser;
+end;
+
+function TRequest.GetBodyAsString: string;
+var
+  RawBytes: TBytes;
+  Enc: TContentEncoding;
+begin
+  try
+    if Assigned(FBodyParser) then
+      RawBytes := FBodyParser.GetMainPartAsBytes
+    else
+      RawBytes := GetBodyBytes;
+
+    if Length(RawBytes) > 0 then
+    begin
+      for Enc in FRequestInfo.ContentEncodings do
+      begin
+        if FContentEncodingHandler.IsCompressionSupported(Enc) then
+          RawBytes := FContentEncodingHandler.DecompressData(RawBytes, Enc);
+      end;
+      Result := TEncoding.UTF8.GetString(RawBytes);
+    end
+    else
+      Result := '';
+  except
+    on E: Exception do
+      Result := '';
+  end;
+end;
+
+function TRequest.GetBodyAsBytes: TBytes;
+var
+  Enc: TContentEncoding;
+begin
+  try
+    if Assigned(FBodyParser) then
+      Result := FBodyParser.GetMainPartAsBytes
+    else
+      Result := GetBodyBytes;
+
+    if Length(Result) > 0 then
+    begin
+      for Enc in FRequestInfo.ContentEncodings do
+      begin
+        if FContentEncodingHandler.IsCompressionSupported(Enc) then
+          Result := FContentEncodingHandler.DecompressData(Result, Enc);
+      end;
+    end;
+  except
+    on E: Exception do
+      SetLength(Result, 0);
+  end;
+end;
+
+function TRequest.GetBodyPart(Index: Integer): TBodyPart;
+begin
+  try
+    if Assigned(FBodyParser) then
+       Result := FBodyParser.GetPart(Index)
+    else
+      Result := nil;
+  except
+    on E: Exception do
+      Result := nil;
+  end;
+end;
+
+function TRequest.GetBodyPartByName(const Name: string): TBodyPart;
+begin
+  try
+    if Assigned(FBodyParser) then
+      Result := FBodyParser.GetPartByName(Name)
+    else
+      Result := nil;
+  except
+    on E: Exception do
+      Result := nil;
+  end;
+end;
+
+function TRequest.GetBodyPartCount: Integer;
+begin
+  try
+    if Assigned(FBodyParser) then
+      Result := FBodyParser.GetPartCount
+    else
+      Result := 0;
+  except
+    on E: Exception do
+      Result := 0;
+  end;
+end;
+
+function TRequest.GetHeadersSize: Integer;
+begin
+  try
+    if FHeadersEndPos >= 4 then
+      Result := FHeadersEndPos - 4
+    else
+      Result := 0;
+  except
+    on E: Exception do
+      Result := 0;
+  end;
+end;
+
+function TRequest.GetRequestSize: Int64;
+begin
+  try
+    Result := GetHeadersSize + FBodyBytesReceived;
+  except
+    Result := 0;
+  end;
+end;
+
+function TRequest.GetContentLength: Int64;
+var
+  ContentLengthStr: string;
+begin
+  try
+    if Assigned(FHeaders) then
+    begin
+      ContentLengthStr := FHeaders.ContentLength;
+      if ContentLengthStr <> '' then
+        Result := StrToInt64Def(ContentLengthStr, -1)
+      else
+        Result := -1;
+    end
+    else
+      Result := -1;
+  except
+    Result := -1;
+  end;
+end;
+
+function TRequest.GetBodyContentType: TBodyContentType;
+begin
+  try
+    if Assigned(FBodyParser) then
+      Result := FBodyParser.BodyType
+    else
+      Result := bctUnknown;
+  except
+    on E: Exception do
+      Result := bctUnknown;
+  end;
+end;
+
 procedure TRequest.SetLemBuf(Alen: Integer);
 begin
   SetLength(FRawBuffer, Alen);
@@ -5903,36 +2434,16 @@ begin
   end;
 end;
 
-function TCaseInsensitiveStringComparer.Equals(const Left, Right: string): Boolean;
-begin
-  Result := CompareText(Left, Right) = 0;
-end;
-
-function TCaseInsensitiveStringComparer.GetHashCode(const Value: string): Integer;
-var
-  UpperValue: string;
-begin
-  UpperValue := UpperCase(Value);
-  Result := TEqualityComparer<string>.Default.GetHashCode(UpperValue);
-end;
-
 function TRequest.IsKeepAlive: Boolean;
-var
-  Conn: string;
 begin
-  Result := True;
-  if Assigned(FHeaders) then
+  Result := False;
+  if Assigned(FRequestInfo) then
   begin
-    Conn := LowerCase(Trim(FHeaders.Connection));
-    if Conn = 'close' then
-      Result := False
-    else if Conn = 'keep-alive' then
-      Result := True
-    else if Assigned(FRequestInfo) and (FRequestInfo.Version = hvHTTP10) then
-      Result := False;
+    if FRequestInfo.Version = hvHTTP11 then
+      Result := FRequestInfo.ConnectionType <> ctClose
+    else if FRequestInfo.Version = hvHTTP10 then
+      Result := FRequestInfo.ConnectionType = ctKeepAlive;
   end;
 end;
 
 end.
-
-
