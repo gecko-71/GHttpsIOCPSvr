@@ -1019,19 +1019,58 @@ begin
 end;
 
 procedure THttp3Server.SendResponse(H3State: THttp3ConnectionState; StreamState: THttp3StreamState; ConnCtx: PConnectionContext; StatusCode: Integer; const ContentType: string; const BodyData: TBytes; const ExtraHeaders: TArray<TPair<string, string>> = nil);
+const
+  PREFIX_RESERVE = 16;
 var
   EncInst, HdrBytes: TBytes;
   Block, Prefix: TBytes;
-  FrameType, FrameLen: TBytes;
-  DataType, DataLen: TBytes;
+  StackHdr: array[0..1023] of Byte;
+  UseStack: Boolean;
+  HdrLen: Integer;
+  BlockStart: Integer;
+  BlockLen: Integer;
+  BlockPtr: PByte;
   Status: QUIC_STATUS;
   SendCtx: PQuicSendContext;
   StreamId: UInt64;
   StreamIdSize: UInt32;
+  BodyLen: Integer;
   FullLen: Integer;
   CurPtr: PByte;
   HdrPair: TPair<string, string>;
   StreamHandle: HQUIC;
+  StatusStr: UTF8String;
+
+  procedure AppendHdr(const Data: TBytes);
+  var
+    AddLen: Integer;
+    OldLen: Integer;
+  begin
+    AddLen := Length(Data);
+    if AddLen = 0 then
+      Exit;
+    if UseStack then
+    begin
+      if PREFIX_RESERVE + HdrLen + AddLen <= SizeOf(StackHdr) then
+      begin
+        Move(Data[0], StackHdr[PREFIX_RESERVE + HdrLen], AddLen);
+        Inc(HdrLen, AddLen);
+        Exit;
+      end;
+      UseStack := False;
+      SetLength(Block, HdrLen + AddLen);
+      if HdrLen > 0 then
+        Move(StackHdr[PREFIX_RESERVE], Block[0], HdrLen);
+      Move(Data[0], Block[HdrLen], AddLen);
+      Inc(HdrLen, AddLen);
+      Exit;
+    end;
+    OldLen := Length(Block);
+    SetLength(Block, OldLen + AddLen);
+    Move(Data[0], Block[OldLen], AddLen);
+    Inc(HdrLen, AddLen);
+  end;
+
 begin
   SendCtx := nil;
   StreamHandle := nil;
@@ -1048,49 +1087,77 @@ begin
     if QuicFailed(FQuicServer.MsQuic.Api.GetParam(StreamHandle, $08000000, StreamIdSize, @StreamId)) then
       StreamId := UInt64(StreamHandle);
 
+    UseStack := True;
+    HdrLen := 0;
+    if StatusCode = 200 then
+      StatusStr := '200'
+    else
+      StatusStr := UTF8Encode(IntToStr(StatusCode));
+
     H3State.Lock.Enter;
     try
       H3State.QpackEncoder.StartHeader(StreamId, 0);
 
-      H3State.QpackEncoder.EncodeHeader(':status', UTF8Encode(IntToStr(StatusCode)), EncInst, HdrBytes);
-      Block := HdrBytes;
+      H3State.QpackEncoder.EncodeHeader(':status', StatusStr, EncInst, HdrBytes);
+      AppendHdr(HdrBytes);
 
       if ContentType <> '' then
       begin
         H3State.QpackEncoder.EncodeHeader('content-type', UTF8Encode(ContentType), EncInst, HdrBytes);
-        Block := Block + HdrBytes;
+        AppendHdr(HdrBytes);
       end;
 
       H3State.QpackEncoder.EncodeHeader('alt-svc', 'h3=":8443"; ma=86400', EncInst, HdrBytes);
-      Block := Block + HdrBytes;
+      AppendHdr(HdrBytes);
 
       for HdrPair in ExtraHeaders do
       begin
         H3State.QpackEncoder.EncodeHeader(UTF8Encode(LowerCase(HdrPair.Key)), UTF8Encode(HdrPair.Value), EncInst, HdrBytes);
-        Block := Block + HdrBytes;
+        AppendHdr(HdrBytes);
       end;
 
       Prefix := H3State.QpackEncoder.EndHeader();
-      Block := Prefix + Block;
     finally
       H3State.Lock.Leave;
     end;
 
-    FrameType := TQuicVarInt.Encode(HTTP3_FRAME_HEADERS);
-    FrameLen := TQuicVarInt.Encode(Length(Block));
-    if Length(BodyData) > 0 then
+    if UseStack and (Length(Prefix) <= PREFIX_RESERVE) then
     begin
-      DataType := TQuicVarInt.Encode(HTTP3_FRAME_DATA);
-      DataLen := TQuicVarInt.Encode(Length(BodyData));
-      FullLen := Length(FrameType) + Length(FrameLen) + Length(Block) +
-                 Length(DataType) + Length(DataLen) + Length(BodyData);
+      BlockStart := PREFIX_RESERVE - Length(Prefix);
+      if Length(Prefix) > 0 then
+        Move(Prefix[0], StackHdr[BlockStart], Length(Prefix));
+      BlockPtr := @StackHdr[BlockStart];
+      BlockLen := Length(Prefix) + HdrLen;
     end
     else
     begin
-      DataType := nil;
-      DataLen := nil;
-      FullLen := Length(FrameType) + Length(FrameLen) + Length(Block);
+      if UseStack then
+      begin
+        SetLength(Block, Length(Prefix) + HdrLen);
+        if Length(Prefix) > 0 then
+          Move(Prefix[0], Block[0], Length(Prefix));
+        if HdrLen > 0 then
+          Move(StackHdr[PREFIX_RESERVE], Block[Length(Prefix)], HdrLen);
+      end
+      else
+        Block := Prefix + Block;
+      BlockLen := Length(Block);
+      if BlockLen > 0 then
+        BlockPtr := @Block[0]
+      else
+        BlockPtr := nil;
     end;
+
+    BodyLen := Length(BodyData);
+    FullLen := TQuicVarInt.EncodedLen(HTTP3_FRAME_HEADERS) +
+               TQuicVarInt.EncodedLen(BlockLen) +
+               BlockLen;
+    if BodyLen > 0 then
+      FullLen := FullLen +
+                 TQuicVarInt.EncodedLen(HTTP3_FRAME_DATA) +
+                 TQuicVarInt.EncodedLen(BodyLen) +
+                 BodyLen;
+
     SendCtx := FQuicServer.AllocSendCtx;
     SendCtx.QuicBuffer.Length := FullLen;
 
@@ -1107,25 +1174,20 @@ begin
       SendCtx.QuicBuffer.Buffer := CurPtr;
     end;
 
-    if Length(FrameType) > 0 then
-       Move(FrameType[0], CurPtr^, Length(FrameType));
-    Inc(CurPtr, Length(FrameType));
-    if Length(FrameLen) > 0 then
-      Move(FrameLen[0], CurPtr^, Length(FrameLen));
-    Inc(CurPtr, Length(FrameLen));
-    if Length(Block) > 0 then
-       Move(Block[0], CurPtr^, Length(Block));
-    Inc(CurPtr, Length(Block));
+    Inc(CurPtr, TQuicVarInt.EncodeTo(HTTP3_FRAME_HEADERS, CurPtr));
+    Inc(CurPtr, TQuicVarInt.EncodeTo(BlockLen, CurPtr));
+    if BlockLen > 0 then
+    begin
+      Move(BlockPtr^, CurPtr^, BlockLen);
+      Inc(CurPtr, BlockLen);
+    end;
 
-    if Length(DataType) > 0 then
-       Move(DataType[0], CurPtr^, Length(DataType));
-    Inc(CurPtr, Length(DataType));
-    if Length(DataLen) > 0 then
-      Move(DataLen[0], CurPtr^, Length(DataLen));
-    Inc(CurPtr, Length(DataLen));
-
-    if Length(BodyData) > 0 then
-       Move(BodyData[0], CurPtr^, Length(BodyData));
+    if BodyLen > 0 then
+    begin
+      Inc(CurPtr, TQuicVarInt.EncodeTo(HTTP3_FRAME_DATA, CurPtr));
+      Inc(CurPtr, TQuicVarInt.EncodeTo(BodyLen, CurPtr));
+      Move(BodyData[0], CurPtr^, BodyLen);
+    end;
 
     Status := FQuicServer.MsQuic.Api.StreamSend(StreamHandle, @SendCtx.QuicBuffer, 1, QUIC_SEND_FLAG_FIN, SendCtx);
     if not QuicSucceeded(Status) then

@@ -35,6 +35,10 @@ type
     FIsSecure: Boolean;
     FUriValidationErrors: TStringList;
     FQueryParameters: TDictionary<string, string>;
+    function GetUriValidationErrors: TStringList;
+    function GetQueryParameters: TDictionary<string, string>;
+    procedure ClearValidationErrors;
+    function HasValidationErrors: Boolean; inline;
     function ParseTransferEncoding(const EncodingStr: string): TTransferEncoding;
     function ParseConnectionType(const ConnectionStr: string): TConnectionType;
   public
@@ -66,8 +70,8 @@ type
     property ContentLength: Int64 read FContentLength;
     property ContentEncodings: TArray<TContentEncoding> read FContentEncodings;
     property IsSecure: Boolean read FIsSecure write FIsSecure;
-    property UriValidationErrors: TStringList read FUriValidationErrors;
-    property QueryParameters: TDictionary<string, string> read FQueryParameters;
+    property UriValidationErrors: TStringList read GetUriValidationErrors;
+    property QueryParameters: TDictionary<string, string> read GetQueryParameters;
     function MethodToString: string;
     function VersionToString: string;
     function HasBody: Boolean;
@@ -102,9 +106,34 @@ end;
 constructor THttpRequestInfo.Create;
 begin
   inherited Create;
-  FQueryParameters := TDictionary<string, string>.Create;
-  FUriValidationErrors := TStringList.Create;
+  FQueryParameters := nil;
+  FUriValidationErrors := nil;
   Clear;
+end;
+
+function THttpRequestInfo.GetUriValidationErrors: TStringList;
+begin
+  if FUriValidationErrors = nil then
+    FUriValidationErrors := TStringList.Create;
+  Result := FUriValidationErrors;
+end;
+
+function THttpRequestInfo.GetQueryParameters: TDictionary<string, string>;
+begin
+  if FQueryParameters = nil then
+    FQueryParameters := TDictionary<string, string>.Create;
+  Result := FQueryParameters;
+end;
+
+procedure THttpRequestInfo.ClearValidationErrors;
+begin
+  if (FUriValidationErrors <> nil) and (FUriValidationErrors.Count > 0) then
+    ClearValidationErrors;
+end;
+
+function THttpRequestInfo.HasValidationErrors: Boolean;
+begin
+  Result := (FUriValidationErrors <> nil) and (FUriValidationErrors.Count > 0);
 end;
 
 destructor THttpRequestInfo.Destroy;
@@ -135,8 +164,7 @@ begin
   if Length(FContentEncodings) > 0 then
     SetLength(FContentEncodings, 0);
   FIsSecure := False;
-  if FUriValidationErrors.Count > 0 then
-    FUriValidationErrors.Clear;
+  ClearValidationErrors;
 end;
 
 function THttpRequestInfo.StringToHttpMethod(const MethodStr: string): THttpMethod;
@@ -288,8 +316,7 @@ begin
       FFragment := '';
       FScheme := '';
       FAuthority := '';
-      if FUriValidationErrors.Count > 0 then
-        FUriValidationErrors.Clear;
+      ClearValidationErrors;
       Exit;
     end;
     RawLen := Length(RawUri);
@@ -325,21 +352,20 @@ begin
         FFragment := '';
         FScheme := '';
         FAuthority := '';
-        if FUriValidationErrors.Count > 0 then
-          FUriValidationErrors.Clear;
+        ClearValidationErrors;
         if (RawLen >= 6) and THeaderValidatorAccess.HasSuspiciousPatterns(FPath) then
-          FUriValidationErrors.Add('Suspicious patterns detected in path');
+          GetUriValidationErrors.Add('Suspicious patterns detected in path');
         Exit;
       end;
     end;
     FRawUri := Trim(RawUri);
     FUri := FRawUri;
-    FUriValidationErrors.Clear;
+    ClearValidationErrors;
     if (Pos('%00', FRawUri) > 0) or (Pos(#0, FRawUri) > 0) then
-      FUriValidationErrors.Add('Null byte injection attempt detected in URI');
+      GetUriValidationErrors.Add('Null byte injection attempt detected in URI');
     if Length(FRawUri) = 0 then
     begin
-      FUriValidationErrors.Add('URI cannot be empty');
+      GetUriValidationErrors.Add('URI cannot be empty');
       FPath := '/';
       Exit;
     end;
@@ -350,7 +376,7 @@ begin
       FFragment := Copy(WorkingUri, HashPos + 1, Length(WorkingUri));
       WorkingUri := Copy(WorkingUri, 1, HashPos - 1);
       if not TUriValidatorAccess.IsValidFragment(FFragment) then
-        FUriValidationErrors.Add('Invalid fragment: ' + FFragment);
+        GetUriValidationErrors.Add('Invalid fragment: ' + FFragment);
     end
     else
       FFragment := '';
@@ -360,8 +386,9 @@ begin
       FQueryString := Copy(WorkingUri, QuestionPos + 1, Length(WorkingUri));
       WorkingUri := Copy(WorkingUri, 1, QuestionPos - 1);
       if not TUriValidator.IsValidQuery(FQueryString) then
-        FUriValidationErrors.Add('Invalid query string: ' + FQueryString);
-      ParseQueryString(FQueryString, FQueryParameters);
+        GetUriValidationErrors.Add('Invalid query string: ' + FQueryString);
+      if FQueryString <> '' then
+        ParseQueryString(FQueryString, GetQueryParameters);
     end
     else
       FQueryString := '';
@@ -389,7 +416,7 @@ begin
       FPath := WorkingUri;
     end;
     if not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
-      FUriValidationErrors.Add('Path validation: ' + ErrorMsg);
+      GetUriValidationErrors.Add('Path validation: ' + ErrorMsg);
     FNormalizedUri := TUriValidator.NormalizeURI(FRawUri);
     if FPath = '' then
       FPath := '/';
@@ -397,7 +424,7 @@ begin
   except
     on E: Exception do
     begin
-      FUriValidationErrors.Add('Parse error: ' + E.Message);
+      GetUriValidationErrors.Add('Parse error: ' + E.Message);
       FPath := '/';
       FQueryString := '';
       FFragment := '';
@@ -416,45 +443,45 @@ var
 begin
   try
     if Length(FPath) > 2048 then
-      FUriValidationErrors.Add('Path too long (>2048 characters)');
+      GetUriValidationErrors.Add('Path too long (>2048 characters)');
     if Length(FQueryString) > 4096 then
-      FUriValidationErrors.Add('Query string too long (>4096 characters)');
+      GetUriValidationErrors.Add('Query string too long (>4096 characters)');
     if Length(FFragment) > 1024 then
-      FUriValidationErrors.Add('Fragment too long (>1024 characters)');
+      GetUriValidationErrors.Add('Fragment too long (>1024 characters)');
 
     HasPercentPath := Pos('%', FPath) > 0;
     HasPercentRaw := HasPercentPath or (Pos('%', FRawUri) > 0);
 
     if Pos('..', FPath) > 0 then
-      FUriValidationErrors.Add('Path traversal attempt detected')
+      GetUriValidationErrors.Add('Path traversal attempt detected')
     else if HasPercentPath then
     begin
       LowerPath := LowerCase(FPath);
       if (Pos('%2e%2e', LowerPath) > 0) or (Pos('%252e', LowerPath) > 0) or (Pos('%c0%af', LowerPath) > 0) then
-        FUriValidationErrors.Add('Path traversal attempt detected');
+        GetUriValidationErrors.Add('Path traversal attempt detected');
     end;
 
     if (Pos(#0, FRawUri) > 0) or (HasPercentRaw and (Pos('%00', FRawUri) > 0)) then
-      FUriValidationErrors.Add('Null byte injection attempt detected');
+      GetUriValidationErrors.Add('Null byte injection attempt detected');
 
     if (Pos(#10, FRawUri) > 0) or (Pos(#13, FRawUri) > 0) then
-      FUriValidationErrors.Add('CRLF injection attempt detected')
+      GetUriValidationErrors.Add('CRLF injection attempt detected')
     else if HasPercentRaw then
     begin
       LowerRaw := LowerCase(FRawUri);
       if (Pos('%0a', LowerRaw) > 0) or (Pos('%0d', LowerRaw) > 0) then
-        FUriValidationErrors.Add('CRLF injection attempt detected');
+        GetUriValidationErrors.Add('CRLF injection attempt detected');
     end;
 
     if FQueryString <> '' then
     begin
       if THeaderValidatorAccess.HasSuspiciousPatterns(FQueryString) then
-        FUriValidationErrors.Add('Potential attack detected in query string')
+        GetUriValidationErrors.Add('Potential attack detected in query string')
       else if (Pos('%', FQueryString) > 0) or (Pos('+', FQueryString) > 0) then
       begin
         DecodedQuery := TNetEncoding.URL.Decode(FQueryString);
         if THeaderValidatorAccess.HasSuspiciousPatterns(DecodedQuery) then
-          FUriValidationErrors.Add('Potential attack detected in query string');
+          GetUriValidationErrors.Add('Potential attack detected in query string');
       end;
       if Length(FQueryString) > 1024 then
       begin
@@ -463,7 +490,7 @@ begin
         begin
           if Length(Param) > 1024 then
           begin
-            FUriValidationErrors.Add('Query parameter too long: ' + Copy(Param, 1, 50) + '...');
+            GetUriValidationErrors.Add('Query parameter too long: ' + Copy(Param, 1, 50) + '...');
             Break;
           end;
         end;
@@ -473,19 +500,19 @@ begin
     if FPath <> '' then
     begin
       if THeaderValidatorAccess.HasSuspiciousPatterns(FPath) then
-        FUriValidationErrors.Add('Potential attack detected in path')
+        GetUriValidationErrors.Add('Potential attack detected in path')
       else if HasPercentPath then
       begin
         DecodedPath := TNetEncoding.URL.Decode(FPath);
         if THeaderValidatorAccess.HasSuspiciousPatterns(DecodedPath) then
-          FUriValidationErrors.Add('Potential attack detected in path');
+          GetUriValidationErrors.Add('Potential attack detected in path');
       end;
     end;
   except
     on E: Exception do
     begin
       Logger.Info(Format('DEBUG: Exception in ValidateUriComponents: %s', [E.Message]));
-      FUriValidationErrors.Add('Validation error: ' + E.Message);
+      GetUriValidationErrors.Add('Validation error: ' + E.Message);
     end;
   end;
 end;
@@ -555,8 +582,7 @@ begin
     FFragment := '';
     FScheme := '';
     FAuthority := '';
-    if FUriValidationErrors.Count > 0 then
-      FUriValidationErrors.Clear;
+    ClearValidationErrors;
     Result := True;
     Exit;
   end;
@@ -572,8 +598,7 @@ begin
     FFragment := '';
     FScheme := '';
     FAuthority := '';
-    if FUriValidationErrors.Count > 0 then
-      FUriValidationErrors.Clear;
+    ClearValidationErrors;
     Result := True;
     Exit;
   end;
@@ -609,8 +634,7 @@ begin
   FFragment := '';
   FScheme := '';
   FAuthority := '';
-  if FUriValidationErrors.Count > 0 then
-    FUriValidationErrors.Clear;
+  ClearValidationErrors;
   Result := True;
 end;
 
@@ -639,7 +663,7 @@ begin
         UriStr := Copy(RequestLine, 5, Len - 13);
         ParseUri(UriStr);
       end;
-      if (FPath <> '/') and (FUriValidationErrors.Count > 0) and not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
+      if (FPath <> '/') and HasValidationErrors and not ((FMethod = hmOPTIONS) and (FPath = '*')) and not TUriValidator.ValidateAbsolutePath(FPath, ErrorMsg) then
         raise Exception.Create('Invalid URI path: ' + ErrorMsg);
       Exit;
     end;
@@ -802,16 +826,16 @@ end;
 
 function THttpRequestInfo.IsUriValid: Boolean;
 begin
-  Result := FUriValidationErrors.Count = 0;
+  Result := not HasValidationErrors;
 end;
 
 function THttpRequestInfo.GetUriValidationSummary: string;
 begin
-  if FUriValidationErrors.Count = 0 then
+  if not HasValidationErrors then
     Result := 'URI validation passed'
   else
     Result := Format('URI validation failed (%d errors): %s',
-                    [FUriValidationErrors.Count, FUriValidationErrors.Text]);
+                    [GetUriValidationErrors.Count, GetUriValidationErrors.Text]);
 end;
 
 procedure THttpRequestInfo.ApplyFastHeaderInfo(ATransferEncoding: TTransferEncoding; AConnectionType: TConnectionType;

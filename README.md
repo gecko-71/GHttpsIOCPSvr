@@ -72,17 +72,24 @@ High-performance IETF QUIC transport protocol implementation by Microsoft.
 *   **Download Pre-built Binaries:**
     Official GitHub releases: [github.com/microsoft/msquic/releases](https://github.com/microsoft/msquic/releases)  
     Download the Windows x64 release package with **SChannel** TLS support (e.g. `msquic_windows_x64_Release_schannel.zip`) and extract `msquic.dll`.
-*   **Building from Source:**  
+*   **Building from Local Repository Sources (Recommended, MsQuic v2.7.0):**  
+    *Requirements:* Visual Studio 2022 (Desktop development with C++), CMake (>= 3.20).
+    ```powershell
+    cd http3_src\sources\msquic_full
+    cmake -B build_perf -G "Visual Studio 17 2022" -A x64 -DQUIC_TLS_LIB=schannel -DQUIC_BUILD_SHARED=ON -DQUIC_ENABLE_LOGGING=OFF
+    cmake --build build_perf --config Release --target msquic
+    ```
+    *Output binary:* `http3_src\sources\msquic_full\build_perf\bin\Release\msquic.dll`
+*   **Building from Upstream Source:**  
     *Requirements:* Visual Studio 2022 (Desktop development with C++), CMake (>= 3.20), Git.
     ```bash
     git clone --recursive https://github.com/microsoft/msquic.git
     cd msquic
-    mkdir build && cd build
-    cmake -G "Visual Studio 17 2022" -A x64 -DQUIC_TLS=schannel -DQUIC_BUILD_SHARED=ON -DCMAKE_BUILD_TYPE=Release -DQUIC_ENABLE_LOGGING=OFF ..
-    cmake --build . --config Release
+    cmake -B build_perf -G "Visual Studio 17 2022" -A x64 -DQUIC_TLS_LIB=schannel -DQUIC_BUILD_SHARED=ON -DQUIC_ENABLE_LOGGING=OFF
+    cmake --build build_perf --config Release --target msquic
     ```
-    *Output binary:* `build\bin\Release\msquic.dll`  
-    *(Note: `GHttpsIOCPSvr` uses Windows SChannel TLS via `-DQUIC_TLS=schannel`, avoiding external OpenSSL dependencies).*
+    *Output binary:* `build_perf\bin\Release\msquic.dll`  
+    *(Note: `GHttpsIOCPSvr` uses Windows SChannel TLS via `-DQUIC_TLS_LIB=schannel`, avoiding external OpenSSL dependencies. MsQuic 2.4+ / 2.7.0 requires `QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT` for SChannel, handled automatically by `Http3DelphiV3\MsQuic.Certificate.pas`).*
 
 ### 2. `ls-qpack.dll` (LiteSpeed QPACK v2.7.0)
 High-efficiency QPACK header compression (RFC 9204) for HTTP/3 streams.
@@ -334,12 +341,14 @@ Measured on Windows 11
 
 ### HTTP/3 (QUIC)
 
-| # | Server | RPS | p50 (ms) | p95 (ms) | p99 (ms) | Errors | RAM (MB) |
-| :---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **1** | **ghttps** | 9637.29 | 0.00 | 16.00 | 27.00 | 0.0% | 118.66 |
-| **2** | kestrel | 7863.01 | 2.00 | 4.00 | 15.54 | 0.0% | 170.21 |
-| **3** | aioquic_wt | 1181.52 | 16.00 | 20.00 | 34.40 | 0.0% | 41.44 |
-| **4** | caddy | 4515.21 | 2.00 | 5.00 | 12.01 | 100.0% (err) | 122.95 |
+| Miejsce | Serwer | Status | RPS (Avg) | p50 (ms) | p95 (ms) | p99 (ms) | Błędy (%) | Peak RAM (MB) |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **#1** |<nobr>`quicgo`<nobr>| ok | 13945.91 | 1.0 | 3.0 | 6.0 | 0.0% | 19.38 |
+| **#2** |<nobr>`caddy`<nobr>| ok | 11532.02 | 1.0 | 4.0 | 6.0 | 0.0% | 45.12 |
+| **#3** |<nobr>`ghttps`<nobr>| ok | 10211.2 | 1.0 | 7.0 | 24.0 | 0.0% | 38.65 |
+| **#4** |<nobr>`traefik`<nobr>| ok | 8117.4 | 2.0 | 5.0 | 8.0 | 0.0% | 137.7 |
+| **#5** |<nobr>`kestrel`<nobr>| ok | 7523.92 | 2.0 | 6.0 | 9.0 | 0.0% | 93.84 |
+| **#6** |<nobr>`aioquic_wt`<nobr>| ok | 1239.57 | 16.0 | 20.0 | 24.0 | 0.0% | 44.99 |
 
 ---
 

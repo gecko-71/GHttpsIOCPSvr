@@ -159,7 +159,8 @@ function IsMsQuicDllAvailable(out AErrorDetails: string): Boolean;
 var
   ExeDir, MsQuicPath, LsQpackPath: string;
   HMsQuic, HLsQpack: HMODULE;
-  OpenVerFunc: function(Version: Cardinal; out ApiTable: Pointer): Cardinal; stdcall;
+  OpenVerFunc: function(Version: Cardinal; out ApiTable: Pointer): Cardinal; cdecl;
+  CloseFunc: procedure(ApiTable: Pointer); cdecl;
   ApiTable: Pointer;
   Status: Cardinal;
   OldErrorMode: UINT;
@@ -194,6 +195,7 @@ begin
 
     try
       @OpenVerFunc := GetProcAddress(HMsQuic, 'MsQuicOpenVersion');
+      @CloseFunc := GetProcAddress(HMsQuic, 'MsQuicClose');
       if not Assigned(@OpenVerFunc) then
       begin
         AErrorDetails := Format('msquic.dll in "%s" does not export "MsQuicOpenVersion"', [MsQuicPath]);
@@ -207,6 +209,8 @@ begin
         AErrorDetails := Format('MsQuicOpenVersion failed with status code 0x%x (%d)', [Status, Status]);
         Exit;
       end;
+      if Assigned(@CloseFunc) and (ApiTable <> nil) then
+        CloseFunc(ApiTable);
     finally
       FreeLibrary(HMsQuic);
     end;

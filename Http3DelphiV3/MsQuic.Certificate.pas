@@ -272,7 +272,28 @@ begin
     if pSearchContext <> nil then
     begin
       try
-        if CertAddCertificateContextToStore(hTmpStore, pSearchContext, CERT_STORE_ADD_ALWAYS, nil) then
+        FillChar(FCredConfig, SizeOf(FCredConfig), 0);
+        FCredConfig.Type_ := QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
+        FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
+        if AmTLSRequired or AmTLSOptional then
+          FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
+        FCredConfig.Certificate := pSearchContext;
+        Result := AConfig.LoadCredential(@FCredConfig);
+        if (not Result) and (FCredConfig.Flags <> QUIC_CREDENTIAL_FLAG_NONE) then
+        begin
+          FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
+          Result := AConfig.LoadCredential(@FCredConfig);
+        end;
+        if (not Result) and (not AmTLSRequired) and AmTLSOptional then
+        begin
+          FillChar(FCredConfig, SizeOf(FCredConfig), 0);
+          FCredConfig.Type_ := QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
+          FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
+          FCredConfig.Certificate := pSearchContext;
+          Result := AConfig.LoadCredential(@FCredConfig);
+        end;
+
+        if (not Result) and CertAddCertificateContextToStore(hTmpStore, pSearchContext, CERT_STORE_ADD_ALWAYS, nil) then
         begin
           FillChar(PfxData, SizeOf(PfxData), 0);
           if PFXExportCertStoreEx(hTmpStore, @PfxData, nil, nil, EXPORT_PRIVATE_KEYS or REPORT_NO_PRIVATE_KEY) then

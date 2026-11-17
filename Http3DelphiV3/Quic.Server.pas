@@ -67,6 +67,8 @@ type
     Data: array[0..1500] of Byte;
     DynamicBuffer: Pointer;
     Server: Pointer;
+    Prev: PQuicSendContext;
+    Next: PQuicSendContext;
   end;
 
   TQuicServer = class;
@@ -130,7 +132,7 @@ type
     FStartupPageFileMB: Double;
     FActiveConnections:         TList<Pointer>;
     FConnectionsLock:           TCriticalSection;
-    FSendCtxList:               TList<Pointer>;
+    FSendCtxHead:               PQuicSendContext;
     FSendCtxLock:               TCriticalSection;
     FActiveConnCount:           Integer;
     FAllConnsClosed:            TEvent;
@@ -262,7 +264,7 @@ begin
   FRequiredServerName        := '';
   FActiveConnections         := TList<Pointer>.Create;
   FConnectionsLock           := TCriticalSection.Create;
-  FSendCtxList               := TList<Pointer>.Create;
+  FSendCtxHead               := nil;
   FSendCtxLock               := TCriticalSection.Create;
   FAllConnsClosed            := TEvent.Create(nil, True, True, '');
 
@@ -278,7 +280,6 @@ begin
   Stop;
   FAllConnsClosed.Free;
   FSendCtxLock.Free;
-  FSendCtxList.Free;
   FConnectionsLock.Free;
   FActiveConnections.Free;
   inherited Destroy;
@@ -289,10 +290,14 @@ begin
   New(Result);
   Result.Server := Self;
   Result.DynamicBuffer := nil;
+  Result.Prev := nil;
   TInterlocked.Increment(FSendCtxAllocated);
   FSendCtxLock.Enter;
   try
-    FSendCtxList.Add(Result);
+    Result.Next := FSendCtxHead;
+    if FSendCtxHead <> nil then
+      FSendCtxHead.Prev := Result;
+    FSendCtxHead := Result;
   finally
     FSendCtxLock.Leave;
   end;
@@ -304,7 +309,14 @@ begin
     Exit;
   FSendCtxLock.Enter;
   try
-    FSendCtxList.Remove(SendCtx);
+    if SendCtx.Prev <> nil then
+      SendCtx.Prev.Next := SendCtx.Next
+    else
+      FSendCtxHead := SendCtx.Next;
+    if SendCtx.Next <> nil then
+      SendCtx.Next.Prev := SendCtx.Prev;
+    SendCtx.Prev := nil;
+    SendCtx.Next := nil;
   finally
     FSendCtxLock.Leave;
   end;
@@ -806,7 +818,7 @@ begin
     FMsQuic.Api.SetParam(nil, $01000000, SizeOf(RetryPercent), @RetryPercent);
   end;
 
-  FRegistration := TMsQuicRegistration.Create(FMsQuic.Api, 'GHttpsIOCPSvr', QUIC_EXECUTION_PROFILE_LOW_LATENCY);
+  FRegistration := TMsQuicRegistration.Create(FMsQuic.Api, 'GHttpsIOCPSvr', QUIC_EXECUTION_PROFILE_TYPE_MAX_THROUGHPUT);
 
   FillChar(Settings, SizeOf(Settings), 0);
   Settings.IsSetFlags :=
@@ -874,6 +886,7 @@ var
   ConnsToShutdown: TArray<Pointer>;
   I: Integer;
   LeakedCtx: PQuicSendContext;
+  NextCtx: PQuicSendContext;
 begin
   if TInterlocked.Exchange(FShuttingDown, 1) = 1 then
     Exit;
@@ -951,18 +964,17 @@ begin
 
   FSendCtxLock.Enter;
   try
-    for I := FSendCtxList.Count - 1 downto 0 do
+    LeakedCtx := FSendCtxHead;
+    FSendCtxHead := nil;
+    while LeakedCtx <> nil do
     begin
-      LeakedCtx := PQuicSendContext(FSendCtxList[I]);
-      if LeakedCtx <> nil then
-      begin
-        if LeakedCtx.DynamicBuffer <> nil then
-          FreeMem(LeakedCtx.DynamicBuffer);
-        Dispose(LeakedCtx);
-        TInterlocked.Increment(FSendCtxFreed);
-      end;
+      NextCtx := LeakedCtx.Next;
+      if LeakedCtx.DynamicBuffer <> nil then
+        FreeMem(LeakedCtx.DynamicBuffer);
+      Dispose(LeakedCtx);
+      TInterlocked.Increment(FSendCtxFreed);
+      LeakedCtx := NextCtx;
     end;
-    FSendCtxList.Clear;
   finally
     FSendCtxLock.Leave;
   end;

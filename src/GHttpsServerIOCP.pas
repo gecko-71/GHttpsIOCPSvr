@@ -622,7 +622,7 @@ begin
       if Result then
       begin
         AAuthType := Ep.AuthorizationType;
-        AKey := GetEndpointKey(AMethod, APath);
+        AKey := APath;
       end
       else
       begin

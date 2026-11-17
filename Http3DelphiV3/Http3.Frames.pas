@@ -43,6 +43,8 @@ type
   TQuicVarInt = record
     class function Decode(const Buffer: TBytes; var Offset: Integer; out Value: UInt64): Boolean; static;
     class function Encode(Value: UInt64): TBytes; static;
+    class function EncodedLen(Value: UInt64): Integer; static;
+    class function EncodeTo(Value: UInt64; Buf: PByte): Integer; static;
   end;
 
 implementation
@@ -130,6 +132,57 @@ begin
     Result[5] := Byte((Value shr 16) and $FF);
     Result[6] := Byte((Value shr 8) and $FF);
     Result[7] := Byte(Value and $FF);
+  end
+  else
+    raise Exception.Create('VarInt value too large');
+end;
+
+class function TQuicVarInt.EncodedLen(Value: UInt64): Integer;
+begin
+  if Value <= $3F then
+    Result := 1
+  else if Value <= $3FFF then
+    Result := 2
+  else if Value <= $3FFFFFFF then
+    Result := 4
+  else if Value <= $3FFFFFFFFFFFFFFF then
+    Result := 8
+  else
+    raise Exception.Create('VarInt value too large');
+end;
+
+class function TQuicVarInt.EncodeTo(Value: UInt64; Buf: PByte): Integer;
+begin
+  if Value <= $3F then
+  begin
+    Buf[0] := Byte(Value);
+    Result := 1;
+  end
+  else if Value <= $3FFF then
+  begin
+    Buf[0] := Byte((Value shr 8) or $40);
+    Buf[1] := Byte(Value and $FF);
+    Result := 2;
+  end
+  else if Value <= $3FFFFFFF then
+  begin
+    Buf[0] := Byte((Value shr 24) or $80);
+    Buf[1] := Byte((Value shr 16) and $FF);
+    Buf[2] := Byte((Value shr 8) and $FF);
+    Buf[3] := Byte(Value and $FF);
+    Result := 4;
+  end
+  else if Value <= $3FFFFFFFFFFFFFFF then
+  begin
+    Buf[0] := Byte((Value shr 56) or $C0);
+    Buf[1] := Byte((Value shr 48) and $FF);
+    Buf[2] := Byte((Value shr 40) and $FF);
+    Buf[3] := Byte((Value shr 32) and $FF);
+    Buf[4] := Byte((Value shr 24) and $FF);
+    Buf[5] := Byte((Value shr 16) and $FF);
+    Buf[6] := Byte((Value shr 8) and $FF);
+    Buf[7] := Byte(Value and $FF);
+    Result := 8;
   end
   else
     raise Exception.Create('VarInt value too large');
