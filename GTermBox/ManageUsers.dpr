@@ -26,14 +26,14 @@ program ManageUsers;
 {$APPTYPE CONSOLE}
 
 uses
-  Winapi.Windows,
-  System.SysUtils,
-  System.Classes,
+  Windows,
+  SysUtils,
+  Classes,
   System.IOUtils,
   System.JSON,
   System.Hash,
-  System.StrUtils,
-  System.Generics.Collections;
+  StrUtils,
+  Generics.Collections;
 
 function GetExeDir: string;
 begin
@@ -60,6 +60,7 @@ const
   BCRYPT_USE_SYSTEM_PREFERRED_RNG = $00000002;
   BCRYPT_ALG_HANDLE_HMAC_FLAG = $00000008;
   BCRYPT_SHA256_ALGORITHM = 'SHA256';
+  MOVEFILE_WRITE_THROUGH = $00000008;
 
 function DeleteAppContainerProfile(pszAppContainerName: PWideChar): HRESULT; stdcall; external 'userenv.dll' name 'DeleteAppContainerProfile';
 
@@ -290,9 +291,9 @@ begin
   if not FileExists(AFilePath) then
     Exit;
   RawBytes := TFile.ReadAllBytes(AFilePath);
-  Content := TEncoding.UTF8.GetString(RawBytes);
-  if (Length(Content) > 0) and (Content[1] = #$FEFF) then
-    Content := Copy(Content, 2, MaxInt);
+  if (Length(RawBytes) >= 3) and (RawBytes[0] = $EF) and (RawBytes[1] = $BB) and (RawBytes[2] = $BF) then
+    RawBytes := Copy(RawBytes, 3, Length(RawBytes) - 3);
+  Content := string(TEncoding.UTF8.GetString(RawBytes));
   Val := TJSONObject.ParseJSONValue(Content);
   if Val is TJSONObject then
     Result := Val as TJSONObject
@@ -309,9 +310,9 @@ begin
   RawBytes := TEncoding.UTF8.GetBytes(ARoot.Format(2) + sLineBreak);
   TempFile := AFilePath + '.tmp';
   TFile.WriteAllBytes(TempFile, RawBytes);
-  if not MoveFileExW(PWideChar(TempFile), PWideChar(AFilePath), MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+  if not MoveFileExW(PWideChar(WideString(TempFile)), PWideChar(WideString(AFilePath)), MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
   begin
-    DeleteFile(PWideChar(TempFile));
+    TFile.Delete(TempFile);
     TFile.WriteAllBytes(AFilePath, RawBytes);
   end;
 
@@ -768,6 +769,8 @@ var
   I: Integer;
   Found: Boolean;
   SandboxDir, FullSandbox, CanonicalSandbox, CanonicalExeDir, ParentSandbox: string;
+  Leaf, SafeLeaf, PathHash: string;
+  Ch: Char;
 begin
   SandboxDir := '';
   UsersArr := LoadUsersArray(GetUsersPath, Root);
@@ -798,15 +801,15 @@ begin
       Writeln(Format('User ''%s'' deleted from configuration.', [AUsername]));
       if SandboxDir <> '' then
       begin
-        var Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(SandboxDir));
-        var SafeLeaf := '';
-        for var Ch in Leaf do
+        Leaf := ExtractFileName(ExcludeTrailingPathDelimiter(SandboxDir));
+        SafeLeaf := '';
+        for Ch in Leaf do
           if CharInSet(Ch, ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) then
             SafeLeaf := SafeLeaf + Ch;
         FullSandbox := TPath.Combine(GetExeDir, SandboxDir);
-        var PathHash := Copy(THashSHA2.GetHashString(TPath.GetFullPath(FullSandbox)), 1, 12);
-        DeleteAppContainerProfile(PWideChar('GTermBox.' + SafeLeaf + '.' + PathHash));
-        DeleteAppContainerProfile(PWideChar('GTermBox.' + SafeLeaf));
+        PathHash := Copy(THashSHA2.GetHashString(TPath.GetFullPath(FullSandbox)), 1, 12);
+        DeleteAppContainerProfile(PWideChar(WideString('GTermBox.' + SafeLeaf + '.' + PathHash)));
+        DeleteAppContainerProfile(PWideChar(WideString('GTermBox.' + SafeLeaf)));
         if TDirectory.Exists(FullSandbox) then
         begin
           CanonicalSandbox := TPath.GetFullPath(FullSandbox);
@@ -1191,18 +1194,40 @@ begin
   Result := False;
 end;
 
+function IsTlsFlag(const AArg: string; out AHasSeparateValue: Boolean): Boolean;
+begin
+  AHasSeparateValue := False;
+  if SameText(AArg, '-tls') or SameText(AArg, '--tls') or SameText(AArg, '/tls') then
+  begin
+    AHasSeparateValue := True;
+    Exit(True);
+  end;
+  Result := StartsText('-tls:', AArg) or StartsText('--tls:', AArg) or
+            StartsText('-tls=', AArg) or StartsText('--tls=', AArg) or
+            StartsText('/tls:', AArg) or StartsText('/tls=', AArg) or
+            SameText(AArg, '--tpopenssl') or SameText(AArg, '-tpopenssl') or
+            SameText(AArg, '--tpschannel') or SameText(AArg, '-tpschannel');
+end;
+
 function GetPositionalArg(AIndex: Integer): string;
 var
   I, PosIdx: Integer;
   Arg: string;
+  HasSep, FoundCmd: Boolean;
 begin
   Result := '';
   PosIdx := 0;
-  I := 2;
+  FoundCmd := False;
+  I := 1;
   while I <= ParamCount do
   begin
     Arg := ParamStr(I);
-    if Arg.StartsWith('--') then
+    if IsTlsFlag(Arg, HasSep) then
+    begin
+      if HasSep then
+        Inc(I);
+    end
+    else if Arg.StartsWith('--') then
     begin
       if not (SameText(Arg, '--network') or SameText(Arg, '--no-network') or
               SameText(Arg, '--allow-job-only') or SameText(Arg, '--no-job-only') or
@@ -1219,9 +1244,14 @@ begin
     end
     else
     begin
-      Inc(PosIdx);
-      if PosIdx = AIndex then
-        Exit(Arg);
+      if not FoundCmd then
+        FoundCmd := True
+      else
+      begin
+        Inc(PosIdx);
+        if PosIdx = AIndex then
+          Exit(Arg);
+      end;
     end;
     Inc(I);
   end;
@@ -1229,7 +1259,7 @@ end;
 
 procedure EditUserCLI;
 var
-  Username, RoleVal, SandboxVal, AppsVal, ReadVal, WriteVal, CertVal: string;
+  Username, RoleVal, SandboxVal, AppsVal, ReadVal, WriteVal, CertVal, UpVal, DownVal: string;
   Root: TJSONObject;
   UsersArr: TJSONArray;
   UserObj, GrantsObj: TJSONObject;
@@ -1352,7 +1382,7 @@ begin
         end
         else
         begin
-          var UpVal := GetOptionValue('upload');
+          UpVal := GetOptionValue('upload');
           if UpVal <> '' then
           begin
             GrantsObj.RemovePair('upload').Free;
@@ -1372,7 +1402,7 @@ begin
         end
         else
         begin
-          var DownVal := GetOptionValue('download');
+          DownVal := GetOptionValue('download');
           if DownVal <> '' then
           begin
             GrantsObj.RemovePair('download').Free;
@@ -1842,7 +1872,9 @@ end;
 
 procedure InitializeEnvironment(const ATargetDir: string = '');
 var
-  BaseDir, SDir: string;
+  BaseDir, SDir, SourceWeb, SourceDll: string;
+  RuntimeDlls: array[0..3] of string;
+  DllIdx: Integer;
 begin
   if ATargetDir <> '' then
     BaseDir := TPath.GetFullPath(ATargetDir)
@@ -1885,7 +1917,7 @@ begin
 
   if not TFile.Exists(TPath.Combine(BaseDir, 'web\index.html')) then
   begin
-    var SourceWeb := TPath.Combine(GetExeDir, 'web');
+    SourceWeb := TPath.Combine(GetExeDir, 'web');
     if TFile.Exists(TPath.Combine(SourceWeb, 'index.html')) and not SameText(SourceWeb, TPath.Combine(BaseDir, 'web')) then
     begin
       CopyDirTree(SourceWeb, TPath.Combine(BaseDir, 'web'));
@@ -1895,7 +1927,7 @@ begin
 
   if not TFile.Exists(TPath.Combine(BaseDir, 'msquic.dll')) then
   begin
-    var SourceDll := TPath.Combine(GetExeDir, 'msquic.dll');
+    SourceDll := TPath.Combine(GetExeDir, 'msquic.dll');
     if TFile.Exists(SourceDll) and not SameText(SourceDll, TPath.Combine(BaseDir, 'msquic.dll')) then
     begin
       TFile.Copy(SourceDll, TPath.Combine(BaseDir, 'msquic.dll'), True);
@@ -1903,13 +1935,20 @@ begin
     end;
   end;
 
-  if not TFile.Exists(TPath.Combine(BaseDir, 'ls-qpack.dll')) then
+  RuntimeDlls[0] := 'ls-qpack.dll';
+  RuntimeDlls[1] := 'libcrypto-3-x64.dll';
+  RuntimeDlls[2] := 'libssl-3-x64.dll';
+  RuntimeDlls[3] := 'msquicSSL.dll';
+  for DllIdx := 0 to High(RuntimeDlls) do
   begin
-    var SourceDll := TPath.Combine(GetExeDir, 'ls-qpack.dll');
-    if TFile.Exists(SourceDll) and not SameText(SourceDll, TPath.Combine(BaseDir, 'ls-qpack.dll')) then
+    if not TFile.Exists(TPath.Combine(BaseDir, RuntimeDlls[DllIdx])) then
     begin
-      TFile.Copy(SourceDll, TPath.Combine(BaseDir, 'ls-qpack.dll'), True);
-      Writeln('[OK] Copied ls-qpack.dll');
+      SourceDll := TPath.Combine(GetExeDir, RuntimeDlls[DllIdx]);
+      if TFile.Exists(SourceDll) and not SameText(SourceDll, TPath.Combine(BaseDir, RuntimeDlls[DllIdx])) then
+      begin
+        TFile.Copy(SourceDll, TPath.Combine(BaseDir, RuntimeDlls[DllIdx]), True);
+        Writeln('[OK] Copied ', RuntimeDlls[DllIdx]);
+      end;
     end;
   end;
 
@@ -2005,6 +2044,10 @@ var
   UName, Pwd, RoleChoice, AppsInput, SandboxInput, NetChoice, JobChoice, FullDiskChoice, UploadChoice, DownloadChoice, PsChoice: string;
   DirsR, DirsW, Confirm: string;
   AppId, AppName, Cmd, SandboxMode, RolesInput: string;
+  UUsersArr, RAppsArr: TJSONArray;
+  RObj, ExistingUser, GObj, RRoot, ExistingApp: TJSONObject;
+  UserFound, AppFound: Boolean;
+  J: Integer;
 begin
   while True do
   begin
@@ -2105,14 +2148,12 @@ begin
       Write('Allowed write dirs comma-separated (leave blank to keep): ');
       Readln(DirsW);
 
-      var UUsersArr: TJSONArray;
-      var RObj: TJSONObject;
       UUsersArr := LoadUsersArray(GetUsersPath, RObj);
       try
-        var UserFound: Boolean := False;
-        for var J := 0 to UUsersArr.Count - 1 do
+        UserFound := False;
+        for J := 0 to UUsersArr.Count - 1 do
         begin
-          var ExistingUser := UUsersArr.Items[J] as TJSONObject;
+          ExistingUser := UUsersArr.Items[J] as TJSONObject;
           if SameText(GetStr(ExistingUser, 'username'), UName) then
           begin
             UserFound := True;
@@ -2133,7 +2174,7 @@ begin
               ExistingUser.RemovePair('apps').Free;
               ExistingUser.AddPair('apps', ArrayToJsonArray(SplitComma(AppsInput)));
             end;
-            var GObj := FindObj(ExistingUser, 'grants');
+            GObj := FindObj(ExistingUser, 'grants');
             if GObj = nil then
             begin
               GObj := TJSONObject.Create;
@@ -2291,13 +2332,12 @@ begin
       Write('New allowed roles comma-separated (leave blank to keep): ');
       Readln(RolesInput);
 
-      var RRoot: TJSONObject;
-      var RAppsArr := LoadAppsArray(GetAppsPath, RRoot);
+      RAppsArr := LoadAppsArray(GetAppsPath, RRoot);
       try
-        var AppFound: Boolean := False;
-        for var J := 0 to RAppsArr.Count - 1 do
+        AppFound := False;
+        for J := 0 to RAppsArr.Count - 1 do
         begin
-          var ExistingApp := RAppsArr.Items[J] as TJSONObject;
+          ExistingApp := RAppsArr.Items[J] as TJSONObject;
           if SameText(GetStr(ExistingApp, 'id'), Trim(AppId)) then
           begin
             AppFound := True;
@@ -2372,7 +2412,10 @@ var
   UName, Pwd, AppId, AppName, ExecCmd: string;
   RolesStr, SandboxStr, AppsStr, ReadStr, WriteStr: string;
   ArgsStr, EnvStr, WDirStr, ColsStr, RowsStr: string;
-  NetFlag: Boolean;
+  NetFlag, UploadFlag, DownloadFlag, PsEverywhereFlag: Boolean;
+  UpOpt, DownOpt, ClientCertStr, CertArg: string;
+  CmdIdx: Integer;
+  HasTlsSep: Boolean;
 begin
   try
     if ParamCount = 0 then
@@ -2381,7 +2424,28 @@ begin
       Exit;
     end;
 
-    Cmd := LowerCase(ParamStr(1));
+    Cmd := '';
+    CmdIdx := 1;
+    while CmdIdx <= ParamCount do
+    begin
+      if IsTlsFlag(ParamStr(CmdIdx), HasTlsSep) then
+      begin
+        if HasTlsSep then
+          Inc(CmdIdx);
+      end
+      else
+      begin
+        Cmd := LowerCase(ParamStr(CmdIdx));
+        Break;
+      end;
+      Inc(CmdIdx);
+    end;
+
+    if Cmd = '' then
+    begin
+      InteractiveMode;
+      Exit;
+    end;
 
     if (Cmd = 'help') or (Cmd = '--help') or (Cmd = '-h') or (Cmd = '/?') then
       PrintHelp
@@ -2406,35 +2470,35 @@ begin
       ReadStr := GetOptionValue('dirs-read', '');
       WriteStr := GetOptionValue('dirs-write', '');
       NetFlag := not HasFlag('no-network');
-      var UploadFlag: Boolean := True;
+      UploadFlag := True;
       if HasFlag('no-upload') then
         UploadFlag := False
       else if HasFlag('upload') then
         UploadFlag := True
       else
       begin
-        var UpOpt := GetOptionValue('upload');
+        UpOpt := GetOptionValue('upload');
         if UpOpt <> '' then
           UploadFlag := SameText(UpOpt, 'true') or SameText(UpOpt, '1') or SameText(UpOpt, 'yes');
       end;
 
-      var DownloadFlag: Boolean := True;
+      DownloadFlag := True;
       if HasFlag('no-download') then
         DownloadFlag := False
       else if HasFlag('download') then
         DownloadFlag := True
       else
       begin
-        var DownOpt := GetOptionValue('download');
+        DownOpt := GetOptionValue('download');
         if DownOpt <> '' then
           DownloadFlag := SameText(DownOpt, 'true') or SameText(DownOpt, '1') or SameText(DownOpt, 'yes');
       end;
 
-      var PsEverywhereFlag: Boolean := SameText(RolesStr, 'admin') or HasFlag('admin') or HasFlag('powershell-outside-sandbox') or HasFlag('powershell-access-everywhere');
+      PsEverywhereFlag := SameText(RolesStr, 'admin') or HasFlag('admin') or HasFlag('powershell-outside-sandbox') or HasFlag('powershell-access-everywhere');
       if HasFlag('no-powershell-outside-sandbox') or HasFlag('no-powershell-access-everywhere') then
         PsEverywhereFlag := False;
 
-      var ClientCertStr := GetOptionValue('cert', '');
+      ClientCertStr := GetOptionValue('cert', '');
       if ClientCertStr = '' then
         ClientCertStr := GetOptionValue('client-cert', '');
 
@@ -2445,7 +2509,7 @@ begin
     else if (Cmd = 'bind-cert') or (Cmd = 'set-cert') or (Cmd = 'cert-bind') then
     begin
       UName := GetPositionalArg(1);
-      var CertArg := GetPositionalArg(2);
+      CertArg := GetPositionalArg(2);
       if (UName = '') or (CertArg = '') then
       begin
         Writeln('[ERROR] Usage: ManageUsers bind-cert <username> <cert_file_or_thumbprint>');
@@ -2522,7 +2586,7 @@ begin
     end
     else
     begin
-      Writeln(Format('[ERROR] Unknown command ''%s''.', [ParamStr(1)]));
+      Writeln(Format('[ERROR] Unknown command ''%s''.', [Cmd]));
       Writeln('Type ''ManageUsers help'' to see available commands and options.');
     end;
   except

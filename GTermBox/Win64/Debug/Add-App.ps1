@@ -32,8 +32,12 @@ param(
 
   [switch]$UpdateUsers,
 
-  [switch]$Interactive
+  [switch]$Interactive,
+
+  [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER
 )
+
+$EffectiveTlsProvider = if ([string]::IsNullOrWhiteSpace($TlsProvider)) { 'tpSchannel' } else { $TlsProvider }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 if (Test-Path (Join-Path $ScriptDir "ManageUsers.exe")) {
@@ -41,6 +45,9 @@ if (Test-Path (Join-Path $ScriptDir "ManageUsers.exe")) {
   $ManageUsersExe = Join-Path $ScriptDir "ManageUsers.exe"
 } elseif (Test-Path (Join-Path $ScriptDir "Win64\Debug\ManageUsers.exe")) {
   $ServerDir = Join-Path $ScriptDir "Win64\Debug"
+  $ManageUsersExe = Join-Path $ServerDir "ManageUsers.exe"
+} elseif (Test-Path (Join-Path $ScriptDir "..\Win64\Debug\ManageUsers.exe")) {
+  $ServerDir = (Resolve-Path (Join-Path $ScriptDir "..\Win64\Debug")).Path
   $ManageUsersExe = Join-Path $ServerDir "ManageUsers.exe"
 } elseif (Test-Path (Join-Path (Get-Location) "Win64\Debug\ManageUsers.exe")) {
   $ServerDir = Join-Path (Get-Location).Path "Win64\Debug"
@@ -54,6 +61,32 @@ if (Test-Path (Join-Path $ScriptDir "ManageUsers.exe")) {
 } else {
   Write-Error "ManageUsers.exe not found. Please compile the project first."
   exit 1
+}
+
+$OpenSslDllSearchDirs = @(
+  $ScriptDir,
+  (Join-Path $ScriptDir "Win64\Debug"),
+  (Join-Path $ScriptDir "Win64\Release"),
+  (Join-Path $ScriptDir "..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\Win64\Release"),
+  (Join-Path $ScriptDir "..\..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\..\Win64\Release"),
+  (Join-Path $ScriptDir "..\..\..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\..\..\Win64\Release")
+)
+foreach ($dllName in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+  $dstDll = Join-Path $ServerDir $dllName
+  if (-not (Test-Path $dstDll)) {
+    foreach ($srcDir in $OpenSslDllSearchDirs) {
+      if (Test-Path $srcDir) {
+        $candDll = Join-Path $srcDir $dllName
+        if (Test-Path $candDll) {
+          Copy-Item -Path $candDll -Destination $dstDll -Force
+          break
+        }
+      }
+    }
+  }
 }
 
 if ($Interactive -or [string]::IsNullOrWhiteSpace($AppId)) {
@@ -72,7 +105,7 @@ if ($Interactive -or [string]::IsNullOrWhiteSpace($AppId)) {
   }
 
   if ([string]::IsNullOrWhiteSpace($Command)) {
-    $Command = Read-Host "Enter Command/Executable (e.g. powershell.exe, C:\tools\app.exe)"
+    $Command = Read-Host "Enter Command/Executable (e.g. powershell.exe, Far\Far.exe)"
   }
 
   $inputSandbox = Read-Host "Enter Sandbox mode [standard / jobonly / none] (default: standard)"
@@ -168,6 +201,9 @@ if ($isNetEnabled) {
 } else {
   $cliArgs += "--no-network"
 }
+if (-not [string]::IsNullOrWhiteSpace($TlsProvider)) {
+  $cliArgs += "-tls:$EffectiveTlsProvider"
+}
 
 Write-Host "Registering application '$AppId' in $ServerDir..." -ForegroundColor Yellow
 Push-Location $ServerDir
@@ -182,7 +218,7 @@ try {
     }
     if (Test-Path $cmdTrimmed) {
       $parentOfCmd = Split-Path -Parent (Resolve-Path $cmdTrimmed).Path
-      if ($parentOfCmd -and (Test-Path $parentOfCmd) -and -not ($parentOfCmd -like "C:\Windows*")) {
+      if ($parentOfCmd -and (Test-Path $parentOfCmd) -and -not ($parentOfCmd -like "$env:SystemRoot*")) {
         $targetAclDirs += $parentOfCmd
       }
     } elseif (Test-Path (Join-Path $ServerDir $cmdTrimmed)) {
@@ -226,7 +262,11 @@ try {
 
     Write-Host ""
     Write-Host "[SUCCESS] Application '$AppId' has been successfully configured!" -ForegroundColor Green
-    & $ManageUsersExe "show-app" $AppId
+    $showArgs = @("show-app", $AppId)
+    if (-not [string]::IsNullOrWhiteSpace($TlsProvider)) {
+      $showArgs += "-tls:$EffectiveTlsProvider"
+    }
+    & $ManageUsersExe @showArgs
   }
 } finally {
   Pop-Location

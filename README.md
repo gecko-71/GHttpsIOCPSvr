@@ -1,6 +1,6 @@
 # GHttpsServerIOCP - A Multi-Protocol HTTP, HTTPS, WebSocket, HTTP/3 & WebTransport Server in Delphi
 
-This server is built in Delphi using asynchronous and multithreaded architecture. The server utilizes Windows I/O Completion Ports (IOCP), the native Windows TLS/SSL stack (SChannel), Microsoft MsQuic, and RFC 6455 WebSockets, ensuring high throughput, minimal latency, and robust enterprise security.
+This server is built in Delphi using asynchronous and multithreaded architecture. The server utilizes Windows I/O Completion Ports (IOCP), the native Windows TLS/SSL stack (SChannel) alongside an optional OpenSSL 3.x (`tpOpenSSL`) engine, Microsoft MsQuic, and RFC 6455 WebSockets, ensuring high throughput, minimal latency, and robust enterprise security.
 
 It serves as a high-performance foundation for REST APIs, real-time WebSocket communication, next-generation HTTP/3 services, and ultra-low-latency WebTransport applications.
 
@@ -10,20 +10,20 @@ It serves as a high-performance foundation for REST APIs, real-time WebSocket co
 
 *   **Hybrid Multi-Protocol Architecture:**
     *   **HTTP/1.1 (TCP):** Ultra-fast plaintext HTTP engine with zero-cost SChannel bypass.
-    *   **HTTPS (TLS 1.3 / 1.2):** Secure SChannel SSPI integration with ALPN negotiation, zero OpenSSL dependencies, and native Windows CNG certificate store integration.
+    *   **HTTPS (TLS 1.3 / 1.2):** Native Windows SChannel SSPI integration by default (`tpSchannel`, zero external TLS dependencies, Windows CNG certificate store integration) with an optional OpenSSL 3.x (`tpOpenSSL`) engine loaded dynamically on demand from file-based PEM certificates (`certs\server.crt` / `server.key`) and ALPN negotiation.
     *   **WebSocket (`ws://` and `wss://`):** Fully asynchronous RFC 6455 implementation with framing, ping/pong heartbeats, fragmentation support, and custom route handlers.
     *   **HTTP/3 over QUIC (UDP):** Next-gen HTTP/3 engine powered by Microsoft `msquic.dll` and QPACK header compression. Seamless `Alt-Svc` header advertisement for automatic browser upgrades.
     *   **WebTransport over HTTP/3 (RFC 9220):** Bidirectional transport over QUIC, supporting unidirectional and bidirectional streams, datagrams (RFC 9297), and dedicated CONNECT session multiplexing.
 *   **Flexible Protocol Operating Modes:**
     *   **Dual-Stack Mode (`-mode:dual`):** Simultaneous listening on plaintext HTTP (default: `8080`) and encrypted HTTPS (default: `8443`) within a unified IOCP completion engine. Supports optional automatic `301 Moved Permanently` redirects (`-redirect`).
-    *   **HTTP-Only Mode (`-mode:http`):** Operates without any SSL/TLS certificates or SChannel overhead. Ideal for internal microservices, proxies, or reverse-proxy backends.
-    *   **HTTPS-Only Mode (`-mode:https`):** Purely encrypted TLS 1.3/1.2 SChannel on port `8443` + HTTP/3 (UDP `8443`). Plaintext HTTP requests are rejected with `400 Bad Request`.
+    *   **HTTP-Only Mode (`-mode:http`):** Operates without any SSL/TLS certificates or TLS engine overhead. Ideal for internal microservices, proxies, or reverse-proxy backends.
+    *   **HTTPS-Only Mode (`-mode:https`):** Purely encrypted TLS 1.3/1.2 (`SChannel` or `OpenSSL 3.x` when `tpOpenSSL` is active) on port `8443` + HTTP/3 (UDP `8443`). Plaintext HTTP requests are rejected with `400 Bad Request`.
 *   **Persistent Connections (Keep-Alive):**
     *   Full HTTP/1.1 Keep-Alive pipelining with zero-allocation buffer reuse.
     *   Configurable idle-timeout sweeper in a dedicated monitor thread.
 *   **Enterprise Security & Web Application Firewall (WAF):**
     *   **Mutual TLS (mTLS) & Zero-Trust Client Authentication:**
-        *   Full two-way cryptographic verification across both HTTPS (TCP / SChannel) and HTTP/3 (QUIC / MsQuic).
+        *   Full two-way cryptographic verification across both HTTPS (TCP: SChannel and OpenSSL 3.x) and HTTP/3 (QUIC / MsQuic).
         *   Flexible enforcement policies: Required client certificate, optional client certificate, and disabled.
         *   Deep X.509 v3 client identity extraction: Common Name (CN), Subject, Issuer, Serial Number, validity dates, SHA-256 thumbprint, and Subject Alternative Names (SAN).
         *   Reverse-proxy identity propagation compatible with standard conventions (`X-Forwarded-Tls-Client-Cert-Info`).
@@ -46,9 +46,11 @@ It serves as a high-performance foundation for REST APIs, real-time WebSocket co
 *   **Architecture:** 64-bit only (Win64).
 *   **Delphi:** Version 10.4 Sydney, 11 Alexandria, 12 Athens (or newer) - 64-bit Windows compiler.
 *   **Operating System:** 64-bit Windows 10 / 11, Windows Server 2019 / 2022.
-*   **Native 64-bit Binaries (Included in repository):**
-    *   `msquic.dll` (Microsoft MsQuic x64 with SChannel TLS support).
-    *   `ls-qpack.dll` (LiteSpeed QPACK x64 header compression).
+*   **Native 64-bit Binaries (Included / Self-Compiled):**
+    *   `msquic.dll` (Microsoft MsQuic x64 with SChannel TLS support — used for HTTP/3 & WebTransport in default `tpSchannel` mode).
+    *   `msquicSSL.dll` (Microsoft MsQuic x64 built with OpenSSL 3.5 — used for HTTP/3 & WebTransport when `tpOpenSSL` is active, without SChannel).
+    *   `ls-qpack.dll` (LiteSpeed QPACK x64 header compression — for HTTP/3 & WebTransport).
+    *   `libcrypto-3-x64.dll` & `libssl-3-x64.dll` (OpenSSL 3.5 x64 — optional, dynamically loaded when `TlsProvider = tpOpenSSL`, `-tls:tpOpenSSL`, or `GHTTPS_TLS_PROVIDER=tpOpenSSL` is selected).
 
 ---
 
@@ -62,12 +64,64 @@ The Delphi projects (`.dproj`) and compilation search paths (`<DCC_UnitSearchPat
 
 ---
 
-## Native Dependencies: msquic.dll & ls-qpack.dll
+### Unified Logging (`GLogger`) — Switching & Adding Loggers
 
-HTTP/3 and WebTransport require two 64-bit native dynamic link libraries placed alongside your compiled `.exe`:
+All projects use `src\GLogger.pas` (`GLog` / `Logger`) configured via `src\GLogger.inc`.
 
-### 1. `msquic.dll` (Microsoft MsQuic)
-High-performance IETF QUIC transport protocol implementation by Microsoft.
+**1. Switching Logger in `src\GLogger.inc`:**
+
+Built-in async UTF-8 logger (default):
+```pascal
+{$IFNDEF GLOGGER_OVERRIDE}
+  {$DEFINE GLOGGER_BACKEND_FAST}
+{$ENDIF}
+```
+`Quick.Logger` (or copy `src\GLoggerQUICKLOGGER.inc` to `src\GLogger.inc`):
+```pascal
+{$IFNDEF GLOGGER_OVERRIDE}
+  {$DEFINE GLOGGER_BACKEND_QUICKLOGGER}
+{$ENDIF}
+```
+Custom logger (`IGLogSink`):
+```pascal
+{$IFNDEF GLOGGER_OVERRIDE}
+  {$DEFINE GLOGGER_BACKEND_CUSTOM}
+{$ENDIF}
+```
+Disabled logger:
+```pascal
+{$IFNDEF GLOGGER_OVERRIDE}
+  {$DEFINE GLOGGER_DISABLED}
+{$ENDIF}
+```
+
+**2. Adding a Third-Party Logger (Method A — `IGLogSink`):**
+1.  Set `{$DEFINE GLOGGER_BACKEND_CUSTOM}` in `src\GLogger.inc`.
+2.  Implement `IGLogSink`:
+    ```pascal
+    type
+      TMyCustomSink = class(TInterfacedObject, IGLogSink)
+      public
+        procedure WriteLog(ALevel: TGLogLevel; const AMsg: string);
+        procedure Flush;
+      end;
+    ```
+3.  Register at startup:
+    ```pascal
+    GLog.SetCustomSink(TMyCustomSink.Create);
+    GLog.Configure(Cfg);
+    ```
+
+---
+
+## Native Dependencies: msquic.dll, msquicSSL.dll, ls-qpack.dll & OpenSSL 3.x
+
+HTTP/3 and WebTransport require `ls-qpack.dll` plus the MsQuic library matching your active TLS provider:
+- **`tpSchannel` (default):** uses `msquic.dll` (SChannel TLS) and certificates from the Windows Certificate Store (`LocalMachine\GHttpsIOCPSvr`).
+- **`tpOpenSSL` (optional):** uses `msquicSSL.dll`, `libcrypto-3-x64.dll`, and `libssl-3-x64.dll` placed alongside your compiled `.exe`, together with file-based PEM certificates (`certs\server.crt` and `certs\server.key`). Selection between `msquic.dll` and `msquicSSL.dll` is automatic in `Http3DelphiV3\Quic.Server.pas` (`TQuicServer.Start`).
+
+### 1. `msquic.dll` (Microsoft MsQuic — SChannel Mode `tpSchannel`)
+High-performance IETF QUIC transport protocol implementation by Microsoft compiled with Windows SChannel (`-DQUIC_TLS_LIB=schannel`).
 
 *   **Download Pre-built Binaries:**
     Official GitHub releases: [github.com/microsoft/msquic/releases](https://github.com/microsoft/msquic/releases)  
@@ -89,7 +143,28 @@ High-performance IETF QUIC transport protocol implementation by Microsoft.
     cmake --build build_perf --config Release --target msquic
     ```
     *Output binary:* `build_perf\bin\Release\msquic.dll`  
-    *(Note: `GHttpsIOCPSvr` uses Windows SChannel TLS via `-DQUIC_TLS_LIB=schannel`, avoiding external OpenSSL dependencies. MsQuic 2.4+ / 2.7.0 requires `QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT` for SChannel, handled automatically by `Http3DelphiV3\MsQuic.Certificate.pas`).*
+    *(Note: In `tpSchannel` mode, `Http3DelphiV3\MsQuic.Certificate.pas` loads credentials via `QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT` from the Windows Certificate Store).*
+
+### 1b. `msquicSSL.dll` (Microsoft MsQuic — OpenSSL 3.5 Mode `tpOpenSSL`)
+Dedicated OpenSSL-backed MsQuic binary (`-DQUIC_TLS_LIB=openssl`) used automatically when `tpOpenSSL` is active (`-tls:tpOpenSSL`, `GHTTPS_TLS_PROVIDER=tpOpenSSL`, or `Server.TlsProvider := tpOpenSSL`). It links dynamically against `libssl-3-x64.dll` and `libcrypto-3-x64.dll` and loads `certs\server.crt` / `certs\server.key` directly via `QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE` with zero SChannel or Windows Certificate Store usage.
+
+*   **Building `msquicSSL.dll` from Local Repository Sources (against OpenSSL 3.5 DLLs):**
+    1. Build OpenSSL 3.5 (`libcrypto-3-x64.dll` & `libssl-3-x64.dll`) as shown in Section 3 below, and generate MSVC import libraries (`libcrypto.lib` and `libssl.lib`) from the DLL exports (`dumpbin /EXPORTS` + `lib /MACHINE:X64 /DEF:...`).
+    2. Configure and build `msquic` with external OpenSSL 3.5:
+       ```powershell
+       cd http3_src\sources\msquic_full
+       cmake -B build_openssl -G "Visual Studio 17 2022" -A x64 `
+         -DQUIC_TLS_LIB=openssl `
+         -DQUIC_USE_EXTERNAL_OPENSSL=ON `
+         -DQUIC_OPENSSL_INCLUDE_DIR=<merged_openssl_include_dir> `
+         -DQUIC_OPENSSL_LIB_DIR=<openssl_import_libs_dir> `
+         -DQUIC_BUILD_SHARED=ON -DQUIC_ENABLE_LOGGING=OFF `
+         -DQUIC_BUILD_TEST=OFF -DQUIC_BUILD_TOOLS=OFF -DQUIC_BUILD_PERF=OFF
+       # Important: replace /DEPENDENTLOADFLAG:0x800 with /DEPENDENTLOADFLAG:0xA00 in build_openssl\src\bin\msquic.vcxproj
+       # so msquicSSL.dll can load libssl-3-x64.dll and libcrypto-3-x64.dll from the executable directory.
+       cmake --build build_openssl --config Release --target msquic
+       ```
+    3. Copy the resulting `http3_src\sources\msquic_full\build_openssl\bin\Release\msquic.dll` as **`msquicSSL.dll`** alongside `libssl-3-x64.dll`, `libcrypto-3-x64.dll`, `msquic.dll`, and `ls-qpack.dll` in your target `.exe` output directory.
 
 ### 2. `ls-qpack.dll` (LiteSpeed QPACK v2.7.0)
 High-efficiency QPACK header compression (RFC 9204) for HTTP/3 streams.
@@ -108,8 +183,43 @@ High-efficiency QPACK header compression (RFC 9204) for HTTP/3 streams.
     *Output binary:* `build\Release\ls-qpack.dll`  
     *(Note: The `-DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=ON` flag is required on Windows so that CMake exports all C functions into the DLL without modifying source headers).*
 
+### 3. `libcrypto-3-x64.dll` & `libssl-3-x64.dll` (OpenSSL 3.5 — Optional `tpOpenSSL` TLS Engine)
+Self-compiled 64-bit OpenSSL 3.5 shared libraries used when `tpOpenSSL` is selected instead of the default Windows SChannel engine (`tpSchannel`). No external MSYS2/GCC runtime DLLs are required at runtime when built with `-static-libgcc` (`mingw64`) or MSVC `/MT`.
+
+*   **Method A — Building from Local Repository Sources via MSYS2 MinGW-w64 + NASM (Recommended):**  
+    *Requirements:* MSYS2 (`mingw-w64-x86_64-gcc`, `make`, `perl`), NASM (`>= 2.15`).
+    ```powershell
+    & "C:\msys64\usr\bin\bash.exe" -lc '
+      set -e
+      export PATH="/mingw64/bin:/usr/bin:/c/Program Files/nasm-2.16.01:$PATH"
+      cd http3_src/sources/msquic_full/submodules/openssl
+      mkdir -p build_mingw64 && cd build_mingw64
+      perl ../Configure mingw64 shared no-tests no-docs
+      make -j$(nproc) build_libs
+    '
+    ```
+    *Output binaries:*
+    *   `http3_src\sources\msquic_full\submodules\openssl\build_mingw64\libcrypto-3-x64.dll`
+    *   `http3_src\sources\msquic_full\submodules\openssl\build_mingw64\libssl-3-x64.dll`
+
+*   **Method B — Building from Local or Upstream Sources via Visual Studio 2022 (`VC-WIN64A`):**  
+    *Requirements:* Visual Studio 2022 (x64 Native Tools Command Prompt / `vcvars64.bat`), Strawberry Perl, NASM.
+    ```bat
+    git clone --depth 1 -b openssl-3.5 https://github.com/openssl/openssl.git
+    cd openssl
+    call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+    perl Configure VC-WIN64A shared no-tests no-docs no-makedepend
+    nmake build_libs
+    ```
+    *Output binaries:* `libcrypto-3-x64.dll` and `libssl-3-x64.dll` in the OpenSSL build root directory.
+
+*   **Activating OpenSSL at Runtime (`tpOpenSSL`):**
+    *   Programmatically before `Server.Start`: `Server.TlsProvider := tpOpenSSL;` (with explicit `Server.TlsCertFile` / `Server.TlsKeyFile` / `Server.TlsKeyPassword`, or automatic file-only discovery of `<ExeDir>\certs\server.crt` and `<ExeDir>\certs\server.key`). In `tpOpenSSL` mode, **Windows Certificate Stores and SChannel are never used** (HTTP/3 uses `msquicSSL.dll` with `QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE`).
+    *   Via CLI switch (supported across all servers, demos, and tools in the repository): `-tls:tpOpenSSL` (or `--tls tpOpenSSL` / `--tpOpenSSL`), optionally paired with `--cert <path>` and `--key <path>`.
+    *   Via environment variable: `set GHTTPS_TLS_PROVIDER=tpOpenSSL` (PowerShell: `$env:GHTTPS_TLS_PROVIDER="tpOpenSSL"`), and optionally `GHTTPS_TLS_CERT_FILE` / `GHTTPS_TLS_KEY_FILE`.
+
 ### Deployment Requirement
-Both `msquic.dll` and `ls-qpack.dll` must be present in the same directory as the compiled server binary (e.g. `Win64\Debug\` or `Win64\Release\`).
+`msquic.dll` (for `tpSchannel`) and `ls-qpack.dll` must be present in the same directory as the compiled server binary (e.g. `Win64\Debug\` or `Win64\Release\`). When using `tpOpenSSL`, also place the self-compiled `msquicSSL.dll`, `libcrypto-3-x64.dll`, and `libssl-3-x64.dll` in the executable directory and provide `certs\server.crt` + `certs\server.key` (or pass explicit `--cert` / `--key` paths).
 
 ---
 
@@ -125,28 +235,32 @@ Browser WebTransport implementations (Google Chrome, Microsoft Edge) strictly en
 *   **Validity Period**: **Maximum 14 days** (2 weeks).
 *   **Hash**: SHA-256 fingerprint verified by the client via `/api/certificate-hash`.
 
-To generate a W3C-compliant certificate:
+To generate a W3C-compliant certificate (and export `certs\server.crt` / `server.key` for `tpOpenSSL` across all build directories):
 ```powershell
-# Run PowerShell as Administrator
+# For Windows SChannel (Run PowerShell as Administrator)
 .\gen_w3c_wt_cert.ps1
+
+# For OpenSSL file-only mode (exports server.crt / server.key to certs\ directories)
+.\gen_w3c_wt_cert.ps1 -ServerIp 127.0.0.1 -TlsProvider tpOpenSSL
 ```
 *(Enables WebTransport connections in standard Chrome/Edge without any developer flags).*
 
 #### Option B: General HTTPS & HTTP/3 QUIC (API & Benchmark Tools)
-For standard HTTPS (TLS 1.3/1.2 via Windows SChannel) and HTTP/3 QUIC CLI benchmark tools (`aioquic`, `h3bench`, `curl -k`):
-*   **Key Algorithm**: RSA 2048 / SHA-256.
-*   **Validity Period**: 5 years.
+For standard HTTPS (TLS 1.3/1.2 via Windows SChannel or `tpOpenSSL`) and HTTP/3 QUIC CLI benchmark tools (`aioquic`, `h3bench`, `curl -k`):
+*   **Key Algorithm**: ECDSA P-256 (`secp256r1`) / SHA-256.
+*   **Validity Period**: 14 days (W3C WebTransport compliant).
 
-To generate the standard RSA certificate:
+To generate and export the QUIC/HTTPS certificate:
 ```powershell
-# Run PowerShell as Administrator
+# Run PowerShell as Administrator (add -TlsProvider tpOpenSSL to populate test_certs\ and certs\)
 .\gen_quic_cert.ps1
 ```
 *(For GMcpSvr MCP server instance, use `.\gen_quic_cert_mcp.ps1`).*
 
 *   **Certificate Storage & Key Security:**
-    *   **Certificate Store:** The certificate is installed into the dedicated Windows machine store: `Cert:\LocalMachine\GHttpsIOCPSvr`.
-    *   **Private Key Permissions (CNG):** Both scripts configure Access Control Lists (ACLs) on the CNG private key file in `%ProgramData%\Microsoft\Crypto\Keys\` granting Read access to service accounts and the `Users` group (SID `S-1-1-0`).
+    *   **Windows Certificate Store (`tpSchannel`):** The certificate is installed into `Cert:\LocalMachine\GHttpsIOCPSvr`.
+    *   **PEM Files (`tpOpenSSL`):** `server.crt` and `server.key` are exported to `certs\` directories alongside the compiled `.exe` files; `tpOpenSSL` reads only these PEM files.
+    *   **Private Key Permissions (CNG):** Both scripts remove `Everyone` (`S-1-1-0`) and configure restricted `Read` ACLs on the CNG private key file in `%ProgramData%\Microsoft\Crypto\Keys\` exclusively for `SYSTEM` (`S-1-5-18`), `Administrators` (`S-1-5-32-544`), and the installing user.
 
 #### Option C: Mutual TLS (mTLS) Test Certificates
 To generate test CA, server, and client certificates for mTLS verification in `test_certs\`:
@@ -155,10 +269,13 @@ To generate test CA, server, and client certificates for mTLS verification in `t
 ```
 
 #### Remove / Clean Certificates:
-To remove all generated test certificates from Windows Certificate Stores:
+To remove generated test certificates from Windows Certificate Stores (and optionally clean `certs\` PEM files for `tpOpenSSL`):
 ```powershell
-# Run PowerShell as Administrator
+# Windows Certificate Stores (Run PowerShell as Administrator)
 .\remove_certs.ps1
+
+# Also remove exported PEM/CER files in certs\ directories
+.\remove_certs.ps1 -TlsProvider tpOpenSSL -CleanPemFiles
 ```
 *(Note: In `-mode:http`, no certificates are needed).*
 
@@ -166,7 +283,7 @@ To remove all generated test certificates from Windows Certificate Stores:
 
 ### 2. Build & Launch
 
-Open the project group `GHttpsIOCPSvrGroup.groupproj` in RAD Studio / Delphi:
+Open the server project in RAD Studio / Delphi:
 *   `GHttpsIOCPSvrWebTransport.dpr` — Complete multi-protocol server (HTTP/1.1, HTTPS, WebSocket, HTTP/3, WebTransport).
 *   `GHttpsIOCPSvrWebSocket.dpr` — HTTP/1.1, HTTPS, WebSocket, HTTP/3.
 *   `GHttpsIOCPSvr.dpr` — Core HTTP/1.1, HTTPS, HTTP/3.
@@ -190,6 +307,9 @@ GHttpsIOCPSvrWebTransport.exe -mode:dual -redirect
 
 # Maximum performance benchmark mode (Disable logging)
 GHttpsIOCPSvrWebTransport.exe -mode:dual -nolog
+
+# Use self-compiled OpenSSL 3.x engine (tpOpenSSL) instead of default SChannel (tpSchannel)
+GHttpsIOCPSvrWebTransport.exe -mode:dual -tls:tpOpenSSL
 
 # View CLI Help
 GHttpsIOCPSvrWebTransport.exe -help
@@ -229,7 +349,6 @@ begin
   );
   try
     Server.EnableHttp3 := True;
-    Server.EnableWebTransport := True;
     Server.EnableKeepAlive := True;
 
     Server.Start;
@@ -267,37 +386,60 @@ Server.RegisterEndpointProc('/api/status', hmGET,
 
 ### 3. Registering WebSockets (`ws://` & `wss://`)
 ```pascal
-Server.RegisterWebSocketRoute('/chat', True);
-
-Server.OnWebSocketFrame := procedure(AServer: TObject; ASession: TWebSocketSession; const AFrame: TWebSocketFrame)
-begin
-  if AFrame.OpCode = wsOpText then
+Server.RegisterWebSocketRoute('/chat',
+  procedure(AServer: TGHttpsServerIOCP; Session: TWebSocketSession; const MessageText: string; Opcode: TWebSocketOpcode)
   begin
-    var Msg := TEncoding.UTF8.GetString(AFrame.Payload);
-    ASession.QueueSendTextFrame('Echo: ' + Msg);
-    Server.TriggerWebSocketWrite(ASession);
-  end;
-end;
+    if Opcode = wsOpText then
+    begin
+      Session.SendText('Echo: ' + MessageText);
+      AServer.TriggerWebSocketWrite(Session);
+    end;
+  end
+);
 ```
 
 ---
 
 ### 4. Registering WebTransport Routes (HTTP/3 QUIC)
 ```pascal
-Server.RegisterWebTransportRoute('/live-transport',
-  procedure(ASession: TWebTransportSession)
-  begin
-    Writeln('WebTransport session opened: ' + IntToStr(ASession.SessionId));
-  end,
-  procedure(ASession: TWebTransportSession; AStream: TWebTransportStream; const AData: TBytes)
-  begin
-    AStream.Send(AData);
-  end,
-  procedure(ASession: TWebTransportSession; const ADatagram: TBytes)
-  begin
-    ASession.SendDatagram(ADatagram);
-  end
-);
+var
+  OnSessionReady: TWebTransportSessionProc;
+  OnStreamData: TWebTransportStreamProc;
+  OnDatagram: TWebTransportDatagramProc;
+  OnSessionClosed: TWebTransportClosedProc;
+begin
+  OnSessionReady :=
+    procedure(Session: PWTSessionContext)
+    begin
+      Writeln('WebTransport session opened: ' + UIntToStr(Session.SessionId));
+    end;
+
+  OnStreamData :=
+    procedure(Session: PWTSessionContext; Stream: HQUIC; const Data: TBytes)
+    begin
+      Session.SendOnStream(Stream, Data);
+    end;
+
+  OnDatagram :=
+    procedure(Session: PWTSessionContext; const Data: TBytes)
+    begin
+      Session.SendDatagram(Data);
+    end;
+
+  OnSessionClosed :=
+    procedure(SessionId: TWTSessionId)
+    begin
+      Writeln('WebTransport session closed: ' + UIntToStr(SessionId));
+    end;
+
+  Server.RegisterWebTransportRoute(
+    '/live-transport',
+    OnSessionReady,
+    OnStreamData,
+    OnDatagram,
+    OnSessionClosed
+  );
+end;
 ```
 
 ---

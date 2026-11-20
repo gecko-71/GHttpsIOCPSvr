@@ -199,8 +199,17 @@ begin
   Writeln('============================================================');
   Writeln('  GHttpsIOCPSvr mTLS Delphi Client Demonstration Suite');
   Writeln('  Target: https://', ServerHost, ':', ServerPort);
+  Writeln('  TLS Provider: ', TlsProviderToString(GetConfiguredTlsProvider(tpSchannel)));
   Writeln('============================================================');
   Writeln;
+
+  if GetConfiguredTlsProvider(tpSchannel) = tpSchannel then
+  begin
+    EnsurePfxInStore(TPath.Combine(CertsDir, 'client_valid.pfx'), '1234');
+    EnsurePfxInStore(TPath.Combine(CertsDir, 'client_untrusted.pfx'), '1234');
+    EnsurePfxInStore(TPath.Combine(CertsDir, 'client_expired.pfx'), '1234');
+    EnsurePfxInStore(TPath.Combine(CertsDir, 'client_pinned.pfx'), '1234');
+  end;
 
   RunScenarioValidCert;
   RunScenarioNoCert;
@@ -256,47 +265,57 @@ begin
   until False;
 end;
 
+var
+  ArgIdx: Integer;
+  PosIdx: Integer;
+  RunAllFlag: Boolean;
+  CurArg: string;
+  LowArg: string;
+  FallbackDir: string;
 begin
   try
-    for var I := 1 to ParamCount do
+    RunAllFlag := False;
+    PosIdx := 0;
+    ArgIdx := 1;
+    while ArgIdx <= ParamCount do
     begin
-      if SameText(ParamStr(I), '--all') or SameText(ParamStr(I), '-a') or SameText(ParamStr(I), 'A') then
+      CurArg := ParamStr(ArgIdx);
+      LowArg := LowerCase(CurArg);
+      if SameText(CurArg, '--all') or SameText(CurArg, '-a') or SameText(CurArg, 'A') then
+        RunAllFlag := True
+      else if (LowArg = '-tls') or (LowArg = '--tls') then
+        Inc(ArgIdx)
+      else if (Copy(LowArg, 1, 1) = '-') then
       begin
-        ServerHost := GetEnvironmentVariable('SERVER_HOST');
-        if ServerHost = '' then
-          ServerHost := GetPrimaryIPv4Address;
-        CertsDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'cercts_client');
-        if not DirectoryExists(CertsDir) then
-        begin
-          var FallbackDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs_client');
-          if DirectoryExists(FallbackDir) then
-            CertsDir := FallbackDir;
-        end;
-        RunAllScenarios;
-        Exit;
+      end
+      else
+      begin
+        Inc(PosIdx);
+        if (PosIdx = 1) and (ServerHost = '') then
+          ServerHost := CurArg
+        else if PosIdx = 2 then
+          ServerPort := StrToIntDef(CurArg, 8453);
       end;
+      Inc(ArgIdx);
     end;
 
-    ServerHost := GetEnvironmentVariable('SERVER_HOST');
+    if Trim(GetEnvironmentVariable('SERVER_HOST')) <> '' then
+      ServerHost := Trim(GetEnvironmentVariable('SERVER_HOST'));
     if ServerHost = '' then
-    begin
-      if ParamCount >= 1 then
-        ServerHost := ParamStr(1)
-      else
-        ServerHost := GetPrimaryIPv4Address;
-    end;
-    if ParamCount >= 2 then
-      ServerPort := StrToIntDef(ParamStr(2), 8453);
+      ServerHost := GetPrimaryIPv4Address;
 
     CertsDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'cercts_client');
     if not DirectoryExists(CertsDir) then
     begin
-      var FallbackDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs_client');
+      FallbackDir := TPath.Combine(ExtractFilePath(ParamStr(0)), 'certs_client');
       if DirectoryExists(FallbackDir) then
         CertsDir := FallbackDir;
     end;
 
-    RunInteractiveMenu;
+    if RunAllFlag then
+      RunAllScenarios
+    else
+      RunInteractiveMenu;
   except
     on E: Exception do
     begin

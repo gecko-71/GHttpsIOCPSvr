@@ -20,7 +20,7 @@
   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   SOFTWARE.
-}
+  }
 
 program GHttpsIOCPSvrWebSocket;
 
@@ -29,10 +29,10 @@ program GHttpsIOCPSvrWebSocket;
 {$R *.res}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger in 'src\GLogger.pas',
   Winapi.Windows,
   System.SysUtils,
   System.Generics.Collections,
@@ -72,12 +72,14 @@ uses
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [mmetUnexpectedMemoryLeakDetail,
                             mmetUnexpectedMemoryLeakSummary,
                             mmetDebugBlockDoubleFree,
                             mmetDebugBlockReallocOfFreedBlock];
+{$IFEND}
 end;
 
 procedure PrepareTestFile(const ASubDir, AFileName: string; AFileSizeInBytes: Int64);
@@ -193,6 +195,7 @@ begin
   Writeln('  -nolog                        Disable all logging (maximum performance)');
   Writeln('  -certstore:<name>             Windows Certificate Store name (default: GHttpsIOCPSvr)');
   Writeln('  -subject:<name>               TLS Certificate Subject name (default: ' + GetPrimaryIPv4Address + ')');
+  Writeln('  -tls:tpSchannel | tpOpenSSL   Select TLS engine provider (default: tpSchannel)');
   Writeln('  -help / -h / -?               Display this help message');
   Writeln('----------------------------------------------------------------');
   Writeln('SERVER CONTROL:');
@@ -205,6 +208,7 @@ const
    DOWNLAD_FILE = 'largefile_10mb.bin';
 
 begin
+  SetInOutRes(0);
   if FindCmdLineSwitch('help', True) or FindCmdLineSwitch('h', True) or
      FindCmdLineSwitch('?', True) or FindCmdLineSwitch('-help', True) then
   begin
@@ -219,28 +223,7 @@ begin
                            FindCmdLineSwitch('disable-log', True) or
                            FindCmdLineSwitch('no-log', True);
 
-    Logger.WaitForFlushBeforeExit := 60;
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var AFileName := '.\Log';
-    if (not LoggingDisabled) and (not TDirectory.Exists(AFileName)) then
-       TDirectory.CreateDirectory(AFileName);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := AFileName + '\Logger.log';
-      DailyRotate := True;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      Enabled := not LoggingDisabled;
-    end;
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := not LoggingDisabled;
-    end;
+    GLog.InitDefault('.\Log\Logger.log', not LoggingDisabled, True, True, 50, False, 60);
 
     var CertStoreName: string := 'GHttpsIOCPSvr';
     var SubjectNameParam: string := GetPrimaryIPv4Address;

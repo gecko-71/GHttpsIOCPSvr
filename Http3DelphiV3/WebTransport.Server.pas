@@ -201,7 +201,7 @@ uses
 
   MsQuic.Errors,
 
-  Quick.Logger;
+  GLogger;
 
 
 

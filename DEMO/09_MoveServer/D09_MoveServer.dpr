@@ -29,10 +29,10 @@ program D09_MoveServer;
 {$R *.res}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger,
   System.SysUtils,
   System.Classes,
   System.Generics.Collections,
@@ -73,12 +73,14 @@ uses
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [mmetUnexpectedMemoryLeakDetail,
                             mmetUnexpectedMemoryLeakSummary,
                             mmetDebugBlockDoubleFree,
                             mmetDebugBlockReallocOfFreedBlock];
+{$IFEND}
 end;
 
 const
@@ -730,9 +732,13 @@ end;
 function ResolveSourceFilePath: string;
 var
   ExeDir, CandidateFile: string;
+  I: Integer;
 begin
-  if (ParamCount >= 1) and FileExists(ParamStr(1)) then
-    Exit(ParamStr(1));
+  for I := 1 to ParamCount do
+  begin
+    if (not StartsStr('-', ParamStr(I))) and (not StartsStr('/', ParamStr(I))) and FileExists(ParamStr(I)) then
+      Exit(ParamStr(I));
+  end;
 
   ExeDir := ExtractFilePath(ParamStr(0));
 
@@ -796,28 +802,7 @@ end;
 begin
   ConfigureFastMM;
   try
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var LogDir := '.\Log';
-    if not TDirectory.Exists(LogDir) then
-      TDirectory.CreateDirectory(LogDir);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := LogDir + '\Logger.log';
-      DailyRotate := True;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      Enabled := True;
-    end;
-
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := True;
-    end;
+    GLog.InitDefault('.\Log\Logger.log', True, True, True, 50, False, 10);
 
     Logger.Info('=====================================================');
     Logger.Info('  DEMO 09: Universal HLS Live Server (VLC & Web)');

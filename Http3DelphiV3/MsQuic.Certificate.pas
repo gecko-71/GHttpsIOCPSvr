@@ -67,8 +67,27 @@ type
     FPkcs12: QUIC_CERTIFICATE_PKCS12;
     FPfxBlob: PByte;
     FPfxBlobSize: Cardinal;
+    FCertFile: QUIC_CERTIFICATE_FILE;
+    FCertFileAnsi: UTF8String;
+    FKeyFileAnsi: UTF8String;
+    FEphemeralStore: HCERTSTORE;
+    FEphemeralCertCtx: PCCERT_CONTEXT;
     procedure Clear;
     function HexToBytes(const Hex: string): TBytes;
+    function TryLoadCredentialWithMtls(
+      AConfig: TMsQuicConfiguration;
+      ACredType: QUIC_CREDENTIAL_TYPE;
+      ACertPtr: Pointer;
+      AmTLSRequired: Boolean;
+      AmTLSOptional: Boolean
+    ): Boolean;
+    function LoadServerCertificateFromFiles(
+      AConfig: TMsQuicConfiguration;
+      const ACertFile: string;
+      const AKeyFile: string;
+      const AmTLSRequired: Boolean = False;
+      const AmTLSOptional: Boolean = False
+    ): Boolean;
   public
     constructor Create;
     destructor Destroy; override;
@@ -80,7 +99,9 @@ type
       ServerCertStore: HCERTSTORE = nil;
       const CertSubjectName: string = '';
       const AmTLSRequired: Boolean = False;
-      const AmTLSOptional: Boolean = False
+      const AmTLSOptional: Boolean = False;
+      const ACertFile: string = '';
+      const AKeyFile: string = ''
     ): Boolean;
 
   end;
@@ -133,6 +154,21 @@ function PFXExportCertStoreEx(
 
 implementation
 
+uses
+  GOpenSslApi, GOpenSslTlsEngine;
+
+const
+  CERT_FIND_SHA1_HASH = $00010000;
+  CERT_FIND_SUBJECT_STR_W = $00080007;
+  CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG = $00010000;
+  CRYPT_ACQUIRE_SILENT_FLAG = $00000040;
+  CERT_NCRYPT_KEY_SPEC = $FFFFFFFF;
+  CRYPT_EXPORTABLE_FLAG = $00000001;
+
+type
+  TNCryptDeleteKeyProc = function(hKey: ULONG_PTR; dwFlags: DWORD): LongInt; stdcall;
+  TNCryptFreeObjectProc = function(hObject: ULONG_PTR): LongInt; stdcall;
+
 function TMsQuicCertificate.HexToBytes(const Hex: string): TBytes;
 var
   I: Integer;
@@ -161,8 +197,13 @@ begin
   inherited Create;
   FPfxBlob := nil;
   FPfxBlobSize := 0;
+  FCertFileAnsi := '';
+  FKeyFileAnsi := '';
+  FEphemeralStore := nil;
+  FEphemeralCertCtx := nil;
   FillChar(FCredConfig, SizeOf(FCredConfig), 0);
   FillChar(FPkcs12, SizeOf(FPkcs12), 0);
+  FillChar(FCertFile, SizeOf(FCertFile), 0);
 end;
 
 destructor TMsQuicCertificate.Destroy;
@@ -172,7 +213,56 @@ begin
 end;
 
 procedure TMsQuicCertificate.Clear;
+var
+  KeyProv: WinApiAdditions.HCRYPTPROV;
+  KeySpec: DWORD;
+  MustFree: BOOL;
+  NCryptLib: HMODULE;
+  DeleteKeyProc: TNCryptDeleteKeyProc;
+  FreeObjProc: TNCryptFreeObjectProc;
+  DelStatus: LongInt;
 begin
+  if FEphemeralCertCtx <> nil then
+  begin
+    KeyProv := 0;
+    KeySpec := 0;
+    MustFree := False;
+    if CryptAcquireCertificatePrivateKey(
+         FEphemeralCertCtx,
+         CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG or CRYPT_ACQUIRE_SILENT_FLAG,
+         nil,
+         KeyProv,
+         KeySpec,
+         MustFree) then
+    begin
+      if KeySpec = CERT_NCRYPT_KEY_SPEC then
+      begin
+        NCryptLib := LoadLibraryW('ncrypt.dll');
+        if NCryptLib <> 0 then
+        begin
+          @DeleteKeyProc := GetProcAddress(NCryptLib, 'NCryptDeleteKey');
+          @FreeObjProc := GetProcAddress(NCryptLib, 'NCryptFreeObject');
+          DelStatus := -1;
+          if Assigned(DeleteKeyProc) then
+            DelStatus := DeleteKeyProc(KeyProv, 0);
+          if (DelStatus <> 0) and MustFree and Assigned(FreeObjProc) then
+            FreeObjProc(KeyProv);
+          FreeLibrary(NCryptLib);
+        end;
+      end
+      else if MustFree then
+        CryptReleaseContext(KeyProv, 0);
+    end;
+    CertFreeCertificateContext(FEphemeralCertCtx);
+    FEphemeralCertCtx := nil;
+  end;
+
+  if FEphemeralStore <> nil then
+  begin
+    CertCloseStore(FEphemeralStore, 0);
+    FEphemeralStore := nil;
+  end;
+
   if FPfxBlob <> nil then
   begin
     if FPfxBlobSize > 0 then
@@ -182,13 +272,66 @@ begin
     FPfxBlobSize := 0;
   end;
 
+  FCertFileAnsi := '';
+  FKeyFileAnsi := '';
   FillChar(FCredConfig, SizeOf(FCredConfig), 0);
   FillChar(FPkcs12, SizeOf(FPkcs12), 0);
+  FillChar(FCertFile, SizeOf(FCertFile), 0);
 end;
 
-const
-  CERT_FIND_SHA1_HASH = $00010000;
-  CERT_FIND_SUBJECT_STR_W = $00080007;
+function TMsQuicCertificate.TryLoadCredentialWithMtls(
+  AConfig: TMsQuicConfiguration;
+  ACredType: QUIC_CREDENTIAL_TYPE;
+  ACertPtr: Pointer;
+  AmTLSRequired: Boolean;
+  AmTLSOptional: Boolean
+): Boolean;
+begin
+  FillChar(FCredConfig, SizeOf(FCredConfig), 0);
+  FCredConfig.Type_ := ACredType;
+  FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
+  if AmTLSRequired or AmTLSOptional then
+    FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
+  FCredConfig.Certificate := ACertPtr;
+  Result := AConfig.LoadCredential(@FCredConfig);
+
+  if (not Result) and (FCredConfig.Flags <> QUIC_CREDENTIAL_FLAG_NONE) then
+  begin
+    FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES or QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION or QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION or QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
+    Result := AConfig.LoadCredential(@FCredConfig);
+  end;
+
+  if (not Result) and (not AmTLSRequired) and AmTLSOptional then
+  begin
+    FillChar(FCredConfig, SizeOf(FCredConfig), 0);
+    FCredConfig.Type_ := ACredType;
+    FCredConfig.Flags := QUIC_CREDENTIAL_FLAG_NONE;
+    FCredConfig.Certificate := ACertPtr;
+    Result := AConfig.LoadCredential(@FCredConfig);
+  end;
+end;
+
+function TMsQuicCertificate.LoadServerCertificateFromFiles(
+  AConfig: TMsQuicConfiguration;
+  const ACertFile: string;
+  const AKeyFile: string;
+  const AmTLSRequired: Boolean;
+  const AmTLSOptional: Boolean
+): Boolean;
+begin
+  Result := False;
+  if (AConfig = nil) or (ACertFile = '') or (AKeyFile = '') then
+    Exit;
+  if (not FileExists(ACertFile)) or (not FileExists(AKeyFile)) then
+    Exit;
+
+  FCertFileAnsi := UTF8String(ACertFile);
+  FKeyFileAnsi := UTF8String(AKeyFile);
+  FCertFile.CertificateFile := PAnsiChar(FCertFileAnsi);
+  FCertFile.PrivateKeyFile := PAnsiChar(FKeyFileAnsi);
+
+  Result := TryLoadCredentialWithMtls(AConfig, QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE, @FCertFile, AmTLSRequired, AmTLSOptional);
+end;
 
 function TMsQuicCertificate.LoadServerCertificate(
   AConfig: TMsQuicConfiguration;
@@ -197,7 +340,9 @@ function TMsQuicCertificate.LoadServerCertificate(
   ServerCertStore: HCERTSTORE;
   const CertSubjectName: string;
   const AmTLSRequired: Boolean;
-  const AmTLSOptional: Boolean
+  const AmTLSOptional: Boolean;
+  const ACertFile: string;
+  const AKeyFile: string
 ): Boolean;
 var
   hStoreToSearch, hTmpStore: HCERTSTORE;
@@ -207,11 +352,27 @@ var
   HashBytes: CRYPT_DATA_BLOB;
   HashData: TBytes;
   FallbackSubject: string;
+  ResolvedCertFile: string;
+  ResolvedKeyFile: string;
 begin
   Clear;
   Result := False;
 
-  if AConfig = nil then Exit;
+  if AConfig = nil then
+    Exit;
+
+  if CertHashHex <> '' then
+    HashData := HexToBytes(CertHashHex);
+
+  if (GetConfiguredTlsProvider(tpSchannel) = tpOpenSSL) or ((ACertFile <> '') and (AKeyFile <> '')) then
+  begin
+    ResolvedCertFile := ACertFile;
+    ResolvedKeyFile := AKeyFile;
+    if not ResolveOpenSslCertAndKeyFiles(StoreName, CertSubjectName, ResolvedCertFile, ResolvedKeyFile) then
+      Exit(False);
+    Result := LoadServerCertificateFromFiles(AConfig, ResolvedCertFile, ResolvedKeyFile, AmTLSRequired, AmTLSOptional);
+    Exit;
+  end;
 
   hStoreToSearch := ServerCertStore;
   MustCloseStore := False;

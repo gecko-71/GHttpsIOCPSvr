@@ -51,6 +51,7 @@ begin
     Writeln('============================================================');
     Writeln('Target Server: https://', ServerHost, ':', ServerPort, EndpointPath);
     Writeln('Client PFX:    ', PfxPath);
+    Writeln('TLS Provider:  ', TlsProviderToString(GetConfiguredTlsProvider(tpSchannel)));
     Writeln('------------------------------------------------------------');
 
     if not FileExists(PfxPath) then

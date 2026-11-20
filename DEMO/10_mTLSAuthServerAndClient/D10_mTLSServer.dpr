@@ -26,10 +26,10 @@ program D10_mTLSServer;
 {$APPTYPE CONSOLE}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger,
   System.SysUtils,
   System.Classes,
   System.IOUtils,
@@ -134,13 +134,7 @@ begin
     CaCertFile := TPath.Combine(ServerCertsDir, 'test_root_ca.crt');
     PinnedThumbprint := LoadPinnedThumbprint(ServerCertsDir);
 
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := True;
-    end;
+    GLog.InitDefault('', True, True);
 
     Logger.Info('============================================================');
     Logger.Info('  GHttpsIOCPSvr DEMO 10: mTLS Mutual Authentication Server');
@@ -167,6 +161,7 @@ begin
     try
       Server.SetSSLShutdownOptions(True, 200);
       Server.EnableHttp3 := False;
+      Server.EnableTLSSessionResumption := False;
       Server.mTLSMode := mTLSModeParam;
 
       if FileExists(CaCertFile) then

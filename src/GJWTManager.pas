@@ -155,7 +155,7 @@ type
 
 implementation
 
-uses Quick.Logger;
+uses GLogger;
 
 { TJWTToken }
 

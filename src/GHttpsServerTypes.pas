@@ -29,12 +29,20 @@ uses
   Winapi.Windows,
   Winapi.WinSock2,
   System.SysUtils,
+  WinApiAdditions,
   GRequest,
   Http3.Request,
   Http3.Response,
   WebTransport.Types,
   WebTransport.Session,
   MsQuic.Types;
+
+type
+  TTlsProvider = WinApiAdditions.TTlsProvider;
+
+const
+  tpSchannel = WinApiAdditions.tpSchannel;
+  tpOpenSSL = WinApiAdditions.tpOpenSSL;
 
 type
   TServerProtocolMode = (

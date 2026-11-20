@@ -6,7 +6,7 @@ uses
   System.SysUtils,
   System.Classes,
   System.Generics.Collections,
-  Quick.Logger,
+  GLogger,
   GRequestBody,
   GRequestTypes,
   GRequestHeaderValidator,

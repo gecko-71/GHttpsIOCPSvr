@@ -5,21 +5,57 @@ param(
   [string]$FarArchive = '',
   [string]$FarExpectedSha256 = '',
   [string]$EditArchive = '',
-  [string]$EditExpectedSha256 = ''
+  [string]$EditExpectedSha256 = '',
+  [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER
 )
 
 $ErrorActionPreference = 'Stop'
 
+$EffectiveTlsProvider = if ([string]::IsNullOrWhiteSpace($TlsProvider)) { 'tpSchannel' } else { $TlsProvider }
+try {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]3072 -bor [Net.SecurityProtocolType]12288
+} catch {
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+}
+
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   if (Test-Path (Join-Path $PSScriptRoot 'ManageUsers.exe')) {
     $InstallDir = $PSScriptRoot
+  } elseif (Test-Path (Join-Path $PSScriptRoot 'Win64\Debug\ManageUsers.exe')) {
+    $InstallDir = Join-Path $PSScriptRoot 'Win64\Debug'
+  } elseif (Test-Path (Join-Path $PSScriptRoot '..\Win64\Debug\ManageUsers.exe')) {
+    $InstallDir = (Resolve-Path (Join-Path $PSScriptRoot '..\Win64\Debug')).Path
   } elseif (Test-Path (Join-Path (Get-Location).Path 'ManageUsers.exe')) {
     $InstallDir = (Get-Location).Path
   } else {
     $InstallDir = $PSScriptRoot
   }
+} elseif (-not [System.IO.Path]::IsPathRooted($InstallDir)) {
+  $InstallDir = Join-Path $PSScriptRoot $InstallDir
 }
 $InstallDir = (Resolve-Path $InstallDir).Path
+
+$OpenSslDllSearchDirs = @(
+  $PSScriptRoot,
+  (Join-Path $PSScriptRoot 'Win64\Debug'),
+  (Join-Path $PSScriptRoot '..\Win64\Debug'),
+  (Join-Path $PSScriptRoot '..\..\Win64\Debug'),
+  (Join-Path $PSScriptRoot '..\..\..\Win64\Debug')
+)
+foreach ($dllName in @('libcrypto-3-x64.dll', 'libssl-3-x64.dll')) {
+  $dstDll = Join-Path $InstallDir $dllName
+  if (-not (Test-Path $dstDll)) {
+    foreach ($srcDir in $OpenSslDllSearchDirs) {
+      if (Test-Path $srcDir) {
+        $candDll = Join-Path $srcDir $dllName
+        if (Test-Path $candDll) {
+          Copy-Item -Path $candDll -Destination $dstDll -Force
+          break
+        }
+      }
+    }
+  }
+}
 
 $ManageExe = Join-Path $InstallDir 'ManageUsers.exe'
 if (-not (Test-Path $ManageExe)) {
@@ -57,10 +93,14 @@ function Get-ArchiveSha256([string]$Path) {
 
 function Invoke-Manage {
   param([string[]]$Arguments)
+  $finalArgs = @($Arguments)
+  if (-not [string]::IsNullOrWhiteSpace($TlsProvider)) {
+    $finalArgs += "-tls:$EffectiveTlsProvider"
+  }
   Push-Location $InstallDir
   try {
-    $output = & $ManageExe @Arguments 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { Stop-Script ("ManageUsers {0} failed: {1}" -f ($Arguments -join ' '), $output.Trim()) }
+    $output = & $ManageExe @finalArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { Stop-Script ("ManageUsers {0} failed: {1}" -f ($finalArgs -join ' '), $output.Trim()) }
     return $output
   } finally {
     Pop-Location

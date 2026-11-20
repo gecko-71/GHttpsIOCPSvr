@@ -65,7 +65,7 @@ implementation
 
 uses
   WebTransport.Server,
-  Quick.Logger;
+  GLogger;
 
 function AllocWTSendContext(ConnCtx: PConnectionContext; Size: Integer): PQuicSendContext;
 var

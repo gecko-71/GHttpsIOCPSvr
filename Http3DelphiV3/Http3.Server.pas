@@ -49,7 +49,7 @@ uses
   WebTransport.Types,
   WebTransport.Server,
   LsQpack.Loader,
-  Quick.Logger,
+  GLogger,
   System.StrUtils,
   GRequest;
 

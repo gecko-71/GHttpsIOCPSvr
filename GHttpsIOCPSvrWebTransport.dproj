@@ -1,4 +1,4 @@
-<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{8F6B7E12-4521-4E15-998A-D913A3172E44}</ProjectGuid>
         <MainSource>GHttpsIOCPSvrWebTransport.dpr</MainSource>
@@ -97,10 +97,13 @@
         <DelphiCompile Include="$(MainSource)">
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
+        <DCCReference Include="src\GLogger.pas"/>
         <DCCReference Include="src\GWebSocket.pas"/>
         <DCCReference Include="src\GHttpsServerIOCP.pas"/>
         <DCCReference Include="src\GHttpsServerTypes.pas"/>
         <DCCReference Include="src\GSchannelTlsManager.pas"/>
+        <DCCReference Include="src\GOpenSslApi.pas"/>
+        <DCCReference Include="src\GOpenSslTlsEngine.pas"/>
         <DCCReference Include="src\GIpSecurityAndCors.pas"/>
         <DCCReference Include="src\GWebSocketBridge.pas"/>
         <DCCReference Include="src\GHttp3WebTransportBridge.pas"/>

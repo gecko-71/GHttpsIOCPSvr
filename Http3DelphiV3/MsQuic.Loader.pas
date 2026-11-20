@@ -32,7 +32,7 @@ interface
 
 uses
   Winapi.Windows, System.SysUtils, System.SyncObjs,
-  Quick.Logger,
+  GLogger,
   MsQuic.Types, MsQuic.ApiTable, MsQuic.Errors;
 
 type

@@ -7,7 +7,7 @@ uses
   System.Classes,
   System.Generics.Collections,
   System.ZLib,
-  Quick.Logger,
+  GLogger,
   GRequestBody,
   GRequestTypes;
 

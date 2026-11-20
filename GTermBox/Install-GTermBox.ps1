@@ -5,6 +5,7 @@ param(
   [string]$Password = '',
   [string]$AssetsDir = '',
   [string]$InstallDir = '',
+  [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER,
   [switch]$SkipFirewall,
   [switch]$SkipSelfTest,
   [switch]$Force
@@ -12,8 +13,25 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$HasExplicitTlsProvider = -not [string]::IsNullOrWhiteSpace($TlsProvider)
+if ([string]::IsNullOrWhiteSpace($TlsProvider)) {
+  $EffectiveTlsProvider = 'tpSchannel'
+} elseif ($TlsProvider -match '(?i)openssl') {
+  $EffectiveTlsProvider = 'tpOpenSSL'
+} else {
+  $EffectiveTlsProvider = 'tpSchannel'
+}
+
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
-  $InstallDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+  $InstallDir = $ScriptDir
+} elseif (-not [System.IO.Path]::IsPathRooted($InstallDir)) {
+  $cwdInstall = Join-Path (Get-Location).Path $InstallDir
+  if (Test-Path $cwdInstall) {
+    $InstallDir = $cwdInstall
+  } else {
+    $InstallDir = Join-Path $ScriptDir $InstallDir
+  }
 }
 $InstallDir = (Resolve-Path $InstallDir).Path
 
@@ -38,8 +56,12 @@ function Invoke-Manage {
   param([string[]]$Arguments)
   Push-Location $InstallDir
   try {
-    $output = & $script:ManageExe @Arguments 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { Stop-Install ("ManageUsers {0} failed: {1}" -f ($Arguments -join ' '), $output.Trim()) }
+    $cmdArgs = @($Arguments)
+    if ($HasExplicitTlsProvider) {
+      $cmdArgs += "-tls:$EffectiveTlsProvider"
+    }
+    $output = & $script:ManageExe @cmdArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { Stop-Install ("ManageUsers {0} failed: {1}" -f ($cmdArgs -join ' '), $output.Trim()) }
     return $output
   } finally {
     Pop-Location
@@ -287,6 +309,39 @@ if (-not (Test-Path $LsQpackDest)) {
 }
 Write-Ok "ls-qpack.dll present in directory"
 
+$CandidateOpenSslDirs = @(
+  $InstallDir,
+  $ScriptDir,
+  (Join-Path $ScriptDir 'Win64\Debug'),
+  (Join-Path $ScriptDir 'Win64\Release'),
+  (Join-Path $ScriptDir '..\Win64\Debug'),
+  (Join-Path $ScriptDir '..\Win64\Release'),
+  (Join-Path $ScriptDir '..\..\Win64\Debug'),
+  (Join-Path $ScriptDir '..\..\Win64\Release'),
+  (Join-Path $ScriptDir '..\..\..\Win64\Debug'),
+  (Join-Path $ScriptDir '..\..\..\Win64\Release'),
+  (Join-Path (Get-Location).Path 'Win64\Debug'),
+  (Join-Path (Get-Location).Path 'Win64\Release')
+)
+foreach ($sslDll in @('libcrypto-3-x64.dll', 'libssl-3-x64.dll')) {
+  $sslDest = Join-Path $InstallDir $sslDll
+  if (-not (Test-Path $sslDest)) {
+    foreach ($candDir in $CandidateOpenSslDirs) {
+      $candSsl = Join-Path $candDir $sslDll
+      if (Test-Path $candSsl) {
+        Copy-Item -Path $candSsl -Destination $sslDest -Force
+        break
+      }
+    }
+  }
+  if ($EffectiveTlsProvider -eq 'tpOpenSSL') {
+    if (-not (Test-Path $sslDest)) {
+      Stop-Install "Missing required OpenSSL library in server directory for tpOpenSSL: $sslDll"
+    }
+    Write-Ok "$sslDll present in directory (tpOpenSSL)"
+  }
+}
+
 $WebDir = Join-Path $InstallDir 'web'
 if (-not (Test-Path (Join-Path $WebDir 'index.html'))) {
   Stop-Install 'Missing web assets in server directory: web\index.html not found'
@@ -345,7 +400,7 @@ Write-Step '[6/9] Generating W3C WebTransport TLS certificate (ECDSA P-256)...'
 $StoreName = 'GHttpsIOCPSvr'
 $genScript = Join-Path $InstallDir 'gen_w3c_wt_cert.ps1'
 if (Test-Path $genScript) {
-  & $genScript -ServerIp $BindIp
+  & $genScript -ServerIp $BindIp -TlsProvider $EffectiveTlsProvider -ExportDir $InstallDir
 } else {
   $detectedIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
@@ -367,6 +422,7 @@ if (Test-Path $genScript) {
   $cert = New-SelfSignedCertificate `
     -DnsName $dnsNames `
     -CertStoreLocation 'Cert:\LocalMachine\My' `
+    -KeyExportPolicy Exportable `
     -KeyAlgorithm ECDSA_nistP256 `
     -HashAlgorithm SHA256 `
     -KeyUsage DigitalSignature `
@@ -429,8 +485,45 @@ try {
   }
 } catch {}
 
+$InstallCertsDir = Join-Path $InstallDir 'certs'
+if (-not (Test-Path $InstallCertsDir)) {
+  New-Item -ItemType Directory -Path $InstallCertsDir -Force | Out-Null
+}
 $cerBytes = $ServerCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
 [System.IO.File]::WriteAllBytes((Join-Path $InstallDir 'localhost.cer'), $cerBytes)
+[System.IO.File]::WriteAllBytes((Join-Path $InstallCertsDir 'localhost.cer'), $cerBytes)
+$srvCrtB64 = [Convert]::ToBase64String($ServerCert.RawData, [Base64FormattingOptions]::InsertLineBreaks)
+$srvCrtPem = "-----BEGIN CERTIFICATE-----`n$srvCrtB64`n-----END CERTIFICATE-----`n"
+[System.IO.File]::WriteAllText((Join-Path $InstallDir 'localhost.crt'), $srvCrtPem, [System.Text.Encoding]::ASCII)
+[System.IO.File]::WriteAllText((Join-Path $InstallDir 'server.crt'), $srvCrtPem, [System.Text.Encoding]::ASCII)
+[System.IO.File]::WriteAllText((Join-Path $InstallCertsDir 'server.crt'), $srvCrtPem, [System.Text.Encoding]::ASCII)
+[System.IO.File]::WriteAllText((Join-Path $InstallCertsDir 'localhost.crt'), $srvCrtPem, [System.Text.Encoding]::ASCII)
+$srvPkcs8 = $null
+$srvEc = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($ServerCert)
+if ($null -ne $srvEc) {
+  if ($srvEc -is [System.Security.Cryptography.ECDsaCng]) {
+    $srvPkcs8 = $srvEc.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+  } else {
+    $srvPkcs8 = $srvEc.ExportPkcs8PrivateKey()
+  }
+} else {
+  $srvRsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($ServerCert)
+  if ($null -ne $srvRsa) {
+    if ($srvRsa -is [System.Security.Cryptography.RSACng]) {
+      $srvPkcs8 = $srvRsa.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+    } else {
+      $srvPkcs8 = $srvRsa.ExportPkcs8PrivateKey()
+    }
+  }
+}
+if ($null -ne $srvPkcs8) {
+  $srvKeyB64 = [Convert]::ToBase64String($srvPkcs8, [Base64FormattingOptions]::InsertLineBreaks)
+  $srvKeyPem = "-----BEGIN PRIVATE KEY-----`n$srvKeyB64`n-----END PRIVATE KEY-----`n"
+  [System.IO.File]::WriteAllText((Join-Path $InstallDir 'localhost.key'), $srvKeyPem, [System.Text.Encoding]::ASCII)
+  [System.IO.File]::WriteAllText((Join-Path $InstallDir 'server.key'), $srvKeyPem, [System.Text.Encoding]::ASCII)
+  [System.IO.File]::WriteAllText((Join-Path $InstallCertsDir 'server.key'), $srvKeyPem, [System.Text.Encoding]::ASCII)
+  [System.IO.File]::WriteAllText((Join-Path $InstallCertsDir 'localhost.key'), $srvKeyPem, [System.Text.Encoding]::ASCII)
+}
 
 $sha256Hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cerBytes)
 $hashHex = [System.BitConverter]::ToString($sha256Hash).Replace('-', '')
@@ -476,6 +569,20 @@ try {
       $pem = "-----BEGIN CERTIFICATE-----`n$b64`n-----END CERTIFICATE-----`n"
       [System.IO.File]::WriteAllText($crtPath, $pem, [System.Text.Encoding]::ASCII)
       [System.IO.File]::WriteAllText((Join-Path $InstallDir "client_keys\$u.crt"), $pem, [System.Text.Encoding]::ASCII)
+      $ccPkcs8 = $null
+      $ccRsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cc)
+      if ($null -ne $ccRsa) {
+        if ($ccRsa -is [System.Security.Cryptography.RSACng]) {
+          $ccPkcs8 = $ccRsa.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+        } else {
+          $ccPkcs8 = $ccRsa.ExportPkcs8PrivateKey()
+        }
+      }
+      if ($null -ne $ccPkcs8) {
+        $ccKeyB64 = [Convert]::ToBase64String($ccPkcs8, [Base64FormattingOptions]::InsertLineBreaks)
+        $ccKeyPem = "-----BEGIN PRIVATE KEY-----`n$ccKeyB64`n-----END PRIVATE KEY-----`n"
+        [System.IO.File]::WriteAllText((Join-Path $InstallDir "client_keys\$u.key"), $ccKeyPem, [System.Text.Encoding]::ASCII)
+      }
       $current = $cc
       Write-Ok "Generated client certificate for $u ($($cc.Thumbprint)), installed in CurrentUser\My"
     }
@@ -502,11 +609,13 @@ if (-not $SkipFirewall) {
   }
   Write-Ok "Firewall rules for TCP/UDP $Port on $BindIp"
 }
-$StartCmd = "@echo off`r`ncd /d `"%~dp0`"`r`nGTermBoxServer.exe --bind $BindIp --port $Port %*`r`n"
+$TlsCmdSuffix = if ($HasExplicitTlsProvider) { " --tls $EffectiveTlsProvider" } else { '' }
+$StartCmd = "@echo off`r`ncd /d `"%~dp0`"`r`nGTermBoxServer.exe --bind $BindIp --port $Port$TlsCmdSuffix %*`r`n"
 [System.IO.File]::WriteAllText((Join-Path $InstallDir 'Start-GTermBox.cmd'), $StartCmd, [System.Text.Encoding]::ASCII)
 $Info = [ordered]@{
   bindIp = $BindIp
   port = $Port
+  tlsProvider = $EffectiveTlsProvider
   serverCertificate = $ServerCert.Thumbprint
   installedAt = (Get-Date).ToString('s')
 }
@@ -519,7 +628,11 @@ if ($SkipSelfTest) {
   Write-Step '[9/9] Running self-test...'
   $logOut = Join-Path $InstallDir 'Log\install_selftest_stdout.log'
   $logErr = Join-Path $InstallDir 'Log\install_selftest_stderr.log'
-  $proc = Start-Process -FilePath $ServerExe -ArgumentList @('--bind', $BindIp, '--port', "$Port") -WorkingDirectory $InstallDir -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr
+  $serverArgs = @('--bind', $BindIp, '--port', "$Port")
+  if ($HasExplicitTlsProvider) {
+    $serverArgs += @('--tls', $EffectiveTlsProvider)
+  }
+  $proc = Start-Process -FilePath $ServerExe -ArgumentList $serverArgs -WorkingDirectory $InstallDir -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr
   $failures = New-Object System.Collections.Generic.List[string]
   try {
     $deadline = (Get-Date).AddSeconds(20)

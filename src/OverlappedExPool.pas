@@ -103,6 +103,11 @@ begin
         if Assigned(Overlapped) then
         begin
           try
+            if Assigned(GOverlappedTlsCleanupProc) then
+              GOverlappedTlsCleanupProc(Overlapped^);
+          except
+          end;
+          try
             Req := TObject(InterlockedExchangePointer(Pointer(Overlapped^.Request), nil));
             if Assigned(Req) then
               Req.Free;
@@ -144,6 +149,7 @@ begin
     Finalize(Overlapped^);
     FillChar(Overlapped^, SizeOf(TOverlappedEx), 0);
     Initialize(Overlapped^);
+    InitializeSRWLock(Overlapped^.SSLLock);
     Overlapped^.InPool := 1;
     FAllAllocated.AddOrSetValue(Overlapped, 1);
     FPool.Enqueue(Overlapped);
@@ -218,6 +224,7 @@ begin
     Finalize(Result^);
     FillChar(Result^, SizeOf(TOverlappedEx), 0);
     Initialize(Result^);
+    InitializeSRWLock(Result^.SSLLock);
     Result^.InPool := 0;
   end;
 end;
@@ -231,6 +238,12 @@ begin
     Exit;
   if InterlockedCompareExchange(AOverlapped^.InPool, 1, 0) <> 0 then
     Exit;
+
+  try
+    if Assigned(GOverlappedTlsCleanupProc) then
+      GOverlappedTlsCleanupProc(AOverlapped^);
+  except
+  end;
 
   ShouldFree := False;
   AcquireSRWLockExclusive(FLock);

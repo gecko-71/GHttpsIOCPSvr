@@ -64,6 +64,7 @@ type
     FIncomingBuffer: TBytes;
     FFramePayloadBuffer: TBytes;
     FCurrentOpcode: TWebSocketOpcode;
+    FLastMessageOpcodes: TArray<TWebSocketOpcode>;
     FFragmentInProgress: Boolean;
     FWriteQueue: TQueue<TBytes>;
     FLock: TCriticalSection;
@@ -115,6 +116,7 @@ type
     property CachedRouteHandler: IInterface read FCachedRouteHandler write FCachedRouteHandler;
     property CachedRawRouteHandler: IInterface read FCachedRawRouteHandler write FCachedRawRouteHandler;
     property LastReceivedOpcode: TWebSocketOpcode read FCurrentOpcode;
+    property LastMessageOpcodes: TArray<TWebSocketOpcode> read FLastMessageOpcodes;
     property IsTLS: Boolean read GetIsTLS;
     property IsSecure: Boolean read GetIsTLS;
   end;
@@ -587,6 +589,7 @@ var
   Frame: TWebSocketFrame;
   ErrorMsg: string;
   MsgList: TList<TBytes>;
+  OpcodeList: TList<TWebSocketOpcode>;
   Lock: TCriticalSection;
   PrevLen: Integer;
   B0, B1, Rsv, OpByte, Len7: Byte;
@@ -598,6 +601,7 @@ var
   MsgBytes: TBytes;
 begin
   CloseConnection := False;
+  SetLength(FLastMessageOpcodes, 0);
   if InCleanup <> 0 then
   begin
     CloseConnection := True;
@@ -685,6 +689,8 @@ begin
             end;
             FLastActivityTime := GetTickCount64;
             FCurrentOpcode := TWebSocketOpcode(OpByte);
+            SetLength(FLastMessageOpcodes, 1);
+            FLastMessageOpcodes[0] := FCurrentOpcode;
             SetLength(Result, 1);
             Result[0] := MsgBytes;
             Exit;
@@ -697,6 +703,7 @@ begin
   end;
 
   MsgList := TList<TBytes>.Create;
+  OpcodeList := TList<TWebSocketOpcode>.Create;
   try
     Lock.Acquire;
     try
@@ -889,6 +896,7 @@ begin
             Exit;
           end;
           MsgList.Add(Copy(FFramePayloadBuffer, 0, Length(FFramePayloadBuffer)));
+          OpcodeList.Add(FCurrentOpcode);
           SetLength(FFramePayloadBuffer, 0);
         end;
       end;
@@ -906,8 +914,10 @@ begin
     finally
       FLock.Leave;
     end;
+    FLastMessageOpcodes := OpcodeList.ToArray;
     Result := MsgList.ToArray;
   finally
+    OpcodeList.Free;
     MsgList.Free;
   end;
 end;

@@ -32,7 +32,7 @@ uses
   System.TypInfo,
   System.SyncObjs,
   System.Generics.Collections,
-  Quick.Logger,
+  GLogger,
   WinApiAdditions,
   GWebSocket,
   OverlappedExPool,
@@ -294,6 +294,12 @@ begin
   WriteOverlapped^.ListenerPort := OverlappedEx^.ListenerPort;
   WriteOverlapped^.SSLContext := OverlappedEx^.SSLContext;
   WriteOverlapped^.SSLContextValid := OverlappedEx^.SSLContextValid;
+  WriteOverlapped^.OpenSSLHandle := OverlappedEx^.OpenSSLHandle;
+  WriteOverlapped^.OpenSSLRBio := OverlappedEx^.OpenSSLRBio;
+  WriteOverlapped^.OpenSSLWBio := OverlappedEx^.OpenSSLWBio;
+  WriteOverlapped^.SSLContextBorrowed := True;
+  WriteOverlapped^.SSLLockPtr := OverlappedEx;
+  OverlappedEx^.SSLLockPtr := OverlappedEx;
   WriteOverlapped^.OpType := otWebSocketWrite;
   WriteOverlapped^.WebSocketSession := Session;
   WriteOverlapped^.ClientIP := OverlappedEx^.ClientIP;
@@ -430,7 +436,7 @@ begin
         if CurrentWriteOv^.IsTLS and CurrentWriteOv^.SSLContextValid then
         begin
           try
-            if not FTlsManager.EncryptBytesToSend(CurrentWriteOv^.SSLContext, PlainChunk, EncryptedChunk) then
+            if not FTlsManager.EncryptBytesToSend(CurrentWriteOv^, PlainChunk, EncryptedChunk) then
             begin
               CleanupWebSocketSession(Session, 'Encryption error during WSASend');
               Exit;
@@ -565,6 +571,8 @@ begin
     WriteOv := Session.DetachWriteOverlapped;
     if Assigned(WriteOv) then
     begin
+      if Assigned(FTlsManager) then
+        FTlsManager.ReleaseConnectionContext(WriteOv^);
       SetLength(WriteOv^.ClientReceiveBuffer, 0);
       WriteOv^.WebSocketSession := nil;
       if Assigned(FOverlappedPool) then

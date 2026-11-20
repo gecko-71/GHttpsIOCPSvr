@@ -33,7 +33,7 @@ uses
   System.StrUtils,
   System.SyncObjs,
   System.Generics.Collections,
-  Quick.Logger,
+  GLogger,
   GJWTManager,
   GRequest,
   GResponse,
@@ -45,6 +45,7 @@ uses
   WebTransport.Server,
   WebTransport.Session,
   MsQuic.Types,
+  WinApiAdditions,
   GHttpsServerTypes,
   GIpSecurityAndCors;
 
@@ -151,13 +152,19 @@ type
     property OnEndpointInvoke: THttp3EndpointInvokeProc read FOnEndpointInvoke write FOnEndpointInvoke;
   end;
 
-function IsMsQuicDllAvailable(out AErrorDetails: string): Boolean;
+function IsMsQuicDllAvailable(out AErrorDetails: string): Boolean; overload;
+function IsMsQuicDllAvailable(out AErrorDetails: string; ATlsProvider: TTlsProvider): Boolean; overload;
 
 implementation
 
 function IsMsQuicDllAvailable(out AErrorDetails: string): Boolean;
+begin
+  Result := IsMsQuicDllAvailable(AErrorDetails, GetConfiguredTlsProvider(tpSchannel));
+end;
+
+function IsMsQuicDllAvailable(out AErrorDetails: string; ATlsProvider: TTlsProvider): Boolean;
 var
-  ExeDir, MsQuicPath, LsQpackPath: string;
+  ExeDir, MsQuicDllName, MsQuicPath, LsQpackPath: string;
   HMsQuic, HLsQpack: HMODULE;
   OpenVerFunc: function(Version: Cardinal; out ApiTable: Pointer): Cardinal; cdecl;
   CloseFunc: procedure(ApiTable: Pointer); cdecl;
@@ -169,12 +176,16 @@ begin
   AErrorDetails := '';
 
   ExeDir := ExtractFilePath(ParamStr(0));
-  MsQuicPath := ExeDir + 'msquic.dll';
+  if ATlsProvider = tpOpenSSL then
+    MsQuicDllName := 'msquicSSL.dll'
+  else
+    MsQuicDllName := 'msquic.dll';
+  MsQuicPath := ExeDir + MsQuicDllName;
   LsQpackPath := ExeDir + 'ls-qpack.dll';
 
   if not FileExists(MsQuicPath) then
   begin
-    AErrorDetails := Format('msquic.dll not found in server directory: %s', [MsQuicPath]);
+    AErrorDetails := Format('%s not found in server directory: %s', [MsQuicDllName, MsQuicPath]);
     Exit;
   end;
 
@@ -198,7 +209,7 @@ begin
       @CloseFunc := GetProcAddress(HMsQuic, 'MsQuicClose');
       if not Assigned(@OpenVerFunc) then
       begin
-        AErrorDetails := Format('msquic.dll in "%s" does not export "MsQuicOpenVersion"', [MsQuicPath]);
+        AErrorDetails := Format('%s in "%s" does not export "MsQuicOpenVersion"', [MsQuicDllName, MsQuicPath]);
         Exit;
       end;
 

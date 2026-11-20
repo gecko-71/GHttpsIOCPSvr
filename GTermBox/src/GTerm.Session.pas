@@ -33,7 +33,7 @@ uses
   System.StrUtils,
   System.Generics.Collections,
   Winapi.Windows,
-  Quick.Logger,
+  GLogger,
   GTerm.Types,
   GTerm.AppConfig,
   GTerm.UserConfig,

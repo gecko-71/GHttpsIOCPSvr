@@ -41,25 +41,58 @@ param(
 
   [string]$Cert = '',
 
-  [switch]$Interactive
+  [switch]$Interactive,
+
+  [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER
 )
+
+$EffectiveTlsProvider = if ([string]::IsNullOrWhiteSpace($TlsProvider)) { 'tpSchannel' } else { $TlsProvider }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 if (Test-Path (Join-Path $ScriptDir "Win64\Debug\ManageUsers.exe")) {
   $ServerDir = Join-Path $ScriptDir "Win64\Debug"
   $ManageUsersExe = Join-Path $ServerDir "ManageUsers.exe"
-} elseif (Test-Path (Join-Path (Get-Location) "ManageUsers.exe")) {
-  $ServerDir = (Get-Location).Path
-  $ManageUsersExe = Join-Path $ServerDir "ManageUsers.exe"
 } elseif (Test-Path (Join-Path $ScriptDir "ManageUsers.exe")) {
   $ServerDir = $ScriptDir
   $ManageUsersExe = Join-Path $ScriptDir "ManageUsers.exe"
+} elseif (Test-Path (Join-Path $ScriptDir "..\Win64\Debug\ManageUsers.exe")) {
+  $ServerDir = (Resolve-Path (Join-Path $ScriptDir "..\Win64\Debug")).Path
+  $ManageUsersExe = Join-Path $ServerDir "ManageUsers.exe"
+} elseif (Test-Path (Join-Path (Get-Location) "ManageUsers.exe")) {
+  $ServerDir = (Get-Location).Path
+  $ManageUsersExe = Join-Path $ServerDir "ManageUsers.exe"
 } elseif (Test-Path (Join-Path (Get-Location) "GTermBox\Win64\Debug\ManageUsers.exe")) {
   $ServerDir = Join-Path (Get-Location).Path "GTermBox\Win64\Debug"
   $ManageUsersExe = Join-Path $ServerDir "ManageUsers.exe"
 } else {
   Write-Error "ManageUsers.exe not found. Please compile the project first."
   exit 1
+}
+
+$OpenSslDllSearchDirs = @(
+  $ScriptDir,
+  (Join-Path $ScriptDir "Win64\Debug"),
+  (Join-Path $ScriptDir "Win64\Release"),
+  (Join-Path $ScriptDir "..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\Win64\Release"),
+  (Join-Path $ScriptDir "..\..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\..\Win64\Release"),
+  (Join-Path $ScriptDir "..\..\..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\..\..\Win64\Release")
+)
+foreach ($dllName in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+  $dstDll = Join-Path $ServerDir $dllName
+  if (-not (Test-Path $dstDll)) {
+    foreach ($srcDir in $OpenSslDllSearchDirs) {
+      if (Test-Path $srcDir) {
+        $candDll = Join-Path $srcDir $dllName
+        if (Test-Path $candDll) {
+          Copy-Item -Path $candDll -Destination $dstDll -Force
+          break
+        }
+      }
+    }
+  }
 }
 
 if ($Admin) {
@@ -237,6 +270,9 @@ if (-not [string]::IsNullOrWhiteSpace($DirsWrite)) {
 if (-not [string]::IsNullOrWhiteSpace($Cert)) {
   $cliArgs += "--cert=$Cert"
 }
+if (-not [string]::IsNullOrWhiteSpace($TlsProvider)) {
+  $cliArgs += "-tls:$EffectiveTlsProvider"
+}
 
 Write-Host "Registering user '$Username' (Role: $Role) in $ServerDir..." -ForegroundColor Yellow
 Push-Location $ServerDir
@@ -246,7 +282,11 @@ try {
   if ($exitCode -eq 0) {
     Write-Host ""
     Write-Host "[SUCCESS] User '$Username' has been successfully created and sandbox prepared!" -ForegroundColor Green
-    & $ManageUsersExe "show" $Username
+    $showArgs = @("show", $Username)
+    if (-not [string]::IsNullOrWhiteSpace($TlsProvider)) {
+      $showArgs += "-tls:$EffectiveTlsProvider"
+    }
+    & $ManageUsersExe @showArgs
   }
 } finally {
   Pop-Location

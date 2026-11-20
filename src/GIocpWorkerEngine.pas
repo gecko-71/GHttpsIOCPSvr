@@ -34,8 +34,7 @@ uses
   System.StrUtils,
   System.SyncObjs,
   System.Generics.Collections,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
+  GLogger,
   GWebSocket,
   GRequest,
   GResponse,
@@ -370,9 +369,11 @@ begin
       if ClientIP <> '' then
         FIpSecurity.TrackIPDisconnect(ClientIP);
       IsAbrupt := ContainsText(AReason, 'interrupted') or ContainsText(AReason, 'aborted') or ContainsText(AReason, 'reset');
-      if AOverlapped^.SSLContextValid then
+      if AOverlapped^.SSLContextValid or (AOverlapped^.OpenSSLHandle <> nil) then
       begin
-        if (not ContainsText(AReason, 'SSL shutdown completed')) and (not IsAbrupt) then
+        if AOverlapped^.SSLContextValid and
+           (not ContainsText(AReason, 'SSL shutdown completed')) and
+           (not IsAbrupt) then
         begin
           try
             FTlsManager.PerformGracefulSSLShutdown(AOverlapped^);
@@ -380,9 +381,8 @@ begin
             on E: Exception do
               Logger.Info('Error SSL shutdown w cleanup: ' + E.Message);
           end;
-        end
-        else
-          AOverlapped^.SSLContextValid := False;
+        end;
+        FTlsManager.ReleaseConnectionContext(AOverlapped^);
       end;
       try
         if not IsAbrupt then
@@ -426,6 +426,8 @@ begin
 
     OverlappedEx^.SSLOutputSize := 0;
     SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+    if Assigned(FTlsManager) then
+      FTlsManager.ReleaseConnectionContext(OverlappedEx^);
   except
     on E: Exception do
       Logger.Error('Error in CleanupOverlappedEx [%s]: %s', [E.ClassName, E.Message]);
@@ -441,6 +443,7 @@ function TIocpWorkerEngine.InitializeRequestProcessing(OverlappedEx: POverlapped
 var
   RemoteAddr: TSockAddrIn;
   ClientIP: string;
+  OldReq: TObject;
 begin
   Result := False;
   try
@@ -449,7 +452,9 @@ begin
       CleanupConnectionWithReason(OverlappedEx, 'Server overloaded: lack of resources');
       Exit;
     end;
-    OverlappedEx^.Request := nil;
+    OldReq := TObject(InterlockedExchangePointer(Pointer(OverlappedEx^.Request), nil));
+    if Assigned(OldReq) then
+      OldReq.Free;
     ZeroMemory(@RemoteAddr, SizeOf(RemoteAddr));
     ClientIP := string(PAnsiChar(@OverlappedEx^.ClientIP[0]));
     if ClientIP <> '' then
@@ -686,7 +691,6 @@ end;
 procedure TIocpWorkerEngine.ContinueReadingRequest(OverlappedEx: POverlappedEx);
 var
   LastErr: Integer;
-  LogItem: TLogItem;
 begin
   try
     if not Assigned(OverlappedEx^.Request) then
@@ -714,26 +718,7 @@ begin
     begin
       LastErr := WSAGetLastError;
       if (LastErr = WSAECONNRESET) or (LastErr = 10054) then
-      begin
-        if Assigned(GlobalLogFileProvider) and GlobalLogFileProvider.Enabled then
-        begin
-          TMonitor.Enter(GlobalLogFileProvider);
-          try
-            LogItem := TLogItem.Create;
-            try
-              LogItem.EventType := etError;
-              LogItem.Msg := 'Error continuing request read: 10054 (WSAECONNRESET: Connection forcibly closed or reset by the remote peer/client)';
-              LogItem.EventDate := Now;
-              LogItem.ThreadId := GetCurrentThreadId;
-              GlobalLogFileProvider.WriteLog(LogItem);
-            finally
-              LogItem.Free;
-            end;
-          finally
-            TMonitor.Exit(GlobalLogFileProvider);
-          end;
-        end;
-      end
+        Logger.Error('Error continuing request read: 10054 (WSAECONNRESET: Connection forcibly closed or reset by the remote peer/client)')
       else
         Logger.Error('Error continuing request read: ' + IntToStr(LastErr));
       CleanupConnectionWithReason(OverlappedEx, 'Error continuing request read');
@@ -771,6 +756,7 @@ var
   ThreadId: DWORD;
   TargetCount: Integer;
 begin
+  IsMultiThread := True;
   Result := True;
   TargetCount := FWorkerThreadCount;
   if TargetCount <= 0 then
@@ -1027,15 +1013,7 @@ var
   ErrorCode: Integer;
   Response: TResponse;
   OutOff: Integer;
-  StreamSizes: SecPkgContext_StreamSizes;
-  SecStatus: SECURITY_STATUS;
-  SecBufs: array[0..3] of TSecBuffer;
-  SecDesc: TSecBufferDesc;
-  HeaderSz, TrailerSz, MaxPayload, RecLen: Integer;
-  I: Integer;
-  CopyOff: Integer;
-  NeedCopy: Boolean;
-  TempRec: array[0..17000] of Byte;
+  FatalEncryptErr: Boolean;
   SyncBytes: DWORD;
   RecvRes: Integer;
   OldResp: TResponse;
@@ -1083,10 +1061,12 @@ begin
           OverlappedEx^.KeepAliveActive := True;
           OverlappedEx^.LastActivityTime := GetTickCount64;
 
-          if Length(OverlappedEx^.ClientReceiveBuffer) > 0 then
+          if (Length(OverlappedEx^.ClientReceiveBuffer) > 0) or
+             (OverlappedEx^.IsTLS and FTlsManager.HasPendingRxData(OverlappedEx^)) then
           begin
             OverlappedEx^.OpType := otRead;
-            InitializeRequestProcessing(OverlappedEx);
+            if not Assigned(OverlappedEx^.Request) then
+              InitializeRequestProcessing(OverlappedEx);
             if OverlappedEx^.AllowInlineRecv then
             begin
               OverlappedEx^.InlineSyncBytes := 0;
@@ -1131,94 +1111,11 @@ begin
       end;
       if OverlappedEx^.IsTLS and OverlappedEx^.SSLContextValid then
       begin
-        if OverlappedEx^.SSLStreamSizesValid then
+        if (not FTlsManager.EncryptResponseChunks(OverlappedEx^, Response, OutOff, FatalEncryptErr)) or FatalEncryptErr then
         begin
-          HeaderSz := OverlappedEx^.SSLStreamHeaderSize;
-          TrailerSz := OverlappedEx^.SSLStreamTrailerSize;
-          MaxPayload := OverlappedEx^.SSLStreamMaxMessage;
-        end
-        else
-        begin
-          SecStatus := QueryContextAttributes(@OverlappedEx^.SSLContext, SECPKG_ATTR_STREAM_SIZES, @StreamSizes);
-          if SecStatus <> SEC_E_OK then
-          begin
-            Logger.Error('Download error StreamSizes: 0x%x', [SecStatus]);
-            CleanupConnectionWithReason(OverlappedEx, 'Chunk encryption error');
-            Exit;
-          end;
-          HeaderSz := StreamSizes.cbHeader;
-          TrailerSz := StreamSizes.cbTrailer;
-          MaxPayload := StreamSizes.cbMaximumMessage;
-          OverlappedEx^.SSLStreamHeaderSize := HeaderSz;
-          OverlappedEx^.SSLStreamTrailerSize := TrailerSz;
-          OverlappedEx^.SSLStreamMaxMessage := MaxPayload;
-          OverlappedEx^.SSLStreamSizesValid := True;
-        end;
-        MaxPayload := Min(RESPONSE_CHUNK_SIZE, MaxPayload);
-        if MaxPayload <= 0 then
-        begin
+          Logger.Error('FATAL ERROR: Failed to encrypt chunk. Closing connection.');
           CleanupConnectionWithReason(OverlappedEx, 'Chunk encryption error');
           Exit;
-        end;
-        OutOff := 0;
-        while (OutOff + HeaderSz + MaxPayload + TrailerSz <= SizeOf(OverlappedEx^.SSLOutputBuffer)) and (not Response.IsComplete) do
-        begin
-          BytesToEncrypt := Response.ReadNextChunk(@OverlappedEx^.SSLOutputBuffer[OutOff + HeaderSz], MaxPayload);
-          if BytesToEncrypt <= 0 then
-            Break;
-
-          SecBufs[0].BufferType := SECBUFFER_STREAM_HEADER;
-          SecBufs[0].cbBuffer := HeaderSz;
-          SecBufs[0].pvBuffer := @OverlappedEx^.SSLOutputBuffer[OutOff];
-
-          SecBufs[1].BufferType := SECBUFFER_DATA;
-          SecBufs[1].cbBuffer := BytesToEncrypt;
-          SecBufs[1].pvBuffer := @OverlappedEx^.SSLOutputBuffer[OutOff + HeaderSz];
-
-          SecBufs[2].BufferType := SECBUFFER_STREAM_TRAILER;
-          SecBufs[2].cbBuffer := TrailerSz;
-          SecBufs[2].pvBuffer := @OverlappedEx^.SSLOutputBuffer[OutOff + HeaderSz + BytesToEncrypt];
-
-          SecBufs[3].BufferType := SECBUFFER_EMPTY;
-          SecBufs[3].cbBuffer := 0;
-          SecBufs[3].pvBuffer := nil;
-
-          SecDesc.ulVersion := SECBUFFER_VERSION;
-          SecDesc.cBuffers := 4;
-          SecDesc.pBuffers := @SecBufs[0];
-
-          SecStatus := EncryptMessage(@OverlappedEx^.SSLContext, 0, @SecDesc, 0);
-          if SecStatus <> SEC_E_OK then
-          begin
-            Logger.Error('FATAL ERROR: Failed to encrypt chunk. Closing connection.');
-            CleanupConnectionWithReason(OverlappedEx, 'Chunk encryption error');
-            Exit;
-          end;
-
-          NeedCopy := (SecBufs[0].pvBuffer <> @OverlappedEx^.SSLOutputBuffer[OutOff]) or
-                      (SecBufs[1].pvBuffer <> @OverlappedEx^.SSLOutputBuffer[OutOff + Integer(SecBufs[0].cbBuffer)]) or
-                      (SecBufs[2].pvBuffer <> @OverlappedEx^.SSLOutputBuffer[OutOff + Integer(SecBufs[0].cbBuffer) + Integer(SecBufs[1].cbBuffer)]) or
-                      (SecBufs[3].cbBuffer > 0);
-          RecLen := Integer(SecBufs[0].cbBuffer) + Integer(SecBufs[1].cbBuffer) + Integer(SecBufs[2].cbBuffer) + Integer(SecBufs[3].cbBuffer);
-          if OutOff + RecLen > SizeOf(OverlappedEx^.SSLOutputBuffer) then
-          begin
-            CleanupConnectionWithReason(OverlappedEx, 'Chunk too big for buffer');
-            Exit;
-          end;
-          if NeedCopy then
-          begin
-            CopyOff := 0;
-            for I := 0 to 3 do
-            begin
-              if (SecBufs[I].cbBuffer > 0) and Assigned(SecBufs[I].pvBuffer) then
-              begin
-                Move(SecBufs[I].pvBuffer^, TempRec[CopyOff], SecBufs[I].cbBuffer);
-                Inc(CopyOff, SecBufs[I].cbBuffer);
-              end;
-            end;
-            Move(TempRec[0], OverlappedEx^.SSLOutputBuffer[OutOff], CopyOff);
-          end;
-          Inc(OutOff, RecLen);
         end;
         if OutOff <= 0 then
         begin
@@ -1339,6 +1236,8 @@ var
   CloseConn: Boolean;
   WsFatalError: Boolean;
   MsgArray: TArray<TBytes>;
+  MsgOpcodes: TArray<TWebSocketOpcode>;
+  MsgIdx: Integer;
   MsgBytes: TBytes;
   Opcode: TWebSocketOpcode;
   MsgStr: string;
@@ -1350,6 +1249,8 @@ var
   SockId: TSocket;
   OpName: string;
   IsActive: Boolean;
+  OsslHasPlain: Boolean;
+  OsslErrMsg: string;
 begin
   Engine := TIocpWorkerEngine(Parameter);
   GracefulShutdown := False;
@@ -1492,7 +1393,8 @@ begin
                 if Engine.InitializeRequestProcessing(OverlappedEx) then
                 begin
                   OverlappedEx^.OpType := otRead;
-                  if Length(OverlappedEx^.ClientReceiveBuffer) > 0 then
+                  if (Length(OverlappedEx^.ClientReceiveBuffer) > 0) or
+                     Engine.FTlsManager.HasPendingRxData(OverlappedEx^) then
                   begin
                     if not PostQueuedCompletionStatus(Engine.FCompletionPort, 0, ULONG_PTR(OverlappedEx^.Socket), POverlapped(OverlappedEx)) then
                       Engine.CleanupConnectionWithReason(OverlappedEx, 'Failed to post completion for buffered post-handshake TLS data: ' + IntToStr(GetLastError));
@@ -1514,7 +1416,8 @@ begin
           end;
           otRead:
           begin
-            if (BytesTransferred > 0) or (Length(OverlappedEx^.ClientReceiveBuffer) > 0) then
+            if (BytesTransferred > 0) or (Length(OverlappedEx^.ClientReceiveBuffer) > 0) or
+               (OverlappedEx^.IsTLS and Engine.FTlsManager.HasPendingRxData(OverlappedEx^)) then
             begin
               if Assigned(OverlappedEx^.Response) then
                 Continue;
@@ -1600,132 +1503,147 @@ begin
                 end;
                 DecryptStatus := SEC_E_OK;
                 FatalTlsError := False;
-                if (Length(OverlappedEx^.ClientReceiveBuffer) = 0) and (BytesTransferred > 0) then
+                if (Engine.FTlsManager.TlsProvider = tpOpenSSL) or (OverlappedEx^.OpenSSLHandle <> nil) then
                 begin
-                  InPlaceBufs[0].BufferType := SECBUFFER_DATA;
-                  InPlaceBufs[0].cbBuffer := BytesTransferred;
-                  InPlaceBufs[0].pvBuffer := @OverlappedEx^.Buffer[0];
-                  InPlaceBufs[1].BufferType := SECBUFFER_EMPTY;
-                  InPlaceBufs[1].cbBuffer := 0;
-                  InPlaceBufs[1].pvBuffer := nil;
-                  InPlaceBufs[2].BufferType := SECBUFFER_EMPTY;
-                  InPlaceBufs[2].cbBuffer := 0;
-                  InPlaceBufs[2].pvBuffer := nil;
-                  InPlaceBufs[3].BufferType := SECBUFFER_EMPTY;
-                  InPlaceBufs[3].cbBuffer := 0;
-                  InPlaceBufs[3].pvBuffer := nil;
-                  InPlaceDesc.ulVersion := SECBUFFER_VERSION;
-                  InPlaceDesc.cBuffers := 4;
-                  InPlaceDesc.pBuffers := @InPlaceBufs[0];
-                  InPlaceStatus := DecryptMessage(@OverlappedEx^.SSLContext, @InPlaceDesc, 0, nil);
-                  if InPlaceStatus = SEC_E_OK then
+                  if not Assigned(OverlappedEx^.Request) then
+                    Engine.InitializeRequestProcessing(OverlappedEx);
+                  if not Engine.FTlsManager.DecryptRequestChunk(OverlappedEx^, BytesTransferred, OverlappedEx^.Request, OsslHasPlain, FatalTlsError, OsslErrMsg) then
                   begin
-                    PlainPtr := nil;
-                    PlainSize := 0;
-                    ExtraPtr := nil;
-                    ExtraSize := 0;
-                    for BufIdx := 0 to 3 do
-                    begin
-                      if InPlaceBufs[BufIdx].BufferType = SECBUFFER_DATA then
-                      begin
-                        PlainPtr := PByte(InPlaceBufs[BufIdx].pvBuffer);
-                        PlainSize := InPlaceBufs[BufIdx].cbBuffer;
-                      end
-                      else if InPlaceBufs[BufIdx].BufferType = SECBUFFER_EXTRA then
-                      begin
-                        ExtraPtr := PByte(InPlaceBufs[BufIdx].pvBuffer);
-                        ExtraSize := InPlaceBufs[BufIdx].cbBuffer;
-                      end;
-                    end;
-                    if not Assigned(OverlappedEx^.Request) then
-                      Engine.InitializeRequestProcessing(OverlappedEx);
-                    if Assigned(OverlappedEx^.Request) then
-                    begin
-                      if (PlainSize > 0) and Assigned(PlainPtr) then
-                        OverlappedEx^.Request.AppendDataPtr(PlainPtr, PlainSize);
-                    end
-                    else
-                    begin
-                      Logger.Error('Fatal error: Request object is NIL while decrypting data. Closing connection.');
-                      Engine.CleanupConnectionWithReason(OverlappedEx, 'Request object NIL during decryption');
+                    if not FatalTlsError then
                       FatalTlsError := True;
-                    end;
-                    if (not FatalTlsError) and (ExtraSize > 0) and Assigned(ExtraPtr) then
-                    begin
-                      SetLength(OverlappedEx^.ClientReceiveBuffer, ExtraSize);
-                      Move(ExtraPtr^, OverlappedEx^.ClientReceiveBuffer[0], ExtraSize);
-                    end;
-                  end
-                  else if (InPlaceStatus = SEC_E_INCOMPLETE_MESSAGE) or (InPlaceStatus = Longint($80090330)) then
-                  begin
-                    SetLength(OverlappedEx^.ClientReceiveBuffer, BytesTransferred);
-                    Move(OverlappedEx^.Buffer[0], OverlappedEx^.ClientReceiveBuffer[0], BytesTransferred);
-                  end
-                  else
-                  begin
-                    FatalTlsError := True;
-                    Engine.CleanupConnectionWithReason(OverlappedEx,
-                      Format('TLS fatal decrypt error: %s (0x%x)', [GetSSLErrorDescription(InPlaceStatus), InPlaceStatus]));
                   end;
+                  if FatalTlsError then
+                    Engine.CleanupConnectionWithReason(OverlappedEx, OsslErrMsg);
                 end
-                else if BytesTransferred > 0 then
+                else
                 begin
-                  CurrentBufferLen := Length(OverlappedEx^.ClientReceiveBuffer);
-                  SetLength(OverlappedEx^.ClientReceiveBuffer, CurrentBufferLen + Integer(BytesTransferred));
-                  Move(OverlappedEx^.Buffer[0], OverlappedEx^.ClientReceiveBuffer[CurrentBufferLen], BytesTransferred);
-                end;
-                while (not FatalTlsError) and (Length(OverlappedEx^.ClientReceiveBuffer) > 0) do
-                begin
-                  DecryptSuccess := Engine.FTlsManager.DecryptReceivedData(OverlappedEx^.SSLContext,
-                                                               OverlappedEx^.ClientReceiveBuffer,
-                                                               DecryptedPlainData,
-                                                               CurrentAttemptConsumedBytes,
-                                                               DecryptStatus);
-
-                  if DecryptSuccess then
+                  if (Length(OverlappedEx^.ClientReceiveBuffer) = 0) and (BytesTransferred > 0) then
                   begin
-                    if CurrentAttemptConsumedBytes > 0 then
+                    InPlaceBufs[0].BufferType := SECBUFFER_DATA;
+                    InPlaceBufs[0].cbBuffer := BytesTransferred;
+                    InPlaceBufs[0].pvBuffer := @OverlappedEx^.Buffer[0];
+                    InPlaceBufs[1].BufferType := SECBUFFER_EMPTY;
+                    InPlaceBufs[1].cbBuffer := 0;
+                    InPlaceBufs[1].pvBuffer := nil;
+                    InPlaceBufs[2].BufferType := SECBUFFER_EMPTY;
+                    InPlaceBufs[2].cbBuffer := 0;
+                    InPlaceBufs[2].pvBuffer := nil;
+                    InPlaceBufs[3].BufferType := SECBUFFER_EMPTY;
+                    InPlaceBufs[3].cbBuffer := 0;
+                    InPlaceBufs[3].pvBuffer := nil;
+                    InPlaceDesc.ulVersion := SECBUFFER_VERSION;
+                    InPlaceDesc.cBuffers := 4;
+                    InPlaceDesc.pBuffers := @InPlaceBufs[0];
+                    InPlaceStatus := DecryptMessage(@OverlappedEx^.SSLContext, @InPlaceDesc, 0, nil);
+                    if InPlaceStatus = SEC_E_OK then
                     begin
-                      RemainingBytes := Length(OverlappedEx^.ClientReceiveBuffer) - CurrentAttemptConsumedBytes;
-                      if RemainingBytes > 0 then
-                        OverlappedEx^.ClientReceiveBuffer := Copy(OverlappedEx^.ClientReceiveBuffer, CurrentAttemptConsumedBytes, RemainingBytes)
-                      else
-                        SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+                      PlainPtr := nil;
+                      PlainSize := 0;
+                      ExtraPtr := nil;
+                      ExtraSize := 0;
+                      for BufIdx := 0 to 3 do
+                      begin
+                        if InPlaceBufs[BufIdx].BufferType = SECBUFFER_DATA then
+                        begin
+                          PlainPtr := PByte(InPlaceBufs[BufIdx].pvBuffer);
+                          PlainSize := InPlaceBufs[BufIdx].cbBuffer;
+                        end
+                        else if InPlaceBufs[BufIdx].BufferType = SECBUFFER_EXTRA then
+                        begin
+                          ExtraPtr := PByte(InPlaceBufs[BufIdx].pvBuffer);
+                          ExtraSize := InPlaceBufs[BufIdx].cbBuffer;
+                        end;
+                      end;
                       if not Assigned(OverlappedEx^.Request) then
                         Engine.InitializeRequestProcessing(OverlappedEx);
-
                       if Assigned(OverlappedEx^.Request) then
                       begin
-                        if Length(DecryptedPlainData) > 0 then
-                          OverlappedEx^.Request.AppendData(DecryptedPlainData, Length(DecryptedPlainData));
+                        if (PlainSize > 0) and Assigned(PlainPtr) then
+                          OverlappedEx^.Request.AppendDataPtr(PlainPtr, PlainSize);
                       end
                       else
                       begin
                         Logger.Error('Fatal error: Request object is NIL while decrypting data. Closing connection.');
-                        FatalTlsError := True;
                         Engine.CleanupConnectionWithReason(OverlappedEx, 'Request object NIL during decryption');
+                        FatalTlsError := True;
+                      end;
+                      if (not FatalTlsError) and (ExtraSize > 0) and Assigned(ExtraPtr) then
+                      begin
+                        SetLength(OverlappedEx^.ClientReceiveBuffer, ExtraSize);
+                        Move(ExtraPtr^, OverlappedEx^.ClientReceiveBuffer[0], ExtraSize);
+                      end;
+                    end
+                    else if (InPlaceStatus = SEC_E_INCOMPLETE_MESSAGE) or (InPlaceStatus = Longint($80090330)) then
+                    begin
+                      SetLength(OverlappedEx^.ClientReceiveBuffer, BytesTransferred);
+                      Move(OverlappedEx^.Buffer[0], OverlappedEx^.ClientReceiveBuffer[0], BytesTransferred);
+                    end
+                    else
+                    begin
+                      FatalTlsError := True;
+                      Engine.CleanupConnectionWithReason(OverlappedEx,
+                        Format('TLS fatal decrypt error: %s (0x%x)', [GetSSLErrorDescription(InPlaceStatus), InPlaceStatus]));
+                    end;
+                  end
+                  else if BytesTransferred > 0 then
+                  begin
+                    CurrentBufferLen := Length(OverlappedEx^.ClientReceiveBuffer);
+                    SetLength(OverlappedEx^.ClientReceiveBuffer, CurrentBufferLen + Integer(BytesTransferred));
+                    Move(OverlappedEx^.Buffer[0], OverlappedEx^.ClientReceiveBuffer[CurrentBufferLen], BytesTransferred);
+                  end;
+                  while (not FatalTlsError) and (Length(OverlappedEx^.ClientReceiveBuffer) > 0) do
+                  begin
+                    DecryptSuccess := Engine.FTlsManager.DecryptReceivedData(OverlappedEx^.SSLContext,
+                                                                 OverlappedEx^.ClientReceiveBuffer,
+                                                                 DecryptedPlainData,
+                                                                 CurrentAttemptConsumedBytes,
+                                                                 DecryptStatus);
+
+                    if DecryptSuccess then
+                    begin
+                      if CurrentAttemptConsumedBytes > 0 then
+                      begin
+                        RemainingBytes := Length(OverlappedEx^.ClientReceiveBuffer) - CurrentAttemptConsumedBytes;
+                        if RemainingBytes > 0 then
+                          OverlappedEx^.ClientReceiveBuffer := Copy(OverlappedEx^.ClientReceiveBuffer, CurrentAttemptConsumedBytes, RemainingBytes)
+                        else
+                          SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+                        if not Assigned(OverlappedEx^.Request) then
+                          Engine.InitializeRequestProcessing(OverlappedEx);
+
+                        if Assigned(OverlappedEx^.Request) then
+                        begin
+                          if Length(DecryptedPlainData) > 0 then
+                            OverlappedEx^.Request.AppendData(DecryptedPlainData, Length(DecryptedPlainData));
+                        end
+                        else
+                        begin
+                          Logger.Error('Fatal error: Request object is NIL while decrypting data. Closing connection.');
+                          FatalTlsError := True;
+                          Engine.CleanupConnectionWithReason(OverlappedEx, 'Request object NIL during decryption');
+                          Break;
+                        end;
+                      end
+                      else
+                      begin
+                        Logger.Error('DecryptReceivedData returned success, but 0 bytes were consumed. Closing connection.');
+                        FatalTlsError := True;
+                        Engine.CleanupConnectionWithReason(OverlappedEx, 'DecryptSuccess but ConsumedBytes = 0');
                         Break;
                       end;
                     end
                     else
                     begin
-                      Logger.Error('DecryptReceivedData returned success, but 0 bytes were consumed. Closing connection.');
-                      FatalTlsError := True;
-                      Engine.CleanupConnectionWithReason(OverlappedEx, 'DecryptSuccess but ConsumedBytes = 0');
-                      Break;
-                    end;
-                  end
-                  else
-                  begin
-                    if (DecryptStatus = SEC_E_INCOMPLETE_MESSAGE) or (DecryptStatus = Longint($80090330)) then
-                      Break
-                    else
-                    begin
-                      FatalTlsError := True;
-                      SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
-                      Engine.CleanupConnectionWithReason(OverlappedEx,
-                        Format('TLS fatal decrypt error: %s (0x%x)', [GetSSLErrorDescription(DecryptStatus), DecryptStatus]));
-                      Break;
+                      if (DecryptStatus = SEC_E_INCOMPLETE_MESSAGE) or (DecryptStatus = Longint($80090330)) then
+                        Break
+                      else
+                      begin
+                        FatalTlsError := True;
+                        SetLength(OverlappedEx^.ClientReceiveBuffer, 0);
+                        Engine.CleanupConnectionWithReason(OverlappedEx,
+                          Format('TLS fatal decrypt error: %s (0x%x)', [GetSSLErrorDescription(DecryptStatus), DecryptStatus]));
+                        Break;
+                      end;
                     end;
                   end;
                 end;
@@ -1828,11 +1746,16 @@ begin
                       if (WsOffset < Integer(BytesTransferred)) and (not CloseConn) and (WsSession.InCleanup = 0) then
                       begin
                         MsgArray := WsSession.ProcessIncomingPlaintextPtr(@OverlappedEx^.Buffer[WsOffset], Integer(BytesTransferred) - WsOffset, CloseConn);
-                        for MsgBytes in MsgArray do
+                        MsgOpcodes := WsSession.LastMessageOpcodes;
+                        for MsgIdx := 0 to High(MsgArray) do
                         begin
                           if WsSession.InCleanup <> 0 then
                             Break;
-                          Opcode := WsSession.LastReceivedOpcode;
+                          MsgBytes := MsgArray[MsgIdx];
+                          if MsgIdx < Length(MsgOpcodes) then
+                            Opcode := MsgOpcodes[MsgIdx]
+                          else
+                            Opcode := WsSession.LastReceivedOpcode;
                           if Opcode in [wsOpText, wsOpBinary] then
                           begin
                             MsgStr := '';
@@ -1913,7 +1836,7 @@ begin
                       WsDecryptStatus := SEC_E_OK;
                       while (Length(OverlappedEx^.ClientReceiveBuffer) > 0) and (WsSession.InCleanup = 0) do
                       begin
-                        if Engine.FTlsManager.DecryptReceivedData(OverlappedEx^.SSLContext, OverlappedEx^.ClientReceiveBuffer, DecryptedPlainData, ConsumedBytes, WsDecryptStatus) then
+                        if Engine.FTlsManager.DecryptReceivedData(OverlappedEx^, OverlappedEx^.ClientReceiveBuffer, DecryptedPlainData, ConsumedBytes, WsDecryptStatus) then
                         begin
                           if ConsumedBytes > 0 then
                           begin
@@ -1926,11 +1849,16 @@ begin
                             if (Length(DecryptedPlainData) > 0) and (WsSession.InCleanup = 0) then
                             begin
                               MsgArray := WsSession.ProcessIncomingPlaintext(DecryptedPlainData, CloseConn);
-                              for MsgBytes in MsgArray do
+                              MsgOpcodes := WsSession.LastMessageOpcodes;
+                              for MsgIdx := 0 to High(MsgArray) do
                               begin
                                 if WsSession.InCleanup <> 0 then
                                   Break;
-                                Opcode := WsSession.LastReceivedOpcode;
+                                MsgBytes := MsgArray[MsgIdx];
+                                if MsgIdx < Length(MsgOpcodes) then
+                                  Opcode := MsgOpcodes[MsgIdx]
+                                else
+                                  Opcode := WsSession.LastReceivedOpcode;
                                 if Opcode in [wsOpText, wsOpBinary] then
                                 begin
                                   MsgStr := '';

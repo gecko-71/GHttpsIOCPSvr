@@ -39,9 +39,7 @@ uses
   System.IOUtils,
   System.JSON,
   System.Hash,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  GLogger,
   GWebSocket,
   GJWTManager,
   GRequest,
@@ -58,6 +56,7 @@ uses
   WebTransport.Session,
   MsQuic.Types,
   GHttpsServerTypes,
+  GOpenSslApi,
   GSchannelTlsManager,
   GIpSecurityAndCors,
   GWebSocketBridge,
@@ -69,6 +68,8 @@ type
   THttpActionOnDualMode = GHttpsServerTypes.THttpActionOnDualMode;
   TAuthorizationType = GHttpsServerTypes.TAuthorizationType;
   TmTLSMode = GHttpsServerTypes.TmTLSMode;
+  TTlsProvider = WinApiAdditions.TTlsProvider;
+  TSchannelTlsManager = GSchannelTlsManager.TSchannelTlsManager;
 
 const
   pmHttpOnly = GHttpsServerTypes.pmHttpOnly;
@@ -81,6 +82,8 @@ const
   mtlsDisabled = GHttpsServerTypes.mtlsDisabled;
   mtlsOptional = GHttpsServerTypes.mtlsOptional;
   mtlsRequired = GHttpsServerTypes.mtlsRequired;
+  tpSchannel = WinApiAdditions.tpSchannel;
+  tpOpenSSL = WinApiAdditions.tpOpenSSL;
 
 type
 
@@ -250,6 +253,14 @@ type
     function GetmTLSCAPath: string;
     function GetOnValidateClientCertificate: TClientCertValidateEvent;
     procedure SetOnValidateClientCertificate(const Value: TClientCertValidateEvent);
+    function GetTlsProvider: TTlsProvider;
+    procedure SetTlsProvider(const Value: TTlsProvider);
+    function GetTlsCertFile: string;
+    procedure SetTlsCertFile(const Value: string);
+    function GetTlsKeyFile: string;
+    procedure SetTlsKeyFile(const Value: string);
+    function GetTlsKeyPassword: string;
+    procedure SetTlsKeyPassword(const Value: string);
     function FindEndpoint(AMethod: THttpMethod; const APath: string): TEndpointItem;
     procedure ProcessHttpRequest(OverlappedEx: POverlappedEx);
   protected
@@ -367,15 +378,37 @@ type
     property mTLSMode: TmTLSMode read GetmTLSMode write SetmTLSMode;
     property mTLSCAPath: string read GetmTLSCAPath;
     property OnValidateClientCertificate: TClientCertValidateEvent read GetOnValidateClientCertificate write SetOnValidateClientCertificate;
+    property TlsProvider: TTlsProvider read GetTlsProvider write SetTlsProvider;
+    property TlsCertFile: string read GetTlsCertFile write SetTlsCertFile;
+    property TlsKeyFile: string read GetTlsKeyFile write SetTlsKeyFile;
+    property TlsKeyPassword: string read GetTlsKeyPassword write SetTlsKeyPassword;
   end;
 
 function GetPrimaryIPv4Address: string;
+function ParseTlsProviderOption(const AValue: string; ADefault: TTlsProvider = tpSchannel): TTlsProvider;
+function GetConfiguredTlsProvider(ADefault: TTlsProvider = tpSchannel): TTlsProvider;
+function TlsProviderToString(AProvider: TTlsProvider): string;
 
 implementation
 
 function GetPrimaryIPv4Address: string;
 begin
   Result := GHttpsServerTypes.GetPrimaryIPv4Address;
+end;
+
+function ParseTlsProviderOption(const AValue: string; ADefault: TTlsProvider): TTlsProvider;
+begin
+  Result := WinApiAdditions.ParseTlsProviderOption(AValue, ADefault);
+end;
+
+function GetConfiguredTlsProvider(ADefault: TTlsProvider): TTlsProvider;
+begin
+  Result := WinApiAdditions.GetConfiguredTlsProvider(ADefault);
+end;
+
+function TlsProviderToString(AProvider: TTlsProvider): string;
+begin
+  Result := WinApiAdditions.TlsProviderToString(AProvider);
 end;
 
 constructor TEndpointItem.Create(const APath: string;
@@ -761,10 +794,10 @@ begin
   if FIocpEngine.Running then
     Exit;
 
-  if FHttp3Bridge.EnableHttp3 and (FIocpEngine.ProtocolMode <> pmHttpOnly) and not IsMsQuicDllAvailable(Http3DllErr) then
+  if FHttp3Bridge.EnableHttp3 and (FIocpEngine.ProtocolMode <> pmHttpOnly) and not IsMsQuicDllAvailable(Http3DllErr, FTlsManager.TlsProvider) then
   begin
     Logger.Critical('CRITICAL ERROR: Failed to load required HTTP/3 libraries: ' + Http3DllErr);
-    Logger.Critical('The server cannot start without working msquic.dll and ls-qpack.dll.');
+    Logger.Critical('The server cannot start without working ' + IfThen(FTlsManager.TlsProvider = tpOpenSSL, 'msquicSSL.dll', 'msquic.dll') + ' and ls-qpack.dll.');
     Logger.Critical(Format('Place valid 64-bit DLL files in: %s', [ExtractFilePath(ParamStr(0))]));
     Exit;
   end;
@@ -804,11 +837,28 @@ begin
 
   if FIocpEngine.ProtocolMode in [pmHttpsOnly, pmDualHttpAndHttps] then
   begin
+    if FTlsManager.TlsProvider = tpOpenSSL then
+    begin
+      if not EnsureOpenSslLoaded then
+      begin
+        Logger.Error('================================================================');
+        Logger.Error('  CRITICAL ERROR: Failed to load OpenSSL 3.x DLLs (tpOpenSSL)!');
+        Logger.Error('  %s', [GetOpenSslLoadError]);
+        Logger.Error('  Ensure libcrypto-3-x64.dll and libssl-3-x64.dll are present.');
+        Logger.Error('================================================================');
+        FIocpEngine.CleanupWinsock;
+        Exit;
+      end;
+      Logger.Info('[TLS] Active provider: tpOpenSSL (%s)', [GetOpenSslVersionText]);
+    end
+    else
+      Logger.Info('[TLS] Active provider: tpSchannel (Windows SChannel)');
+
     if not FTlsManager.LoadServerCertificate then
     begin
       Logger.Error('');
       Logger.Error('================================================================');
-      Logger.Error('  CRITICAL ERROR: TLS certificate not found in Windows store!');
+      Logger.Error('  CRITICAL ERROR: TLS certificate not found or failed to load!');
       Logger.Error('  The server cannot start without a valid TLS certificate.');
       Logger.Error('  Run from the project root directory:');
       Logger.Error('  powershell -ExecutionPolicy Bypass -File gen_quic_cert.ps1');
@@ -839,6 +889,7 @@ begin
   FIocpEngine.RejectNewConnections := 0;
   if FIocpEngine.MonitorRun then
   begin
+    IsMultiThread := True;
     FIocpEngine.MonitorThread := CreateThread(nil, 0, @TIocpWorkerEngine.MonitorThreadProc, FIocpEngine, 0, ThreadId);
     if FIocpEngine.MonitorThread = 0 then
     begin
@@ -892,7 +943,10 @@ begin
         end;
       end;
 
-      Logger.Info(Format('[H3] Creating HTTP/3 server with SHA-1 hash %s from store LocalMachine\%s', [H3HashHex, FTlsManager.CertificateStore]));
+      if FTlsManager.TlsProvider = tpOpenSSL then
+        Logger.Info(Format('[H3] Creating HTTP/3 server from PEM files (%s, %s)', [FTlsManager.TlsCertFile, FTlsManager.TlsKeyFile]))
+      else
+        Logger.Info(Format('[H3] Creating HTTP/3 server with SHA-1 hash %s from store LocalMachine\%s', [H3HashHex, FTlsManager.CertificateStore]));
       H3Svr := THttp3Server.Create(H3HashHex, FTlsManager.CertificateStore, FTlsManager.SubjectName, FTlsManager.ServerCertStore);
       FHttp3Bridge.Http3Server := H3Svr;
       H3Svr.EnableWebTransport;
@@ -921,6 +975,9 @@ begin
         H3Svr.QuicServer.mTLSRequired := (FTlsManager.mTLSMode = mtlsRequired);
         H3Svr.QuicServer.mTLSOptional := (FTlsManager.mTLSMode = mtlsOptional);
         H3Svr.QuicServer.CACertContext := FTlsManager.CACertContext;
+        H3Svr.QuicServer.TlsProvider := FTlsManager.TlsProvider;
+        H3Svr.QuicServer.TlsCertFile := FTlsManager.TlsCertFile;
+        H3Svr.QuicServer.TlsKeyFile := FTlsManager.TlsKeyFile;
         H3Svr.QuicServer.OnValidateClientCertificate := FTlsManager.OnValidateClientCertificate;
         H3Svr.QuicServer.OnBeforeAcceptConnection := FHttp3Bridge.HandleQuicBeforeAcceptConnection;
         H3Svr.QuicServer.OnAfterCloseConnection := FHttp3Bridge.HandleQuicAfterCloseConnection;
@@ -2087,5 +2144,48 @@ procedure TGHttpsServerIOCP.SetOnValidateClientCertificate(const Value: TClientC
 begin
   FTlsManager.OnValidateClientCertificate := Value;
 end;
+
+function TGHttpsServerIOCP.GetTlsProvider: TTlsProvider;
+begin
+  Result := FTlsManager.TlsProvider;
+end;
+
+procedure TGHttpsServerIOCP.SetTlsProvider(const Value: TTlsProvider);
+begin
+  FTlsManager.TlsProvider := Value;
+end;
+
+function TGHttpsServerIOCP.GetTlsCertFile: string;
+begin
+  Result := FTlsManager.TlsCertFile;
+end;
+
+procedure TGHttpsServerIOCP.SetTlsCertFile(const Value: string);
+begin
+  FTlsManager.TlsCertFile := Value;
+end;
+
+function TGHttpsServerIOCP.GetTlsKeyFile: string;
+begin
+  Result := FTlsManager.TlsKeyFile;
+end;
+
+procedure TGHttpsServerIOCP.SetTlsKeyFile(const Value: string);
+begin
+  FTlsManager.TlsKeyFile := Value;
+end;
+
+function TGHttpsServerIOCP.GetTlsKeyPassword: string;
+begin
+  Result := FTlsManager.TlsKeyPassword;
+end;
+
+procedure TGHttpsServerIOCP.SetTlsKeyPassword(const Value: string);
+begin
+  FTlsManager.TlsKeyPassword := Value;
+end;
+
+initialization
+  SetInOutRes(0);
 
 end.

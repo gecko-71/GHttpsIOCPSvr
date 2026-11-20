@@ -27,7 +27,7 @@ interface
 
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.StrUtils, System.IOUtils,
-  System.SyncObjs, System.Hash, System.Generics.Collections, Quick.Logger, GTerm.ConPty.Loader, GTerm.Types;
+  System.SyncObjs, System.Hash, System.Generics.Collections, GLogger, GTerm.ConPty.Loader, GTerm.Types;
 
 const
   PROC_THREAD_ATTRIBUTE_HANDLE_LIST          = $00020002;

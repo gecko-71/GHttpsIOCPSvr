@@ -105,6 +105,19 @@ type
   end;
   PQUIC_CERTIFICATE_PKCS12 = ^QUIC_CERTIFICATE_PKCS12;
 
+  QUIC_CERTIFICATE_FILE = record
+    PrivateKeyFile: PAnsiChar;
+    CertificateFile: PAnsiChar;
+  end;
+  PQUIC_CERTIFICATE_FILE = ^QUIC_CERTIFICATE_FILE;
+
+  QUIC_CERTIFICATE_FILE_PROTECTED = record
+    PrivateKeyFile: PAnsiChar;
+    CertificateFile: PAnsiChar;
+    PrivateKeyPassword: PAnsiChar;
+  end;
+  PQUIC_CERTIFICATE_FILE_PROTECTED = ^QUIC_CERTIFICATE_FILE_PROTECTED;
+
   QUIC_EXECUTION_PROFILE = UInt32;
 const
   QUIC_EXECUTION_PROFILE_LOW_LATENCY = 0;

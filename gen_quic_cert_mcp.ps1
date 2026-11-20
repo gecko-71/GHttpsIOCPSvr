@@ -1,3 +1,8 @@
+param(
+    [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER,
+    [string]$ExportDir = ""
+)
+
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 Get-ChildItem Cert:\CurrentUser\GMcpSvr -ErrorAction SilentlyContinue | Where-Object { $_.Subject -like "*CN=localhost*" -or $_.FriendlyName -eq "GMcpSvr" } | Remove-Item -Force -ErrorAction SilentlyContinue
@@ -14,6 +19,7 @@ $cert = New-SelfSignedCertificate `
     -KeyLength 2048 `
     -HashAlgorithm SHA256 `
     -KeyUsage DigitalSignature, KeyEncipherment `
+    -KeyExportPolicy Exportable `
     -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.1,1.3.6.1.5.5.7.3.2') `
     -NotAfter (Get-Date).AddYears(5) `
     -FriendlyName "GMcpSvr"
@@ -35,6 +41,57 @@ if ($isAdmin) {
         $destStoreLM.Add($cert)
         $destStoreLM.Close()
     } catch {}
+}
+
+$EffectiveTlsProvider = if ([string]::IsNullOrWhiteSpace($TlsProvider)) { "tpSchannel" } else { $TlsProvider }
+
+function Export-McpCertPairToDir([string]$TargetOutDir, $CertObj) {
+    if (-not (Test-Path $TargetOutDir)) {
+        New-Item -ItemType Directory -Path $TargetOutDir -Force | Out-Null
+    }
+    $b64 = [System.Convert]::ToBase64String($CertObj.RawData, [System.Base64FormattingOptions]::InsertLineBreaks)
+    $crtPem = "-----BEGIN CERTIFICATE-----`n$b64`n-----END CERTIFICATE-----`n"
+    [System.IO.File]::WriteAllText((Join-Path $TargetOutDir "mcp_server.crt"), $crtPem, [System.Text.Encoding]::ASCII)
+
+    try {
+        $expRsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($CertObj)
+        if ($expRsaKey) {
+            $pkcs8Bytes = $null
+            if ($expRsaKey.PSObject.Methods['ExportPkcs8PrivateKey']) {
+                $pkcs8Bytes = $expRsaKey.ExportPkcs8PrivateKey()
+            } elseif ($expRsaKey -is [System.Security.Cryptography.RSACng]) {
+                $pkcs8Bytes = $expRsaKey.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+            }
+            if ($pkcs8Bytes) {
+                $k64 = [System.Convert]::ToBase64String($pkcs8Bytes, [System.Base64FormattingOptions]::InsertLineBreaks)
+                $keyPem = "-----BEGIN PRIVATE KEY-----`n$k64`n-----END PRIVATE KEY-----`n"
+                [System.IO.File]::WriteAllText((Join-Path $TargetOutDir "mcp_server.key"), $keyPem, [System.Text.Encoding]::ASCII)
+            }
+        }
+    } catch {
+        Write-Warning "OpenSSL PEM key export note: $($_.Exception.Message)"
+    }
+}
+
+$ExportTargets = New-Object System.Collections.Generic.List[string]
+if (-not [string]::IsNullOrWhiteSpace($ExportDir)) {
+    $ResolvedExportDir = if ([System.IO.Path]::IsPathRooted($ExportDir)) { $ExportDir } else { Join-Path $PSScriptRoot $ExportDir }
+    $ExportTargets.Add($ResolvedExportDir)
+} else {
+    $ExportTargets.Add((Join-Path $PSScriptRoot "certs"))
+    if ($EffectiveTlsProvider -match '(?i)openssl') {
+        $ExportTargets.Add((Join-Path $PSScriptRoot "test_certs"))
+    }
+    foreach ($relBin in @("Win64\Debug", "Win64\Release", "GMcpSvr\Win64\Debug", "GMcpSvr\Win64\Release")) {
+        $absBin = Join-Path $PSScriptRoot $relBin
+        if (Test-Path $absBin) {
+            $ExportTargets.Add((Join-Path $absBin "certs"))
+        }
+    }
+}
+
+foreach ($outTarget in ($ExportTargets | Select-Object -Unique)) {
+    Export-McpCertPairToDir $outTarget $cert
 }
 
 try {
@@ -67,6 +124,7 @@ try {
 
 Write-Host "New CNG MCP certificate generated successfully." -ForegroundColor Green
 Write-Host "Store Name:  GMcpSvr" -ForegroundColor Cyan
+Write-Host "TLS Profile: $EffectiveTlsProvider" -ForegroundColor Cyan
 Write-Host "Subject:     $($cert.Subject)" -ForegroundColor Cyan
 Write-Host "Thumbprint:  $($cert.Thumbprint)" -ForegroundColor Yellow
 Write-Host "Valid Until: $($cert.NotAfter)" -ForegroundColor Green

@@ -26,6 +26,7 @@
     <File Path="src"/>
     <File Path="src\GHttpsServerIOCP.pas"/>
     <File Path="src\GJWTManager.pas"/>
+    <File Path="src\GLogger.pas"/>
     <File Path="src\GRequest.pas"/>
     <File Path="src\GRequestBody.pas"/>
     <File Path="src\GResponse.pas"/>

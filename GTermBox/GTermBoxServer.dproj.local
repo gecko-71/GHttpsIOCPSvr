@@ -1,6 +1,22 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <BorlandProject>
 	<ProjectSortOrder AutoSort="0" SortType="0">
+    <File Path="..\..\GHttpsIOCPSvr"/>
+    <File Path="..\Http3DelphiV3"/>
+    <File Path="..\Http3DelphiV3\MsQuic.Types.pas"/>
+    <File Path="..\Http3DelphiV3\Quic.Server.pas"/>
+    <File Path="..\Http3DelphiV3\WebTransport.Session.pas"/>
+    <File Path="..\Http3DelphiV3\WebTransport.Types.pas"/>
+    <File Path="..\src"/>
+    <File Path="..\src\GHttpsServerIOCP.pas"/>
+    <File Path="..\src\GJWTManager.pas"/>
+    <File Path="..\src\GLogger.pas"/>
+    <File Path="..\src\GOpenSslTlsEngine.pas"/>
+    <File Path="..\src\GRequest.pas"/>
+    <File Path="..\src\GRequestBody.pas"/>
+    <File Path="..\src\GResponse.pas"/>
+    <File Path="..\src\OverlappedExPool.pas"/>
+    <File Path="..\src\WinApiAdditions.pas"/>
     <File Path="src"/>
     <File Path="src\GTerm.AmsiScanner.pas"/>
     <File Path="src\GTerm.AppConfig.pas"/>
@@ -9,16 +25,5 @@
     <File Path="src\GTerm.Session.pas"/>
     <File Path="src\GTerm.Types.pas"/>
     <File Path="src\GTerm.UserConfig.pas"/>
-    <File Path="GHttpsIOCPSvr\src\GHttpsServerIOCP.pas"/>
-    <File Path="GHttpsIOCPSvr\src\GJWTManager.pas"/>
-    <File Path="GHttpsIOCPSvr\src\GRequest.pas"/>
-    <File Path="GHttpsIOCPSvr\src\GRequestBody.pas"/>
-    <File Path="GHttpsIOCPSvr\src\GResponse.pas"/>
-    <File Path="GHttpsIOCPSvr\src\OverlappedExPool.pas"/>
-    <File Path="GHttpsIOCPSvr\src\WinApiAdditions.pas"/>
-    <File Path="GHttpsIOCPSvr\Http3DelphiV3\MsQuic.Types.pas"/>
-    <File Path="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Types.pas"/>
-    <File Path="GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Session.pas"/>
-    <File Path="GHttpsIOCPSvr\Http3DelphiV3\Quic.Server.pas"/>
   </ProjectSortOrder>
 </BorlandProject>

@@ -30,10 +30,10 @@ program GHttpsIOCPSvrWebTransport;
 {$R *.res}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger in 'src\GLogger.pas',
   System.SysUtils,
   System.Classes,
   System.Generics.Collections,
@@ -73,12 +73,14 @@ uses
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [mmetUnexpectedMemoryLeakDetail,
                             mmetUnexpectedMemoryLeakSummary,
                             mmetDebugBlockDoubleFree,
                             mmetDebugBlockReallocOfFreedBlock];
+{$IFEND}
 end;
 
 procedure PrepareTestFile(const ASubDir, AFileName: string; AFileSizeInBytes: Int64);
@@ -192,6 +194,7 @@ begin
   Writeln('  -daemon                       Run as continuous background daemon without console input');
   Writeln('  -certstore:<name>             Windows Certificate Store name (default: GHttpsIOCPSvr)');
   Writeln('  -subject:<name>               TLS Certificate Subject name (default: ' + GetPrimaryIPv4Address + ')');
+  Writeln('  -tls:tpSchannel | tpOpenSSL   Select TLS engine provider (default: tpSchannel)');
   Writeln('  -help / -h / -?               Display this help message');
   Writeln('----------------------------------------------------------------');
   Writeln('WEBTRANSPORT ENDPOINTS:');
@@ -259,28 +262,7 @@ begin
                            FindCmdLineSwitch('disable-log', True) or
                            FindCmdLineSwitch('no-log', True);
 
-    Logger.WaitForFlushBeforeExit := 60;
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var AFileName := '.\Log';
-    if (not LoggingDisabled) and (not TDirectory.Exists(AFileName)) then
-       TDirectory.CreateDirectory(AFileName);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := AFileName + '\GHttpsIOCPSvrWebTransport.log';
-      DailyRotate := True;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      Enabled := not LoggingDisabled;
-    end;
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := not LoggingDisabled;
-    end;
+    GLog.InitDefault('.\Log\GHttpsIOCPSvrWebTransport.log', not LoggingDisabled, True, True, 50, False, 60);
 
     var CertStoreName: string := 'GHttpsIOCPSvr';
     var SubjectNameParam: string := GetPrimaryIPv4Address;
@@ -370,6 +352,7 @@ begin
           [HttpPortParam, HttpsPortParam, ActionStr]));
       end;
     end;
+    Logger.Info(Format('Active TLS Provider: %s', [TlsProviderToString(GetConfiguredTlsProvider(tpSchannel))]));
     Logger.Info('================================================================');
     Logger.Info('Starting server...');
 

@@ -27,7 +27,7 @@ unit GRequestBody;
 interface
 
 uses
-  Quick.Logger, System.SysUtils, System.Classes, System.Generics.Collections,
+  GLogger, System.SysUtils, System.Classes, System.Generics.Collections,
   System.StrUtils, System.Character, System.Math,
   System.NetEncoding, System.IOUtils, System.DateUtils, Winapi.Windows;
 

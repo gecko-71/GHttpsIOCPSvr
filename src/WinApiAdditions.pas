@@ -27,7 +27,7 @@ unit WinApiAdditions;
 interface
 
 uses
-   Quick.Logger, Winapi.Windows, Winapi.Winsock2,
+   GLogger, Winapi.Windows, Winapi.Winsock2,
    GRequest,
    GResponse,
    System.Classes,
@@ -65,6 +65,11 @@ type
                     otWebSocketRead,
                     otWebSocketWrite);
 
+  TTlsProvider = (
+    tpSchannel,
+    tpOpenSSL
+  );
+
   POverlappedEx = ^TOverlappedEx;
   TOverlappedEx = record
     Overlapped: TOverlapped;
@@ -76,6 +81,12 @@ type
     ClientSocket: TSocket;
     SSLContext: TCtxtHandle;
     SSLContextValid: Boolean;
+    OpenSSLHandle: Pointer;
+    OpenSSLRBio: Pointer;
+    OpenSSLWBio: Pointer;
+    SSLLockPtr: POverlappedEx;
+    SSLContextBorrowed: Boolean;
+    SSLLock: _RTL_SRWLOCK;
     SSLStreamHeaderSize: DWORD;
     SSLStreamTrailerSize: DWORD;
     SSLStreamMaxMessage: DWORD;
@@ -103,6 +114,11 @@ type
     ClientIP: array[0..45] of AnsiChar;
     ClientCertInfo: TGClientCertInfo;
   end;
+
+  TOverlappedTlsCleanupProc = procedure(var OverlappedEx: TOverlappedEx);
+
+var
+  GOverlappedTlsCleanupProc: TOverlappedTlsCleanupProc = nil;
 
 
 const
@@ -523,11 +539,19 @@ procedure SafeFreeSSLBuffer(var Buffer: Pointer);
 procedure AppendBytesToFile(const FileName: string; const Data: TBytes);
 
 function GetPrimaryIPv4Address: string;
+function ParseTlsProviderOption(const AValue: string; ADefault: TTlsProvider = tpSchannel): TTlsProvider;
+function GetConfiguredTlsProvider(ADefault: TTlsProvider = tpSchannel): TTlsProvider;
+function TlsProviderToString(AProvider: TTlsProvider): string;
+function GetConfiguredTlsCertFile: string;
+function GetConfiguredTlsKeyFile: string;
+function ResolveOpenSslCertAndKeyFiles(const AStoreName, ASubjectName: string; var ACertFile, AKeyFile: string): Boolean;
+function PFXImportCertStore(pPFX: PCRYPT_DATA_BLOB; szPassword: LPCWSTR; dwFlags: DWORD): HCERTSTORE; stdcall;
+  external 'crypt32.dll';
 function SetFileCompletionNotificationModes(FileHandle: THandle; Flags: Byte): BOOL; stdcall; external 'kernel32.dll';
 
 implementation
 
-uses System.SyncObjs;
+uses System.SyncObjs, System.IOUtils;
 
 var
   GAppendFileLock: TCriticalSection = nil;
@@ -763,6 +787,325 @@ begin
 
   if NeedCleanup then
     WSACleanup;
+end;
+
+function ParseTlsProviderOption(const AValue: string; ADefault: TTlsProvider): TTlsProvider;
+var
+  Normalized: string;
+begin
+  Result := ADefault;
+  Normalized := LowerCase(Trim(AValue));
+  if (Normalized = 'tpopenssl') or (Normalized = 'openssl') then
+    Result := tpOpenSSL
+  else if (Normalized = 'tpschannel') or (Normalized = 'schannel') then
+    Result := tpSchannel;
+end;
+
+function GetConfiguredTlsProvider(ADefault: TTlsProvider): TTlsProvider;
+var
+  EnvVal: string;
+  Idx: Integer;
+  Arg: string;
+  LowArg: string;
+  SepPos: Integer;
+  ValPart: string;
+begin
+  Result := ADefault;
+  EnvVal := GetEnvironmentVariable('GHTTPS_TLS_PROVIDER');
+  if Trim(EnvVal) <> '' then
+    Result := ParseTlsProviderOption(EnvVal, Result);
+
+  Idx := 1;
+  while Idx <= ParamCount do
+  begin
+    Arg := Trim(ParamStr(Idx));
+    LowArg := LowerCase(Arg);
+    if (LowArg = '--tpopenssl') or (LowArg = '-tpopenssl') or
+       (LowArg = '--openssl') or (LowArg = '-openssl') then
+      Result := tpOpenSSL
+    else if (LowArg = '--tpschannel') or (LowArg = '-tpschannel') or
+            (LowArg = '--schannel') or (LowArg = '-schannel') then
+      Result := tpSchannel
+    else if (LowArg = '-tls') or (LowArg = '--tls') then
+    begin
+      if Idx + 1 <= ParamCount then
+      begin
+        Result := ParseTlsProviderOption(ParamStr(Idx + 1), Result);
+        Inc(Idx);
+      end;
+    end
+    else if (Copy(LowArg, 1, 5) = '-tls:') or (Copy(LowArg, 1, 5) = '-tls=') or
+            (Copy(LowArg, 1, 6) = '--tls:') or (Copy(LowArg, 1, 6) = '--tls=') then
+    begin
+      SepPos := Pos(':', Arg);
+      if SepPos = 0 then
+        SepPos := Pos('=', Arg);
+      if SepPos > 0 then
+      begin
+        ValPart := Copy(Arg, SepPos + 1, MaxInt);
+        Result := ParseTlsProviderOption(ValPart, Result);
+      end;
+    end;
+    Inc(Idx);
+  end;
+end;
+
+function TlsProviderToString(AProvider: TTlsProvider): string;
+begin
+  if AProvider = tpOpenSSL then
+    Result := 'tpOpenSSL'
+  else
+    Result := 'tpSchannel';
+end;
+
+function GetCliOptionByFlags(const AFlags: array of string): string;
+var
+  Idx: Integer;
+  Arg: string;
+  LowArg: string;
+  FlagName: string;
+  LowFlag: string;
+begin
+  Result := '';
+  Idx := 1;
+  while Idx <= ParamCount do
+  begin
+    Arg := Trim(ParamStr(Idx));
+    LowArg := LowerCase(Arg);
+    for FlagName in AFlags do
+    begin
+      LowFlag := LowerCase(FlagName);
+      if LowArg = LowFlag then
+      begin
+        if Idx + 1 <= ParamCount then
+        begin
+          Result := Trim(ParamStr(Idx + 1));
+          Inc(Idx);
+        end;
+      end
+      else if (Copy(LowArg, 1, Length(LowFlag) + 1) = LowFlag + ':') or
+              (Copy(LowArg, 1, Length(LowFlag) + 1) = LowFlag + '=') then
+        Result := Trim(Copy(Arg, Length(LowFlag) + 2, MaxInt));
+    end;
+    Inc(Idx);
+  end;
+end;
+
+function GetConfiguredTlsCertFile: string;
+var
+  CliVal: string;
+begin
+  Result := Trim(GetEnvironmentVariable('GHTTPS_TLS_CERT_FILE'));
+  CliVal := GetCliOptionByFlags(['--cert', '-cert', '--tls-cert', '-tls-cert']);
+  if CliVal <> '' then
+    Result := CliVal;
+end;
+
+function GetConfiguredTlsKeyFile: string;
+var
+  CliVal: string;
+begin
+  Result := Trim(GetEnvironmentVariable('GHTTPS_TLS_KEY_FILE'));
+  CliVal := GetCliOptionByFlags(['--key', '-key', '--tls-key', '-tls-key']);
+  if CliVal <> '' then
+    Result := CliVal;
+end;
+
+function IsIpv4AddressText(const AValue: string): Boolean;
+var
+  I: Integer;
+  DotCount: Integer;
+  Ch: Char;
+begin
+  Result := False;
+  if AValue = '' then
+    Exit;
+  DotCount := 0;
+  for I := 1 to Length(AValue) do
+  begin
+    Ch := AValue[I];
+    if Ch = '.' then
+      Inc(DotCount)
+    else if (Ch < '0') or (Ch > '9') then
+      Exit;
+  end;
+  Result := DotCount = 3;
+end;
+
+function ResolveExistingFilePath(const APathText, AExeDir: string): string;
+var
+  Candidate: string;
+begin
+  Result := '';
+  if APathText = '' then
+    Exit;
+  if TPath.IsPathRooted(APathText) then
+  begin
+    if FileExists(APathText) then
+      Result := TPath.GetFullPath(APathText);
+    Exit;
+  end;
+  Candidate := TPath.Combine(GetCurrentDir, APathText);
+  if FileExists(Candidate) then
+    Exit(TPath.GetFullPath(Candidate));
+  if AExeDir <> '' then
+  begin
+    Candidate := TPath.Combine(AExeDir, APathText);
+    if FileExists(Candidate) then
+      Exit(TPath.GetFullPath(Candidate));
+  end;
+end;
+
+function TryCertKeyPairInDir(const ADirPath, ACertName, AKeyName: string; var ACertFile, AKeyFile: string): Boolean;
+var
+  CandCert: string;
+  CandKey: string;
+begin
+  Result := False;
+  if ADirPath = '' then
+    Exit;
+  CandCert := TPath.Combine(ADirPath, ACertName);
+  CandKey := TPath.Combine(ADirPath, AKeyName);
+  if FileExists(CandCert) and FileExists(CandKey) then
+  begin
+    ACertFile := TPath.GetFullPath(CandCert);
+    AKeyFile := TPath.GetFullPath(CandKey);
+    Result := True;
+  end;
+end;
+
+function ResolveOpenSslCertAndKeyFiles(const AStoreName, ASubjectName: string; var ACertFile, AKeyFile: string): Boolean;
+var
+  ExeDir: string;
+  CurDir: string;
+  ResolvedCert: string;
+  ResolvedKey: string;
+  StoreDirExe: string;
+  StoreDirCur: string;
+  IsDefaultStore: Boolean;
+  IsStandardSubject: Boolean;
+  CandDirs: array[0..3] of string;
+  I: Integer;
+begin
+  Result := False;
+  ExeDir := ExcludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)));
+  CurDir := ExcludeTrailingPathDelimiter(GetCurrentDir);
+
+  if ACertFile = '' then
+    ACertFile := GetConfiguredTlsCertFile;
+  if AKeyFile = '' then
+    AKeyFile := GetConfiguredTlsKeyFile;
+
+  if (ACertFile <> '') or (AKeyFile <> '') then
+  begin
+    if (ACertFile = '') or (AKeyFile = '') then
+      Exit(False);
+    ResolvedCert := ResolveExistingFilePath(ACertFile, ExeDir);
+    ResolvedKey := ResolveExistingFilePath(AKeyFile, ExeDir);
+    if (ResolvedCert <> '') and (ResolvedKey <> '') then
+    begin
+      ACertFile := ResolvedCert;
+      AKeyFile := ResolvedKey;
+      Exit(True);
+    end;
+    Exit(False);
+  end;
+
+  IsDefaultStore := (AStoreName = '') or
+                    SameText(AStoreName, 'GHttpsIOCPSvr') or
+                    SameText(AStoreName, 'My') or
+                    SameText(AStoreName, 'GMcpSvr');
+
+  if not IsDefaultStore then
+  begin
+    if ExeDir <> '' then
+    begin
+      StoreDirExe := TPath.Combine(TPath.Combine(ExeDir, 'certs'), AStoreName);
+      if (ASubjectName <> '') and (not SameText(ASubjectName, 'localhost')) then
+      begin
+        if TryCertKeyPairInDir(StoreDirExe, ASubjectName + '.crt', ASubjectName + '.key', ACertFile, AKeyFile) then
+          Exit(True);
+      end;
+      if TryCertKeyPairInDir(StoreDirExe, 'server.crt', 'server.key', ACertFile, AKeyFile) then
+        Exit(True);
+    end
+    else if CurDir <> '' then
+    begin
+      StoreDirCur := TPath.Combine(TPath.Combine(CurDir, 'certs'), AStoreName);
+      if (ASubjectName <> '') and (not SameText(ASubjectName, 'localhost')) then
+      begin
+        if TryCertKeyPairInDir(StoreDirCur, ASubjectName + '.crt', ASubjectName + '.key', ACertFile, AKeyFile) then
+          Exit(True);
+      end;
+      if TryCertKeyPairInDir(StoreDirCur, 'server.crt', 'server.key', ACertFile, AKeyFile) then
+        Exit(True);
+    end;
+    Exit(False);
+  end;
+
+  IsStandardSubject := (ASubjectName = '') or
+                       SameText(ASubjectName, 'localhost') or
+                       SameText(ASubjectName, '::1') or
+                       IsIpv4AddressText(ASubjectName);
+
+  if not IsStandardSubject then
+  begin
+    if ExeDir <> '' then
+    begin
+      if TryCertKeyPairInDir(TPath.Combine(ExeDir, 'certs'), ASubjectName + '.crt', ASubjectName + '.key', ACertFile, AKeyFile) then
+        Exit(True);
+      if TryCertKeyPairInDir(ExeDir, ASubjectName + '.crt', ASubjectName + '.key', ACertFile, AKeyFile) then
+        Exit(True);
+    end
+    else if CurDir <> '' then
+    begin
+      if TryCertKeyPairInDir(TPath.Combine(CurDir, 'certs'), ASubjectName + '.crt', ASubjectName + '.key', ACertFile, AKeyFile) then
+        Exit(True);
+      if TryCertKeyPairInDir(CurDir, ASubjectName + '.crt', ASubjectName + '.key', ACertFile, AKeyFile) then
+        Exit(True);
+    end;
+    Exit(False);
+  end;
+
+  if SameText(AStoreName, 'GMcpSvr') then
+  begin
+    if ExeDir <> '' then
+    begin
+      if TryCertKeyPairInDir(TPath.Combine(ExeDir, 'certs'), 'mcp_server.crt', 'mcp_server.key', ACertFile, AKeyFile) then
+        Exit(True);
+      if TryCertKeyPairInDir(ExeDir, 'mcp_server.crt', 'mcp_server.key', ACertFile, AKeyFile) then
+        Exit(True);
+    end
+    else if CurDir <> '' then
+    begin
+      if TryCertKeyPairInDir(TPath.Combine(CurDir, 'certs'), 'mcp_server.crt', 'mcp_server.key', ACertFile, AKeyFile) then
+        Exit(True);
+      if TryCertKeyPairInDir(CurDir, 'mcp_server.crt', 'mcp_server.key', ACertFile, AKeyFile) then
+        Exit(True);
+    end;
+  end;
+
+  if ExeDir <> '' then
+  begin
+    CandDirs[0] := TPath.Combine(ExeDir, 'certs');
+    CandDirs[1] := ExeDir;
+    CandDirs[2] := TPath.Combine(ExeDir, 'cercts_server');
+    CandDirs[3] := TPath.Combine(ExeDir, 'server_certificates');
+    for I := 0 to 3 do
+    begin
+      if TryCertKeyPairInDir(CandDirs[I], 'server.crt', 'server.key', ACertFile, AKeyFile) then
+        Exit(True);
+      if TryCertKeyPairInDir(CandDirs[I], 'localhost.crt', 'localhost.key', ACertFile, AKeyFile) then
+        Exit(True);
+    end;
+  end
+  else if CurDir <> '' then
+  begin
+    if TryCertKeyPairInDir(TPath.Combine(CurDir, 'certs'), 'server.crt', 'server.key', ACertFile, AKeyFile) then
+      Exit(True);
+    if TryCertKeyPairInDir(CurDir, 'server.crt', 'server.key', ACertFile, AKeyFile) then
+      Exit(True);
+  end;
 end;
 
 initialization

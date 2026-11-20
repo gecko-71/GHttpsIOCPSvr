@@ -29,10 +29,10 @@ program GHttpsIOCPSvr;
 {$R *.res}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger in 'src\GLogger.pas',
   System.SysUtils,
   System.Classes,
   Winapi.Windows,
@@ -71,12 +71,14 @@ uses
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [mmetUnexpectedMemoryLeakDetail,
                             mmetUnexpectedMemoryLeakSummary,
                             mmetDebugBlockDoubleFree,
                             mmetDebugBlockReallocOfFreedBlock];
+{$IFEND}
 end;
 
 procedure PrepareTestFile(const ASubDir, AFileName: string; AFileSizeInBytes: Int64);
@@ -142,6 +144,7 @@ begin
   Writeln('  -nolog                        Disable all logging (maximum performance)');
   Writeln('  -certstore:<name>             Windows Certificate Store name (default: GHttpsIOCPSvr)');
   Writeln('  -subject:<name>               TLS Certificate Subject name (default: ' + GetPrimaryIPv4Address + ')');
+  Writeln('  -tls:tpSchannel | tpOpenSSL   Select TLS engine provider (default: tpSchannel)');
   Writeln('  -help / -h / -?               Display this help message');
   Writeln('----------------------------------------------------------------');
   Writeln('SERVER CONTROL:');
@@ -154,6 +157,7 @@ const
    DOWNLAD_FILE = 'largefile_10mb.bin';
 
 begin
+  SetInOutRes(0);
   if FindCmdLineSwitch('help', True) or FindCmdLineSwitch('h', True) or
      FindCmdLineSwitch('?', True) or FindCmdLineSwitch('-help', True) then
   begin
@@ -168,28 +172,7 @@ begin
                            FindCmdLineSwitch('disable-log', True) or
                            FindCmdLineSwitch('no-log', True);
 
-    Logger.WaitForFlushBeforeExit := 60;
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var AFileName := '.\Log';
-    if (not LoggingDisabled) and (not TDirectory.Exists(AFileName)) then
-       TDirectory.CreateDirectory(AFileName);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := AFileName + '\Logger.log';
-      DailyRotate := True;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      Enabled := not LoggingDisabled;
-    end;
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := not LoggingDisabled;
-    end;
+    GLog.InitDefault('.\Log\Logger.log', not LoggingDisabled, True, True, 50, False, 60);
 
     var CertStoreName: string := 'GHttpsIOCPSvr';
     var SubjectNameParam: string := GetPrimaryIPv4Address;
@@ -317,11 +300,13 @@ begin
     Logger.Info(Format('  HTTP->HTTPS 301: %s', [BoolToStr(HttpActionParam = haRedirectToHttps, True)]));
     Logger.Info(Format('  Keep-Alive:      %s', [BoolToStr(KeepAliveParam, True)]));
     Logger.Info(Format('  Cert Store:      %s (Subject: %s)', [CertStoreName, SubjectNameParam]));
+    Logger.Info(Format('  TLS Provider:    %s', [TlsProviderToString(GetConfiguredTlsProvider(tpSchannel))]));
     Logger.Info('----------------------------------------------------------------');
     Logger.Info('CLI SWITCHES GUIDE:');
     Logger.Info('  -mode:http|dual|https  -httpport:<port>  -httpsport:<port>');
     Logger.Info('  -redirect              -keepalive|-nokeepalive  -nolog');
     Logger.Info('  -certstore:<name>      -subject:<name>          -help');
+    Logger.Info('  -tls:tpSchannel|tpOpenSSL');
     Logger.Info('  -bind:<ip>  -httpbind:<ip>  -httpsbind:<ip>  -http3bind:<ip>');
     Logger.Info('================================================================');
     Logger.Info('Starting server...');

@@ -28,7 +28,7 @@ interface
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.JSON, System.IOUtils,
   System.Generics.Collections, System.SyncObjs,
-  Quick.Logger, GTerm.Types;
+  GLogger, GTerm.Types;
 
 type
   TAppEntry = record

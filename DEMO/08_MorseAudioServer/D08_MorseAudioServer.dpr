@@ -29,10 +29,10 @@ program D08_MorseAudioServer;
 {$R *.res}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger,
   System.SysUtils,
   System.Classes,
   System.Generics.Collections,
@@ -54,12 +54,14 @@ uses
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [mmetUnexpectedMemoryLeakDetail,
                             mmetUnexpectedMemoryLeakSummary,
                             mmetDebugBlockDoubleFree,
                             mmetDebugBlockReallocOfFreedBlock];
+{$IFEND}
 end;
 
 const
@@ -524,28 +526,7 @@ end;
 begin
   ConfigureFastMM;
   try
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var LogDir := '.\Log';
-    if not TDirectory.Exists(LogDir) then
-      TDirectory.CreateDirectory(LogDir);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := LogDir + '\Logger.log';
-      DailyRotate := True;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      Enabled := True;
-    end;
-
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := True;
-    end;
+    GLog.InitDefault('.\Log\Logger.log', True, True, True, 50, False, 10);
 
     Logger.Info('=====================================================');
     Logger.Info('  DEMO 08: Morse Audio Radio Server (IOCP)');

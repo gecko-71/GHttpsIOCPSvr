@@ -8,6 +8,7 @@ param(
   [switch]$SkipFar,
   [switch]$SkipEdit,
   [hashtable[]]$CustomApps = @(),
+  [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER,
   [switch]$Interactive,
   [switch]$NonInteractive
 )
@@ -15,6 +16,15 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+
+$HasExplicitTlsProvider = -not [string]::IsNullOrWhiteSpace($TlsProvider)
+if ([string]::IsNullOrWhiteSpace($TlsProvider)) {
+  $EffectiveTlsProvider = "tpSchannel"
+} elseif ($TlsProvider -match '(?i)openssl') {
+  $EffectiveTlsProvider = "tpOpenSSL"
+} else {
+  $EffectiveTlsProvider = "tpSchannel"
+}
 
 if ([string]::IsNullOrWhiteSpace($TargetDir)) {
   if (Test-Path (Join-Path $ScriptDir "GTermBoxServer.exe")) {
@@ -30,9 +40,46 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
   } else {
     $TargetDir = Join-Path $ScriptDir "Win64\Debug"
   }
+} elseif (-not [System.IO.Path]::IsPathRooted($TargetDir)) {
+  $cwdTarget = Join-Path (Get-Location).Path $TargetDir
+  if (Test-Path $cwdTarget) {
+    $TargetDir = $cwdTarget
+  } else {
+    $TargetDir = Join-Path $ScriptDir $TargetDir
+  }
 }
 
+if (-not (Test-Path $TargetDir)) {
+  New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+}
 $TargetDir = (Resolve-Path $TargetDir).Path
+
+$CandidateDllDirs = @(
+  $TargetDir,
+  $ScriptDir,
+  (Join-Path $ScriptDir "Win64\Debug"),
+  (Join-Path $ScriptDir "Win64\Release"),
+  (Join-Path $ScriptDir "..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\Win64\Release"),
+  (Join-Path $ScriptDir "..\..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\..\Win64\Release"),
+  (Join-Path $ScriptDir "..\..\..\Win64\Debug"),
+  (Join-Path $ScriptDir "..\..\..\Win64\Release"),
+  (Join-Path (Get-Location).Path "Win64\Debug"),
+  (Join-Path (Get-Location).Path "Win64\Release")
+)
+foreach ($dllName in @("msquic.dll", "ls-qpack.dll", "libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+  $destDll = Join-Path $TargetDir $dllName
+  if (-not (Test-Path $destDll)) {
+    foreach ($candDir in $CandidateDllDirs) {
+      $candDll = Join-Path $candDir $dllName
+      if (Test-Path $candDll) {
+        Copy-Item -Path $candDll -Destination $destDll -Force
+        break
+      }
+    }
+  }
+}
 
 $IsInteractive = $false
 if ($Interactive) {
@@ -93,9 +140,17 @@ if (Test-Path $ManageUsersExe) {
   Write-Host "[1/4] Initializing base environment and configurations..." -ForegroundColor Yellow
   Push-Location $TargetDir
   try {
-    & $ManageUsersExe init-env $TargetDir
-    & $ManageUsersExe passwd admin 1234 | Out-Null
-    & $ManageUsersExe passwd usr1 1234 | Out-Null
+    $initArgs = @("init-env", $TargetDir)
+    $passwdAdminArgs = @("passwd", "admin", "1234")
+    $passwdUsrArgs = @("passwd", "usr1", "1234")
+    if ($HasExplicitTlsProvider) {
+      $initArgs += "-tls:$EffectiveTlsProvider"
+      $passwdAdminArgs += "-tls:$EffectiveTlsProvider"
+      $passwdUsrArgs += "-tls:$EffectiveTlsProvider"
+    }
+    & $ManageUsersExe @initArgs
+    & $ManageUsersExe @passwdAdminArgs | Out-Null
+    & $ManageUsersExe @passwdUsrArgs | Out-Null
   } finally {
     Pop-Location
   }
@@ -168,7 +223,11 @@ foreach ($mu in $DefaultMtlsUsers) {
   if (Test-Path $ManageUsersExe) {
     Push-Location $TargetDir
     try {
-      & $ManageUsersExe bind-cert $cName "$cName.crt" | Out-Null
+      $bindArgs = @("bind-cert", $cName, "$cName.crt")
+      if ($HasExplicitTlsProvider) {
+        $bindArgs += "-tls:$EffectiveTlsProvider"
+      }
+      & $ManageUsersExe @bindArgs | Out-Null
     } finally {
       Pop-Location
     }
@@ -192,7 +251,7 @@ $UserStore = New-Object System.Security.Cryptography.X509Certificates.X509Store(
 $UserStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
 try {
   $ServerCert = $null
-  $ReuseCandidates = @($UserStore.Certificates | Where-Object { $_.Subject -eq 'CN=localhost' -and $_.HasPrivateKey -and $_.NotAfter -gt $CertNow.AddDays(30) } | Sort-Object NotAfter -Descending)
+  $ReuseCandidates = @($UserStore.Certificates | Where-Object { $_.Subject -eq 'CN=localhost' -and $_.HasPrivateKey -and $_.PublicKey.Oid.Value -eq '1.2.840.10045.2.1' -and ($_.NotAfter - $_.NotBefore).TotalDays -le 14.1 -and $_.NotAfter -gt $CertNow.AddDays(1) } | Sort-Object NotAfter -Descending)
   foreach ($rc in $ReuseCandidates) {
     $sanExtObj = $rc.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' }
     $sanText = ''
@@ -205,14 +264,14 @@ try {
   }
 
   if ($ServerCert) {
-    Write-Host ("  [=] Reusing valid server certificate {0} (expires {1})" -f $ServerCert.Thumbprint, $ServerCert.NotAfter) -ForegroundColor DarkGray
+    Write-Host ("  [=] Reusing valid W3C ECDSA P-256 server certificate {0} (expires {1})" -f $ServerCert.Thumbprint, $ServerCert.NotAfter) -ForegroundColor DarkGray
   } else {
     $sanParts = New-Object System.Collections.Generic.List[string]
     $sanParts.Add('DNS=localhost')
     if ($ServerHostName -and $ServerHostName -ne 'localhost') { $sanParts.Add("DNS=$ServerHostName") }
     foreach ($ip in $ServerIps) { $sanParts.Add("IPAddress=$ip") }
     $sanExt = '2.5.29.17={text}' + ($sanParts -join '&')
-    $newServerCert = New-SelfSignedCertificate -Subject 'CN=localhost' -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy Exportable -KeySpec KeyExchange -KeyUsage DigitalSignature,KeyEncipherment -KeyLength 2048 -KeyAlgorithm RSA -HashAlgorithm SHA256 -Type Custom -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.1', $sanExt) -NotAfter $CertNow.AddYears(5)
+    $newServerCert = New-SelfSignedCertificate -Subject 'CN=localhost' -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy Exportable -KeyUsage DigitalSignature -KeyAlgorithm ECDSA_nistP256 -HashAlgorithm SHA256 -Type Custom -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.1', $sanExt) -NotBefore $CertNow.AddDays(-1) -NotAfter $CertNow.AddDays(13) -FriendlyName 'GHttpsIOCPSvr'
 
     foreach ($old in @($UserStore.Certificates | Where-Object { $_.Subject -eq 'CN=localhost' })) {
       try {
@@ -225,7 +284,7 @@ try {
     $UserStore.Add($newServerCert)
     Remove-Item -Path ("Cert:\CurrentUser\My\" + $newServerCert.Thumbprint) -Force
     $ServerCert = $newServerCert
-    Write-Host ("  [+] Generated new server certificate {0} (SAN: {1})" -f $ServerCert.Thumbprint, ($sanParts -join ', ')) -ForegroundColor Green
+    Write-Host ("  [+] Generated new W3C ECDSA P-256 server certificate {0} (SAN: {1})" -f $ServerCert.Thumbprint, ($sanParts -join ', ')) -ForegroundColor Green
   }
 
   if ($IsAdmin) {
@@ -250,7 +309,46 @@ try {
     }
   }
 
-  [System.IO.File]::WriteAllBytes($ServerCerPath, $ServerCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+  $TargetCertsDir = Join-Path $TargetDir "certs"
+  if (-not (Test-Path $TargetCertsDir)) {
+    New-Item -ItemType Directory -Path $TargetCertsDir -Force | Out-Null
+  }
+  $cerBytes = $ServerCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+  [System.IO.File]::WriteAllBytes($ServerCerPath, $cerBytes)
+  [System.IO.File]::WriteAllBytes((Join-Path $TargetCertsDir "localhost.cer"), $cerBytes)
+  $srvB64 = [Convert]::ToBase64String($ServerCert.RawData, [Base64FormattingOptions]::InsertLineBreaks)
+  $srvPem = "-----BEGIN CERTIFICATE-----`n$srvB64`n-----END CERTIFICATE-----`n"
+  $srvCrtPath = Join-Path $TargetDir "localhost.crt"
+  [System.IO.File]::WriteAllText($srvCrtPath, $srvPem, [System.Text.Encoding]::ASCII)
+  [System.IO.File]::WriteAllText((Join-Path $TargetCertsDir "server.crt"), $srvPem, [System.Text.Encoding]::ASCII)
+  [System.IO.File]::WriteAllText((Join-Path $TargetCertsDir "localhost.crt"), $srvPem, [System.Text.Encoding]::ASCII)
+  $srvKeyPath = Join-Path $TargetDir "localhost.key"
+  $pkcs8Bytes = $null
+  $ecdsaKey = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($ServerCert)
+  if ($null -ne $ecdsaKey) {
+    if ($ecdsaKey -is [System.Security.Cryptography.ECDsaCng]) {
+      $pkcs8Bytes = $ecdsaKey.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+    } else {
+      $pkcs8Bytes = $ecdsaKey.ExportPkcs8PrivateKey()
+    }
+  } else {
+    $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($ServerCert)
+    if ($null -ne $rsaKey) {
+      if ($rsaKey -is [System.Security.Cryptography.RSACng]) {
+        $pkcs8Bytes = $rsaKey.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+      } else {
+        $pkcs8Bytes = $rsaKey.ExportPkcs8PrivateKey()
+      }
+    }
+  }
+  if ($null -ne $pkcs8Bytes) {
+    $keyB64 = [Convert]::ToBase64String($pkcs8Bytes, [Base64FormattingOptions]::InsertLineBreaks)
+    $keyPem = "-----BEGIN PRIVATE KEY-----`n$keyB64`n-----END PRIVATE KEY-----`n"
+    [System.IO.File]::WriteAllText($srvKeyPath, $keyPem, [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText((Join-Path $TargetCertsDir "server.key"), $keyPem, [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText((Join-Path $TargetCertsDir "localhost.key"), $keyPem, [System.Text.Encoding]::ASCII)
+    Write-Host ("  [+] OpenSSL PEM key exported:    {0}" -f $srvKeyPath) -ForegroundColor Green
+  }
   Write-Host ("  [+] Server certificate exported: {0}" -f $ServerCerPath) -ForegroundColor Green
   Write-Host ("      Thumbprint: {0}  Expires: {1}" -f $ServerCert.Thumbprint, $ServerCert.NotAfter) -ForegroundColor DarkGray
 } finally {
@@ -592,11 +690,13 @@ if ($SkipPython) {
       Set-Content -Path $PyTuiRunCmd -Value "@echo off`r`npython app.py`r`n" -Encoding ASCII
     }
 
+$TlsCliFlag = if ($HasExplicitTlsProvider) { @("-tls:$EffectiveTlsProvider") } else { @() }
+
     if (Test-Path $ManageUsersExe) {
       Push-Location $TargetDir
       try {
-        & $ManageUsersExe add-app python "Python Console" "python.exe" --sandbox=job-only --no-network --args="-i,-q" --env="TERM=xterm-256color,COLORTERM=truecolor,PYTHONIOENCODING=utf-8,PYTHONUTF8=1" | Out-Null
-        & $ManageUsersExe add-app pytui "Python Demo TUI" "PyTui\run.cmd" --sandbox=job-only --no-network --env="TERM=xterm-256color,COLORTERM=truecolor,PYTHONIOENCODING=utf-8,PYTHONUTF8=1" | Out-Null
+        & $ManageUsersExe add-app python "Python Console" "python.exe" --sandbox=job-only --no-network --args="-i,-q" --env="TERM=xterm-256color,COLORTERM=truecolor,PYTHONIOENCODING=utf-8,PYTHONUTF8=1" @TlsCliFlag | Out-Null
+        & $ManageUsersExe add-app pytui "Python Demo TUI" "PyTui\run.cmd" --sandbox=job-only --no-network --env="TERM=xterm-256color,COLORTERM=truecolor,PYTHONIOENCODING=utf-8,PYTHONUTF8=1" @TlsCliFlag | Out-Null
       } finally {
         Pop-Location
       }
@@ -611,7 +711,7 @@ if ($SkipFar) {
     Remove-Item -Path $TargetFarDir -Recurse -Force -ErrorAction SilentlyContinue
   }
   if (Test-Path $ManageUsersExe) {
-    & $ManageUsersExe delete-app far | Out-Null
+    & $ManageUsersExe delete-app far @TlsCliFlag | Out-Null
   }
 } elseif (-not [string]::IsNullOrWhiteSpace($FarPath)) {
   $FarResolvedExe = $FarPath
@@ -630,7 +730,7 @@ if ($SkipFar) {
     if (Test-Path $ManageUsersExe) {
       Push-Location $TargetDir
       try {
-        & $ManageUsersExe add-app far "Far Manager" "Far\Far.exe" --sandbox=standard --no-network --cols=160 --rows=38 --args="-title:Far,-s,%SANDBOX%\profile,%SANDBOX%\profile\local,%SANDBOX%,%SANDBOX%" | Out-Null
+        & $ManageUsersExe add-app far "Far Manager" "Far\Far.exe" --sandbox=standard --no-network --cols=160 --rows=38 --args="-title:Far,-s,%SANDBOX%\profile,%SANDBOX%\profile\local,%SANDBOX%,%SANDBOX%" @TlsCliFlag | Out-Null
       } finally {
         Pop-Location
       }
@@ -645,7 +745,7 @@ if ($SkipEdit) {
     Remove-Item -Path $TargetEditDir -Recurse -Force -ErrorAction SilentlyContinue
   }
   if (Test-Path $ManageUsersExe) {
-    & $ManageUsersExe delete-app edit | Out-Null
+    & $ManageUsersExe delete-app edit @TlsCliFlag | Out-Null
   }
 } elseif (-not [string]::IsNullOrWhiteSpace($EditPath)) {
   $EditResolvedExe = $EditPath
@@ -666,7 +766,7 @@ if ($SkipEdit) {
     if (Test-Path $ManageUsersExe) {
       Push-Location $TargetDir
       try {
-        & $ManageUsersExe add-app edit "Microsoft Edit" "Edit\edit.exe" --sandbox=standard --no-network --cols=120 --rows=40 | Out-Null
+        & $ManageUsersExe add-app edit "Microsoft Edit" "Edit\edit.exe" --sandbox=standard --no-network --cols=120 --rows=40 @TlsCliFlag | Out-Null
       } finally {
         Pop-Location
       }
@@ -685,6 +785,7 @@ if ($CustomApps.Count -gt 0 -and (Test-Path $ManageUsersExe)) {
 
     $argsList = @("add-app", $aId, $aName, $aCmd, "--sandbox=$aSb")
     if ($bNet) { $argsList += "--network" } else { $argsList += "--no-network" }
+    if ($HasExplicitTlsProvider) { $argsList += "-tls:$EffectiveTlsProvider" }
 
     Push-Location $TargetDir
     try {
@@ -704,7 +805,7 @@ if ((Test-Path $AppsJsonPath) -and (Test-Path $ManageUsersExe)) {
     if ($activeAppIds.Count -gt 0) {
       Push-Location $TargetDir
       try {
-        & $ManageUsersExe edit usr1 "--apps=$($activeAppIds -join ',')" | Out-Null
+        & $ManageUsersExe edit usr1 "--apps=$($activeAppIds -join ',')" @TlsCliFlag | Out-Null
       } finally {
         Pop-Location
       }
@@ -740,6 +841,8 @@ $Checklist = @(
   @{ Name = "web\index.html";     Path = (Join-Path $TargetDir "web\index.html");     Required = $true; Skipped = $false },
   @{ Name = "msquic.dll";         Path = (Join-Path $TargetDir "msquic.dll");         Required = $true; Skipped = $false },
   @{ Name = "ls-qpack.dll";       Path = (Join-Path $TargetDir "ls-qpack.dll");       Required = $true; Skipped = $false },
+  @{ Name = "libcrypto-3-x64.dll"; Path = (Join-Path $TargetDir "libcrypto-3-x64.dll"); Required = ($EffectiveTlsProvider -eq "tpOpenSSL"); Skipped = $false },
+  @{ Name = "libssl-3-x64.dll";    Path = (Join-Path $TargetDir "libssl-3-x64.dll");    Required = ($EffectiveTlsProvider -eq "tpOpenSSL"); Skipped = $false },
   @{ Name = "users.json";         Path = (Join-Path $TargetDir "users.json");         Required = $true; Skipped = $false },
   @{ Name = "apps.json";          Path = (Join-Path $TargetDir "apps.json");          Required = $true; Skipped = $false },
   @{ Name = "trusted_clients\admin.crt"; Path = (Join-Path $TargetDir "trusted_clients\admin.crt"); Required = $true; Skipped = $false },
@@ -747,6 +850,8 @@ $Checklist = @(
   @{ Name = "client_keys\admin.pfx";     Path = (Join-Path $TargetDir "client_keys\admin.pfx");     Required = $true; Skipped = $false },
   @{ Name = "client_keys\usr1.pfx";      Path = (Join-Path $TargetDir "client_keys\usr1.pfx");      Required = $true; Skipped = $false },
   @{ Name = "localhost.cer";      Path = (Join-Path $TargetDir "localhost.cer");      Required = $true; Skipped = $false },
+  @{ Name = "localhost.crt";      Path = (Join-Path $TargetDir "localhost.crt");      Required = ($EffectiveTlsProvider -eq "tpOpenSSL"); Skipped = $false },
+  @{ Name = "localhost.key";      Path = (Join-Path $TargetDir "localhost.key");      Required = ($EffectiveTlsProvider -eq "tpOpenSSL"); Skipped = $false },
   @{ Name = "Python\python.exe";  Path = (Join-Path $TargetDir "Python\python.exe");  Required = (-not $SkipPython); Skipped = $SkipPython },
   @{ Name = "PyTui\app.py";       Path = (Join-Path $TargetDir "PyTui\app.py");       Required = (-not $SkipPython); Skipped = $SkipPython },
   @{ Name = "PyTui\run.cmd";      Path = (Join-Path $TargetDir "PyTui\run.cmd");      Required = (-not $SkipPython); Skipped = $SkipPython },

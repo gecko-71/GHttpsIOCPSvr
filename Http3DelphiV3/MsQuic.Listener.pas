@@ -61,7 +61,7 @@ type
 implementation
 
 uses
-  Quick.Logger;
+  GLogger;
 
 constructor TMsQuicListener.Create(const AApi: PQuicApiTable; ARegistration: TMsQuicRegistration);
 var

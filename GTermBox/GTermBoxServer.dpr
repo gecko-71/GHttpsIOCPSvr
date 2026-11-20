@@ -3,10 +3,10 @@ program GTermBoxServer;
 {$APPTYPE CONSOLE}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger in '..\src\GLogger.pas',
   System.SysUtils,
   System.Classes,
   System.IOUtils,
@@ -17,7 +17,7 @@ uses
   System.Generics.Collections,
   System.StrUtils,
   System.NetEncoding,
-  Quic.Server in 'GHttpsIOCPSvr\Http3DelphiV3\Quic.Server.pas',
+  Quic.Server in '..\Http3DelphiV3\Quic.Server.pas',
   Winapi.Windows,
   Winapi.Winsock2,
   GTerm.Types in 'src\GTerm.Types.pas',
@@ -26,20 +26,22 @@ uses
   GTerm.ConPty.Loader in 'src\GTerm.ConPty.Loader.pas',
   GTerm.ConPty in 'src\GTerm.ConPty.pas',
   GTerm.Session in 'src\GTerm.Session.pas',
-  GHttpsServerIOCP in 'GHttpsIOCPSvr\src\GHttpsServerIOCP.pas',
-  GJWTManager in 'GHttpsIOCPSvr\src\GJWTManager.pas',
-  GRequest in 'GHttpsIOCPSvr\src\GRequest.pas',
-  GRequestBody in 'GHttpsIOCPSvr\src\GRequestBody.pas',
-  GResponse in 'GHttpsIOCPSvr\src\GResponse.pas',
-  OverlappedExPool in 'GHttpsIOCPSvr\src\OverlappedExPool.pas',
-  WinApiAdditions in 'GHttpsIOCPSvr\src\WinApiAdditions.pas',
-  MsQuic.Types in 'GHttpsIOCPSvr\Http3DelphiV3\MsQuic.Types.pas',
-  WebTransport.Types in 'GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Types.pas',
-  WebTransport.Session in 'GHttpsIOCPSvr\Http3DelphiV3\WebTransport.Session.pas',
+  GHttpsServerIOCP in '..\src\GHttpsServerIOCP.pas',
+  GJWTManager in '..\src\GJWTManager.pas',
+  GRequest in '..\src\GRequest.pas',
+  GRequestBody in '..\src\GRequestBody.pas',
+  GResponse in '..\src\GResponse.pas',
+  OverlappedExPool in '..\src\OverlappedExPool.pas',
+  WinApiAdditions in '..\src\WinApiAdditions.pas',
+  GOpenSslTlsEngine in '..\src\GOpenSslTlsEngine.pas',
+  MsQuic.Types in '..\Http3DelphiV3\MsQuic.Types.pas',
+  WebTransport.Types in '..\Http3DelphiV3\WebTransport.Types.pas',
+  WebTransport.Session in '..\Http3DelphiV3\WebTransport.Session.pas',
   GTerm.AmsiScanner in 'src\GTerm.AmsiScanner.pas';
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [
@@ -48,6 +50,7 @@ begin
     mmetDebugBlockDoubleFree,
     mmetDebugBlockReallocOfFreedBlock
   ];
+{$IFEND}
 end;
 
 const
@@ -132,6 +135,10 @@ var
   NumRead: DWORD;
   GServerRunning: Boolean = True;
   GServerCertIsTrusted: Boolean = False;
+  GTlsCertFile: string = '';
+  GTlsKeyFile: string = '';
+  GCertSha256Hex: string = '';
+  GCertSha1Hex: string = '';
 
 function ConsoleCtrlHandler(dwCtrlType: DWORD): BOOL; stdcall;
 begin
@@ -1650,30 +1657,7 @@ begin
   GTrustedClients := TDictionary<string, string>.Create;
   try
     try
-    Logger.WaitForFlushBeforeExit := 60;
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var LogDir := '.\Log';
-    if not TDirectory.Exists(LogDir) then
-      TDirectory.CreateDirectory(LogDir);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := LogDir + '\GTermBoxServer.log';
-      DailyRotate := False;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      AutoFlush := True;
-      Enabled := True;
-    end;
-
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := True;
-    end;
+    GLog.InitDefault('.\Log\GTermBoxServer.log', True, True, False, 50, True, 60);
 
     Logger.Info('================================================================');
     Logger.Info('  GTermBox Web Terminal Host Server (FastMM5 + QuickLogger)');
@@ -1819,9 +1803,16 @@ begin
       begin
         Inc(IParam);
         GIdleTimeoutSeconds := StrToIntDef(ParamStr(IParam), 300);
-      end;
+      end
+      else if (SameText(Arg, '--tls') or SameText(Arg, '-tls') or
+               SameText(Arg, '--cert') or SameText(Arg, '-cert') or
+               SameText(Arg, '--key') or SameText(Arg, '-key')) and (IParam < ParamCount) then
+        Inc(IParam);
       Inc(IParam);
     end;
+
+    GTlsCertFile := GetConfiguredTlsCertFile;
+    GTlsKeyFile := GetConfiguredTlsKeyFile;
 
     if GTrustedClientsDir = '' then
     begin
@@ -1838,21 +1829,45 @@ begin
 
     var CertCheckErr: string;
     var IsCertTrusted: Boolean := False;
-    if not CheckServerCertificateValidity(CertStoreName, SubjectNameParam, CertCheckErr, IsCertTrusted) then
+    if GetConfiguredTlsProvider(tpSchannel) = tpOpenSSL then
     begin
-      if (SubjectNameParam <> 'localhost') and CheckServerCertificateValidity(CertStoreName, 'localhost', CertCheckErr, IsCertTrusted) then
+      if not ResolveOpenSslCertAndKeyFiles(CertStoreName, SubjectNameParam, GTlsCertFile, GTlsKeyFile) then
       begin
-        SubjectNameParam := 'localhost';
-      end
-      else
+        if (SubjectNameParam <> 'localhost') and ResolveOpenSslCertAndKeyFiles(CertStoreName, 'localhost', GTlsCertFile, GTlsKeyFile) then
+          SubjectNameParam := 'localhost'
+        else
+        begin
+          Logger.Critical(Format('CRITICAL ERROR: No TLS certificate with subject "%s" found in store "%s" (or certs directory). Run .\gen_w3c_wt_cert.ps1 -TlsProvider tpOpenSSL to generate a 14-day W3C certificate.', [SubjectNameParam, CertStoreName]));
+          ExitCode := 1;
+          Exit;
+        end;
+      end;
+      if not ValidateOpenSslServerCertAndKeyFiles(GTlsCertFile, GTlsKeyFile, CertStoreName, SubjectNameParam, True, CertCheckErr, IsCertTrusted, GCertSha256Hex, GCertSha1Hex) then
       begin
         Logger.Critical('CRITICAL ERROR: ' + CertCheckErr);
-        ExitCode := 1; Exit;
+        ExitCode := 1;
+        Exit;
+      end;
+    end
+    else
+    begin
+      if not CheckServerCertificateValidity(CertStoreName, SubjectNameParam, CertCheckErr, IsCertTrusted) then
+      begin
+        if (SubjectNameParam <> 'localhost') and CheckServerCertificateValidity(CertStoreName, 'localhost', CertCheckErr, IsCertTrusted) then
+          SubjectNameParam := 'localhost'
+        else
+        begin
+          Logger.Critical('CRITICAL ERROR: ' + CertCheckErr);
+          ExitCode := 1;
+          Exit;
+        end;
       end;
     end;
     GServerCertIsTrusted := IsCertTrusted;
     if GServerCertIsTrusted then
-      Logger.Info('[Cert] Server certificate is TRUSTED by Windows Root CA (14-day limit waived)')
+      Logger.Info('[Cert] Server certificate is TRUSTED (14-day limit waived)')
+    else if GetConfiguredTlsProvider(tpSchannel) = tpOpenSSL then
+      Logger.Info('[Cert] Server certificate is self-signed W3C compliant (ECDSA P-256, <=14 days, PEM files verified)')
     else
       Logger.Info('[Cert] Server certificate is self-signed W3C compliant (ECDSA P-256, <=14 days, CNG permissions verified)');
 
@@ -1920,9 +1935,14 @@ begin
       );
 
       Server.SetSSLShutdownOptions(True, 200);
+      if GTlsCertFile <> '' then
+        Server.TlsCertFile := GTlsCertFile;
+      if GTlsKeyFile <> '' then
+        Server.TlsKeyFile := GTlsKeyFile;
       Server.JWTManager.SetRevocationStorePath(ExtractFilePath(ParamStr(0)) + 'revoked_tokens.json');
       Server.JWTManager.SetRevocationStorePath(ExtractFilePath(ParamStr(0)) + 'revoked_tokens.json');
       Server.EnableKeepAlive := True;
+      Logger.Info(Format('[TLS] Active TLS Provider: %s', [TlsProviderToString(Server.TlsProvider)]));
       Server.EnableHttp3 := True;
       Server.EnableCORS := False;
       Server.BindAddress := GBindAddress;

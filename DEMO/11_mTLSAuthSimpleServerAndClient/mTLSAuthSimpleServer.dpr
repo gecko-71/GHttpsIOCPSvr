@@ -26,10 +26,10 @@ program mTLSAuthSimpleServer;
 {$APPTYPE CONSOLE}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger,
   System.SysUtils,
   System.Classes,
   System.IOUtils,
@@ -88,13 +88,7 @@ begin
     SetInOutRes(0);
     PinnedClientThumbprint := LoadClientThumbprint;
 
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := True;
-    end;
+    GLog.InitDefault('', True, True);
 
     Logger.Info('============================================================');
     Logger.Info('  GHttpsIOCPSvr DEMO 11: Simple mTLS Direct Trust Server');

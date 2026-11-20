@@ -36,15 +36,23 @@ uses
   System.NetEncoding,
   System.Hash,
   System.Generics.Collections,
-  Quick.Logger,
+  GLogger,
   OverlappedExPool,
   WinApiAdditions,
   GRequest,
-  GHttpsServerTypes;
+  GResponse,
+  GHttpsServerTypes,
+  GOpenSslApi,
+  GOpenSslTlsEngine;
 
 type
   TSchannelTlsManager = class
   private
+    FTlsProvider: TTlsProvider;
+    FTlsCertFile: string;
+    FTlsKeyFile: string;
+    FTlsKeyPassword: string;
+    FOpenSslEngine: TOpenSslTlsEngine;
     FEnableGracefulSSLShutdown: Boolean;
     FSSLShutdownTimeout: Cardinal;
     FCertContext: PCCERT_CONTEXT;
@@ -64,6 +72,7 @@ type
     FExtraCertContexts: TList<PCCERT_CONTEXT>;
     FmTLSCAPath: string;
     procedure BuildAlpnBuffer;
+    function ValidateAndPopulateClientCert(RemoteCert: PCCERT_CONTEXT; var OverlappedEx: TOverlappedEx): Boolean;
     function ProcessClientCertificate(var OverlappedEx: TOverlappedEx): Boolean;
   public
     constructor Create(const ASubjectName, ACertificateStore: string);
@@ -73,20 +82,35 @@ type
     procedure EnableGracefulSSLShutdown(Enable: Boolean);
     procedure SetSSLShutdownTimeout(TimeoutMs: Cardinal);
     procedure PerformGracefulSSLShutdown(var OverlappedEx: TOverlappedEx);
+    procedure ReleaseConnectionContext(var OverlappedEx: TOverlappedEx);
+    function HasPendingRxData(var OverlappedEx: TOverlappedEx): Boolean;
     function LoadServerCertificate: Boolean;
     function GetCertificateSha256Hash: TBytes;
     function InitializeSSLCredentials: Boolean;
     function ProcessSSLHandshakeStep(var OverlappedEx: TOverlappedEx; BytesReceived: DWORD): Boolean;
     function LoadCACertificate(const AFileName: string): Boolean;
     function AddTrustedCertificate(const AFileName: string): Boolean;
+    function DecryptRequestChunk(var OverlappedEx: TOverlappedEx; BytesReceived: DWORD;
+                                 Request: TRequest; out HasPlaintext: Boolean;
+                                 out FatalError: Boolean; out ErrorText: string): Boolean;
+    function EncryptResponseChunks(var OverlappedEx: TOverlappedEx; Response: TResponse;
+                                   out OutLen: Integer; out FatalError: Boolean): Boolean;
     function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
                                  var PlainData: TBytes; out BytesConsumed: Integer): Boolean; overload;
     function DecryptReceivedData(var Context: TCtxtHandle; const EncryptedData: TBytes;
                                  var PlainData: TBytes; out BytesConsumed: Integer; out AStatus: SECURITY_STATUS): Boolean; overload;
+    function DecryptReceivedData(var OverlappedEx: TOverlappedEx; var EncryptedData: TBytes;
+                                 var PlainData: TBytes; out BytesConsumed: Integer; out AStatus: SECURITY_STATUS): Boolean; overload;
     function EncryptBytesToSend(var Context: TCtxtHandle;
-                                const PlainData: TBytes; var EncryptedData: TBytes): Boolean;
+                                const PlainData: TBytes; var EncryptedData: TBytes): Boolean; overload;
+    function EncryptBytesToSend(var OverlappedEx: TOverlappedEx;
+                                const PlainData: TBytes; var EncryptedData: TBytes): Boolean; overload;
     procedure CleanupHandles;
     function mTLSModePtr: Pointer;
+    property TlsProvider: TTlsProvider read FTlsProvider write FTlsProvider;
+    property TlsCertFile: string read FTlsCertFile write FTlsCertFile;
+    property TlsKeyFile: string read FTlsKeyFile write FTlsKeyFile;
+    property TlsKeyPassword: string read FTlsKeyPassword write FTlsKeyPassword;
     property EnableGracefulSSLShutdownFlag: Boolean read FEnableGracefulSSLShutdown write FEnableGracefulSSLShutdown;
     property SSLShutdownTimeout: Cardinal read FSSLShutdownTimeout write FSSLShutdownTimeout;
     property CertContext: PCCERT_CONTEXT read FCertContext;
@@ -105,9 +129,55 @@ type
 
 implementation
 
+procedure ReleaseOverlappedTlsContextGlobal(var OverlappedEx: TOverlappedEx);
+var
+  NeedFreeSchannel: Boolean;
+  ShouldFreeSsl: Boolean;
+  SslPtr: Pointer;
+begin
+  SslPtr := OverlappedEx.OpenSSLHandle;
+  if SslPtr <> nil then
+  begin
+    ShouldFreeSsl := not OverlappedEx.SSLContextBorrowed;
+    OverlappedEx.OpenSSLHandle := nil;
+    OverlappedEx.OpenSSLRBio := nil;
+    OverlappedEx.OpenSSLWBio := nil;
+    OverlappedEx.SSLContextBorrowed := False;
+    OverlappedEx.SSLLockPtr := nil;
+    if ShouldFreeSsl and IsOpenSslLoaded and Assigned(OsslSslFree) then
+    begin
+      try
+        OsslSslFree(PSSL(SslPtr));
+      except
+      end;
+    end;
+  end;
+
+  NeedFreeSchannel := OverlappedEx.SSLContextValid and
+                      (not OverlappedEx.SSLContextBorrowed) and
+                      ((OverlappedEx.SSLContext.dwLower <> 0) or (OverlappedEx.SSLContext.dwUpper <> 0));
+  if NeedFreeSchannel then
+  begin
+    try
+      DeleteSecurityContext(@OverlappedEx.SSLContext);
+    except
+    end;
+  end;
+  OverlappedEx.SSLContext.dwLower := 0;
+  OverlappedEx.SSLContext.dwUpper := 0;
+  OverlappedEx.SSLContextBorrowed := False;
+  OverlappedEx.SSLContextValid := False;
+end;
+
 constructor TSchannelTlsManager.Create(const ASubjectName, ACertificateStore: string);
 begin
   inherited Create;
+  FTlsProvider := GetConfiguredTlsProvider(tpSchannel);
+  FTlsCertFile := GetConfiguredTlsCertFile;
+  FTlsKeyFile := GetConfiguredTlsKeyFile;
+  FTlsKeyPassword := '';
+  FOpenSslEngine := TOpenSslTlsEngine.Create;
+  GOverlappedTlsCleanupProc := ReleaseOverlappedTlsContextGlobal;
   FSubjectName := ASubjectName;
   FCertificateStore := ACertificateStore;
   FEnableGracefulSSLShutdown := True;
@@ -130,6 +200,7 @@ end;
 destructor TSchannelTlsManager.Destroy;
 begin
   CleanupHandles;
+  FreeAndNil(FOpenSslEngine);
   inherited Destroy;
 end;
 
@@ -142,9 +213,14 @@ procedure TSchannelTlsManager.CleanupHandles;
 var
   Ctx: PCCERT_CONTEXT;
 begin
+  if Assigned(FOpenSslEngine) then
+    FOpenSslEngine.Cleanup;
   if FCredentialsValid then
   begin
-    FreeCredentialsHandle(@FServerCredHandle);
+    if (FServerCredHandle.dwLower <> 0) or (FServerCredHandle.dwUpper <> 0) then
+      FreeCredentialsHandle(@FServerCredHandle);
+    FServerCredHandle.dwLower := 0;
+    FServerCredHandle.dwUpper := 0;
     FCredentialsValid := False;
   end;
   if FCertContext <> nil then
@@ -232,6 +308,14 @@ var
   AllocatedSizes: array[0..1] of Cardinal;
   BuffersToFree: Integer;
 begin
+  if (FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil) then
+  begin
+    if Assigned(FOpenSslEngine) then
+      FOpenSslEngine.PerformGracefulShutdown(OverlappedEx, FEnableGracefulSSLShutdown)
+    else
+      ReleaseConnectionContext(OverlappedEx);
+    Exit;
+  end;
   if not OverlappedEx.SSLContextValid then
   begin
     Logger.Info('SSL context no longer valid - skipping shutdown');
@@ -379,6 +463,10 @@ var
   PrevContext: PCCERT_CONTEXT;
   HasExpiredInTargetStore: Boolean;
   OrigSubject: string;
+  CertErr: string;
+  IsCaSigned: Boolean;
+  Sha256Hex: string;
+  Sha1Hex: string;
 
   function TrySearchInStore(SystemStoreFlags: DWORD; const SystemStoreName, StoreName: string): Boolean;
   const
@@ -495,6 +583,39 @@ var
   end;
 
 begin
+  if FTlsProvider = tpOpenSSL then
+  begin
+    if FCertContext <> nil then
+    begin
+      CertFreeCertificateContext(FCertContext);
+      FCertContext := nil;
+    end;
+    if FH3CertContext <> nil then
+    begin
+      CertFreeCertificateContext(FH3CertContext);
+      FH3CertContext := nil;
+    end;
+    if not ResolveOpenSslCertAndKeyFiles(FCertificateStore, FSubjectName, FTlsCertFile, FTlsKeyFile) then
+    begin
+      Logger.Error('[OpenSSL] Server certificate/key PEM files not found for store "%s", subject "%s" (expected certs\server.crt and certs\server.key)', [FCertificateStore, FSubjectName]);
+      Exit(False);
+    end;
+    if not ValidateOpenSslServerCertAndKeyFiles(FTlsCertFile, FTlsKeyFile, FCertificateStore, FSubjectName, False, CertErr, IsCaSigned, Sha256Hex, Sha1Hex) then
+    begin
+      Logger.Error('[OpenSSL] %s', [CertErr]);
+      Exit(False);
+    end;
+    FCertContext := CreateWinCertContextFromFile(FTlsCertFile);
+    if FCertContext <> nil then
+    begin
+      FH3CertContext := CertDuplicateCertificateContext(FCertContext);
+      Logger.Info('[OpenSSL] Certificate loaded exclusively from PEM files: %s, %s', [FTlsCertFile, FTlsKeyFile]);
+      Exit(True);
+    end;
+    Logger.Error('[OpenSSL] Failed to create certificate context from PEM file: %s', [FTlsCertFile]);
+    Exit(False);
+  end;
+
   if FCertificateStore = '' then
     FCertificateStore := 'GHttpsIOCPSvr';
 
@@ -587,6 +708,22 @@ var
   ExtraCtx: PCCERT_CONTEXT;
 begin
   Result := False;
+  if FTlsProvider = tpOpenSSL then
+  begin
+    Result := FOpenSslEngine.InitializeCredentials(
+      FCertContext,
+      FCACertContext,
+      FExtraCertContexts,
+      FTlsCertFile,
+      FTlsKeyFile,
+      FTlsKeyPassword,
+      FEnableTLSSessionResumption,
+      FEnableTLSSessionTickets,
+      FmTLSMode
+    );
+    FCredentialsValid := Result;
+    Exit;
+  end;
   Logger.Info('InitializeSSLCredentials START - Production setup for Windows 11/CNG with SCH_CREDENTIALS...');
   if FCertContext = nil then
   begin
@@ -691,15 +828,40 @@ var
   FreeResult: SECURITY_STATUS;
 begin
   Result := False;
-  BuffersToFree := 0;
-  FillChar(OriginalBuffers, SizeOf(OriginalBuffers), 0);
-  FillChar(AllocatedBuffers, SizeOf(AllocatedBuffers), 0);
-  FillChar(AllocatedSizes, SizeOf(AllocatedSizes), 0);
   if not FCredentialsValid then
   begin
     Logger.Error('SSL Credentials are not initialized');
     Exit;
   end;
+  if FTlsProvider = tpOpenSSL then
+  begin
+    Result := FOpenSslEngine.ProcessHandshakeStep(OverlappedEx, BytesReceived);
+    if Result then
+    begin
+      FillChar(OverlappedEx.ClientCertInfo, SizeOf(OverlappedEx.ClientCertInfo), 0);
+      if FmTLSMode <> mtlsDisabled then
+      begin
+        if not ProcessClientCertificate(OverlappedEx) then
+        begin
+          if FmTLSMode = mtlsRequired then
+          begin
+            PerformGracefulSSLShutdown(OverlappedEx);
+            OverlappedEx.SSLContextValid := False;
+            OverlappedEx.SSLNeedsMoreData := False;
+            OverlappedEx.SSLOutputSize := 0;
+            SetLength(OverlappedEx.ClientReceiveBuffer, 0);
+            Result := False;
+            Exit;
+          end;
+        end;
+      end;
+    end;
+    Exit;
+  end;
+  BuffersToFree := 0;
+  FillChar(OriginalBuffers, SizeOf(OriginalBuffers), 0);
+  FillChar(AllocatedBuffers, SizeOf(AllocatedBuffers), 0);
+  FillChar(AllocatedSizes, SizeOf(AllocatedSizes), 0);
   FirstCall := (OverlappedEx.SSLHandshakeStep = 0);
   Inc(OverlappedEx.SSLHandshakeStep);
   try
@@ -937,10 +1099,8 @@ begin
   end;
 end;
 
-function TSchannelTlsManager.ProcessClientCertificate(var OverlappedEx: TOverlappedEx): Boolean;
+function TSchannelTlsManager.ValidateAndPopulateClientCert(RemoteCert: PCCERT_CONTEXT; var OverlappedEx: TOverlappedEx): Boolean;
 var
-  RemoteCert: PCCERT_CONTEXT;
-  QueryStatus: SECURITY_STATUS;
   NameBuf: array[0..255] of WideChar;
   NameLen: DWORD;
   HashBuf: array[0..31] of Byte;
@@ -954,18 +1114,6 @@ var
   HashBytes: TBytes;
   VerifyFlags: DWORD;
 begin
-  FillChar(OverlappedEx.ClientCertInfo, SizeOf(OverlappedEx.ClientCertInfo), 0);
-  RemoteCert := nil;
-
-  QueryStatus := QueryContextAttributes(@OverlappedEx.SSLContext, SECPKG_ATTR_REMOTE_CERT_CONTEXT, @RemoteCert);
-  if (QueryStatus <> SEC_E_OK) or (RemoteCert = nil) then
-  begin
-    OverlappedEx.ClientCertInfo.HasCertificate := False;
-    OverlappedEx.ClientCertInfo.IsVerified := False;
-    OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate not provided';
-    Exit(False);
-  end;
-
   try
     OverlappedEx.ClientCertInfo.HasCertificate := True;
 
@@ -1536,6 +1684,226 @@ begin
       end;
     end;
   end;
+end;
+
+function TSchannelTlsManager.ProcessClientCertificate(var OverlappedEx: TOverlappedEx): Boolean;
+var
+  RemoteCert: PCCERT_CONTEXT;
+  QueryStatus: SECURITY_STATUS;
+begin
+  FillChar(OverlappedEx.ClientCertInfo, SizeOf(OverlappedEx.ClientCertInfo), 0);
+  RemoteCert := nil;
+
+  if (FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil) then
+  begin
+    if Assigned(FOpenSslEngine) then
+      RemoteCert := FOpenSslEngine.ExtractPeerCertContext(OverlappedEx);
+  end
+  else
+  begin
+    QueryStatus := QueryContextAttributes(@OverlappedEx.SSLContext, SECPKG_ATTR_REMOTE_CERT_CONTEXT, @RemoteCert);
+    if QueryStatus <> SEC_E_OK then
+      RemoteCert := nil;
+  end;
+
+  if RemoteCert = nil then
+  begin
+    OverlappedEx.ClientCertInfo.HasCertificate := False;
+    OverlappedEx.ClientCertInfo.IsVerified := False;
+    OverlappedEx.ClientCertInfo.ValidationError := 'Client certificate not provided';
+    Exit(False);
+  end;
+
+  Result := ValidateAndPopulateClientCert(RemoteCert, OverlappedEx);
+end;
+
+procedure TSchannelTlsManager.ReleaseConnectionContext(var OverlappedEx: TOverlappedEx);
+begin
+  if (FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil) then
+  begin
+    if Assigned(FOpenSslEngine) then
+      FOpenSslEngine.ReleaseContext(OverlappedEx);
+  end;
+  if OverlappedEx.SSLContextValid and
+     (not OverlappedEx.SSLContextBorrowed) and
+     ((OverlappedEx.SSLContext.dwLower <> 0) or (OverlappedEx.SSLContext.dwUpper <> 0)) then
+  begin
+    try
+      DeleteSecurityContext(@OverlappedEx.SSLContext);
+    except
+      on E: Exception do
+        Logger.Error('Delete error SSL context: ' + E.Message);
+    end;
+  end;
+  OverlappedEx.SSLContext.dwLower := 0;
+  OverlappedEx.SSLContext.dwUpper := 0;
+  OverlappedEx.SSLContextBorrowed := False;
+  OverlappedEx.SSLContextValid := False;
+end;
+
+function TSchannelTlsManager.HasPendingRxData(var OverlappedEx: TOverlappedEx): Boolean;
+begin
+  if ((FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil)) and Assigned(FOpenSslEngine) then
+    Result := FOpenSslEngine.HasPendingRxData(OverlappedEx)
+  else
+    Result := False;
+end;
+
+function TSchannelTlsManager.DecryptRequestChunk(var OverlappedEx: TOverlappedEx; BytesReceived: DWORD;
+  Request: TRequest; out HasPlaintext: Boolean; out FatalError: Boolean; out ErrorText: string): Boolean;
+begin
+  if ((FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil)) and Assigned(FOpenSslEngine) then
+    Result := FOpenSslEngine.DecryptRequestChunk(OverlappedEx, BytesReceived, Request, HasPlaintext, FatalError, ErrorText)
+  else
+  begin
+    HasPlaintext := False;
+    FatalError := True;
+    ErrorText := 'DecryptRequestChunk called without active OpenSSL context';
+    Result := False;
+  end;
+end;
+
+function TSchannelTlsManager.EncryptResponseChunks(var OverlappedEx: TOverlappedEx; Response: TResponse;
+  out OutLen: Integer; out FatalError: Boolean): Boolean;
+var
+  HeaderSz, TrailerSz, MaxPayload: Integer;
+  StreamSizes: SecPkgContext_StreamSizes;
+  SecStatus: SECURITY_STATUS;
+  SecBufs: array[0..3] of TSecBuffer;
+  SecDesc: TSecBufferDesc;
+  BytesToEncrypt: Integer;
+  NeedCopy: Boolean;
+  RecLen: Integer;
+  CopyOff: Integer;
+  I: Integer;
+  TempRec: array[0..36863] of Byte;
+begin
+  OutLen := 0;
+  FatalError := False;
+  if (FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil) then
+  begin
+    if not Assigned(FOpenSslEngine) then
+    begin
+      FatalError := True;
+      Exit(False);
+    end;
+    Result := FOpenSslEngine.EncryptResponseChunks(OverlappedEx, Response, OutLen);
+    if not Result then
+      FatalError := True;
+    Exit;
+  end;
+
+  Result := False;
+  if OverlappedEx.SSLStreamSizesValid then
+  begin
+    HeaderSz := OverlappedEx.SSLStreamHeaderSize;
+    TrailerSz := OverlappedEx.SSLStreamTrailerSize;
+    MaxPayload := OverlappedEx.SSLStreamMaxMessage;
+  end
+  else
+  begin
+    SecStatus := QueryContextAttributes(@OverlappedEx.SSLContext, SECPKG_ATTR_STREAM_SIZES, @StreamSizes);
+    if SecStatus <> SEC_E_OK then
+    begin
+      Logger.Error('Download error StreamSizes: 0x%x', [SecStatus]);
+      FatalError := True;
+      Exit;
+    end;
+    HeaderSz := StreamSizes.cbHeader;
+    TrailerSz := StreamSizes.cbTrailer;
+    MaxPayload := StreamSizes.cbMaximumMessage;
+    OverlappedEx.SSLStreamHeaderSize := HeaderSz;
+    OverlappedEx.SSLStreamTrailerSize := TrailerSz;
+    OverlappedEx.SSLStreamMaxMessage := MaxPayload;
+    OverlappedEx.SSLStreamSizesValid := True;
+  end;
+
+  MaxPayload := Min(16384, MaxPayload);
+  if MaxPayload <= 0 then
+  begin
+    FatalError := True;
+    Exit;
+  end;
+
+  while (OutLen + HeaderSz + MaxPayload + TrailerSz <= SizeOf(OverlappedEx.SSLOutputBuffer)) and (not Response.IsComplete) do
+  begin
+    BytesToEncrypt := Response.ReadNextChunk(@OverlappedEx.SSLOutputBuffer[OutLen + HeaderSz], MaxPayload);
+    if BytesToEncrypt <= 0 then
+      Break;
+
+    SecBufs[0].BufferType := SECBUFFER_STREAM_HEADER;
+    SecBufs[0].cbBuffer := HeaderSz;
+    SecBufs[0].pvBuffer := @OverlappedEx.SSLOutputBuffer[OutLen];
+
+    SecBufs[1].BufferType := SECBUFFER_DATA;
+    SecBufs[1].cbBuffer := BytesToEncrypt;
+    SecBufs[1].pvBuffer := @OverlappedEx.SSLOutputBuffer[OutLen + HeaderSz];
+
+    SecBufs[2].BufferType := SECBUFFER_STREAM_TRAILER;
+    SecBufs[2].cbBuffer := TrailerSz;
+    SecBufs[2].pvBuffer := @OverlappedEx.SSLOutputBuffer[OutLen + HeaderSz + BytesToEncrypt];
+
+    SecBufs[3].BufferType := SECBUFFER_EMPTY;
+    SecBufs[3].cbBuffer := 0;
+    SecBufs[3].pvBuffer := nil;
+
+    SecDesc.ulVersion := SECBUFFER_VERSION;
+    SecDesc.cBuffers := 4;
+    SecDesc.pBuffers := @SecBufs[0];
+
+    SecStatus := EncryptMessage(@OverlappedEx.SSLContext, 0, @SecDesc, 0);
+    if SecStatus <> SEC_E_OK then
+    begin
+      Logger.Error('FATAL ERROR: Failed to encrypt chunk. Closing connection.');
+      FatalError := True;
+      Exit;
+    end;
+
+    NeedCopy := (SecBufs[0].pvBuffer <> @OverlappedEx.SSLOutputBuffer[OutLen]) or
+                (SecBufs[1].pvBuffer <> @OverlappedEx.SSLOutputBuffer[OutLen + Integer(SecBufs[0].cbBuffer)]) or
+                (SecBufs[2].pvBuffer <> @OverlappedEx.SSLOutputBuffer[OutLen + Integer(SecBufs[0].cbBuffer) + Integer(SecBufs[1].cbBuffer)]) or
+                (SecBufs[3].cbBuffer > 0);
+    RecLen := Integer(SecBufs[0].cbBuffer) + Integer(SecBufs[1].cbBuffer) + Integer(SecBufs[2].cbBuffer) + Integer(SecBufs[3].cbBuffer);
+    if OutLen + RecLen > SizeOf(OverlappedEx.SSLOutputBuffer) then
+    begin
+      FatalError := True;
+      Exit;
+    end;
+    if NeedCopy then
+    begin
+      CopyOff := 0;
+      for I := 0 to 3 do
+      begin
+        if (SecBufs[I].cbBuffer > 0) and Assigned(SecBufs[I].pvBuffer) then
+        begin
+          Move(SecBufs[I].pvBuffer^, TempRec[CopyOff], SecBufs[I].cbBuffer);
+          Inc(CopyOff, SecBufs[I].cbBuffer);
+        end;
+      end;
+      Move(TempRec[0], OverlappedEx.SSLOutputBuffer[OutLen], CopyOff);
+    end;
+    Inc(OutLen, RecLen);
+  end;
+
+  Result := True;
+end;
+
+function TSchannelTlsManager.DecryptReceivedData(var OverlappedEx: TOverlappedEx; var EncryptedData: TBytes;
+  var PlainData: TBytes; out BytesConsumed: Integer; out AStatus: SECURITY_STATUS): Boolean;
+begin
+  if ((FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil)) and Assigned(FOpenSslEngine) then
+    Result := FOpenSslEngine.DecryptReceivedData(OverlappedEx, EncryptedData, PlainData, BytesConsumed, AStatus)
+  else
+    Result := DecryptReceivedData(OverlappedEx.SSLContext, EncryptedData, PlainData, BytesConsumed, AStatus);
+end;
+
+function TSchannelTlsManager.EncryptBytesToSend(var OverlappedEx: TOverlappedEx;
+  const PlainData: TBytes; var EncryptedData: TBytes): Boolean;
+begin
+  if ((FTlsProvider = tpOpenSSL) or (OverlappedEx.OpenSSLHandle <> nil)) and Assigned(FOpenSslEngine) then
+    Result := FOpenSslEngine.EncryptBytesToSend(OverlappedEx, PlainData, EncryptedData)
+  else
+    Result := EncryptBytesToSend(OverlappedEx.SSLContext, PlainData, EncryptedData);
 end;
 
 end.

@@ -7,17 +7,29 @@ param(
   [string]$Password = '',
 
   [Parameter(Position = 2)]
-  [string]$PfxPath = ''
+  [string]$PfxPath = '',
+
+  [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER
 )
 
 $ErrorActionPreference = 'Stop'
 
+$EffectiveTlsProvider = if ([string]::IsNullOrWhiteSpace($TlsProvider)) { 'tpSchannel' } else { $TlsProvider }
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+if ($PfxPath -and -not [System.IO.Path]::IsPathRooted($PfxPath)) {
+  if (Test-Path (Join-Path $ScriptDir $PfxPath)) {
+    $PfxPath = (Resolve-Path (Join-Path $ScriptDir $PfxPath)).Path
+  } elseif (Test-Path (Join-Path (Get-Location).Path $PfxPath)) {
+    $PfxPath = (Resolve-Path (Join-Path (Get-Location).Path $PfxPath)).Path
+  }
+}
 
 if (-not $PfxPath) {
   $Candidates = @(
     (Join-Path $ScriptDir "$Username.pfx"),
-    (Join-Path $ScriptDir "client_keys\$Username.pfx")
+    (Join-Path $ScriptDir "client_keys\$Username.pfx"),
+    (Join-Path $ScriptDir "Win64\Debug\client_keys\$Username.pfx")
   )
   foreach ($Cand in $Candidates) {
     if (Test-Path $Cand) {
@@ -35,6 +47,31 @@ if (-not $Password) {
   Write-Host "Generated random PFX password for '$Username': $Password" -ForegroundColor Yellow
 }
 
+function Export-ClientPemPair([System.Security.Cryptography.X509Certificates.X509Certificate2]$CertObj, [string]$CrtPath, [string]$KeyPath) {
+  $b64 = [Convert]::ToBase64String($CertObj.RawData, [Base64FormattingOptions]::InsertLineBreaks)
+  $pem = "-----BEGIN CERTIFICATE-----`n$b64`n-----END CERTIFICATE-----`n"
+  [System.IO.File]::WriteAllText($CrtPath, $pem, [System.Text.Encoding]::ASCII)
+
+  if (-not [string]::IsNullOrWhiteSpace($KeyPath)) {
+    try {
+      $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($CertObj)
+      $pkcs8 = $null
+      if ($rsaKey) {
+        if ($rsaKey.PSObject.Methods['ExportPkcs8PrivateKey']) {
+          $pkcs8 = $rsaKey.ExportPkcs8PrivateKey()
+        } elseif ($rsaKey -is [System.Security.Cryptography.RSACng]) {
+          $pkcs8 = $rsaKey.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+        }
+      }
+      if ($pkcs8) {
+        $k64 = [Convert]::ToBase64String($pkcs8, [Base64FormattingOptions]::InsertLineBreaks)
+        $kpem = "-----BEGIN PRIVATE KEY-----`n$k64`n-----END PRIVATE KEY-----`n"
+        [System.IO.File]::WriteAllText($KeyPath, $kpem, [System.Text.Encoding]::ASCII)
+      }
+    } catch {}
+  }
+}
+
 if (-not $PfxPath -or -not (Test-Path $PfxPath)) {
   $clientKeysDir = Join-Path $ScriptDir 'client_keys'
   if (-not (Test-Path $clientKeysDir)) {
@@ -48,13 +85,12 @@ if (-not $PfxPath -or -not (Test-Path $PfxPath)) {
   if (-not (Test-Path $trustedClientsDir)) {
     New-Item -ItemType Directory -Path $trustedClientsDir -Force | Out-Null
   }
-  $b64 = [Convert]::ToBase64String($cc.RawData, [Base64FormattingOptions]::InsertLineBreaks)
-  $pem = "-----BEGIN CERTIFICATE-----`n$b64`n-----END CERTIFICATE-----`n"
-  [System.IO.File]::WriteAllText((Join-Path $trustedClientsDir "$Username.crt"), $pem, [System.Text.Encoding]::ASCII)
-  Write-Host "Generated client certificate and PFX for $Username" -ForegroundColor Green
+  Export-ClientPemPair $cc (Join-Path $trustedClientsDir "$Username.crt") ""
+  Export-ClientPemPair $cc (Join-Path $clientKeysDir "$Username.crt") (Join-Path $clientKeysDir "$Username.key")
+  Write-Host "Generated client certificate, PFX and OpenSSL PEM (.crt/.key) for $Username" -ForegroundColor Green
 }
 
-Write-Host "Installing client certificate for user '$Username'..." -ForegroundColor Cyan
+Write-Host "Installing client certificate for user '$Username' (TLS Profile: $EffectiveTlsProvider)..." -ForegroundColor Cyan
 Write-Host "PFX Path: $PfxPath" -ForegroundColor DarkGray
 
 $Process = Start-Process -FilePath 'certutil.exe' -ArgumentList "-user -p `"$Password`" -importpfx `"$PfxPath`" NoRoot" -NoNewWindow -Wait -PassThru

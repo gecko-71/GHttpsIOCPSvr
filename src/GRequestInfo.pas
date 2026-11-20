@@ -8,7 +8,7 @@ uses
   System.StrUtils,
   System.NetEncoding,
   System.Generics.Collections,
-  Quick.Logger,
+  GLogger,
   GRequestBody,
   GRequestTypes,
   GRequestHeaderValidator,

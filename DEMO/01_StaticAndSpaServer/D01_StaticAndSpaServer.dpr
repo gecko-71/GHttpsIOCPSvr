@@ -29,10 +29,10 @@ program D01_StaticAndSpaServer;
 {$R *.res}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger,
   System.SysUtils,
   System.Classes,
   System.StrUtils,
@@ -63,12 +63,14 @@ var
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [mmetUnexpectedMemoryLeakDetail,
                             mmetUnexpectedMemoryLeakSummary,
                             mmetDebugBlockDoubleFree,
                             mmetDebugBlockReallocOfFreedBlock];
+{$IFEND}
 end;
 
 function TryServeStaticFile(const FilePath: string; const ARequest: TRequest; const AResponse: TResponse): Boolean;
@@ -122,28 +124,7 @@ begin
   SERVER_HOST := GetPrimaryIPv4Address;
   ConfigureFastMM;
   try
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var LogDir := '.\Log';
-    if not TDirectory.Exists(LogDir) then
-       TDirectory.CreateDirectory(LogDir);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := LogDir + '\Logger.log';
-      DailyRotate := True;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      Enabled := True;
-    end;
-
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := True;
-    end;
+    GLog.InitDefault('.\Log\Logger.log', True, True, True, 50, False, 10);
 
     GStartTime := Now;
 

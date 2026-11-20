@@ -3,7 +3,7 @@ unit GRequest;
 interface
 
 uses
-  Quick.Logger, System.SysUtils, System.Classes, System.Threading, System.SyncObjs,
+  GLogger, System.SysUtils, System.Classes, System.Threading, System.SyncObjs,
   System.Generics.Collections, System.Math, System.StrUtils, System.Character,
   Winapi.Windows, Winapi.WinSock2,
   System.NetEncoding, GRequestBody, System.Generics.Defaults, System.ZLib,

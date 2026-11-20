@@ -1,4 +1,4 @@
-<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{B2C3D4E5-1111-4E11-BCDE-123456789011}</ProjectGuid>
         <MainSource>mTLSAuthSimpleClient.dpr</MainSource>

@@ -28,7 +28,7 @@ interface
 uses
   Winapi.Windows, System.SysUtils, System.Classes, System.JSON, System.Hash, System.StrUtils,
   System.Generics.Collections, System.SyncObjs,
-  Quick.Logger;
+  GLogger;
 
 type
   TUserGrants = record

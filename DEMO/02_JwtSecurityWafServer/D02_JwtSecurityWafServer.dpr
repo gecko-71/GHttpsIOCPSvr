@@ -29,10 +29,10 @@ program D02_JwtSecurityWafServer;
 {$R *.res}
 
 uses
+  {$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FASTMM5,
-  Quick.Logger,
-  Quick.Logger.Provider.Files,
-  Quick.Logger.Provider.Console,
+  {$IFEND}
+  GLogger,
   System.SysUtils,
   System.Classes,
   System.StrUtils,
@@ -75,12 +75,14 @@ var
 
 procedure ConfigureFastMM;
 begin
+{$IF DEFINED(DCC) AND DEFINED(DEBUG)}
   FastMM_EnterDebugMode;
   FastMM_MessageBoxEvents := [];
   FastMM_LogToFileEvents := FastMM_LogToFileEvents + [mmetUnexpectedMemoryLeakDetail,
                             mmetUnexpectedMemoryLeakSummary,
                             mmetDebugBlockDoubleFree,
                             mmetDebugBlockReallocOfFreedBlock];
+{$IFEND}
 end;
 
 constructor TRateLimiter.Create;
@@ -205,28 +207,7 @@ begin
   SERVER_HOST := GetPrimaryIPv4Address;
   ConfigureFastMM;
   try
-    Logger.Providers.Add(GlobalLogFileProvider);
-    Logger.Providers.Add(GlobalLogConsoleProvider);
-
-    var LogDir := '.\Log';
-    if not TDirectory.Exists(LogDir) then
-      TDirectory.CreateDirectory(LogDir);
-
-    with GlobalLogFileProvider do
-    begin
-      FileName := LogDir + '\JwtSecurityWafServer.log';
-      DailyRotate := True;
-      MaxFileSizeInMB := 50;
-      LogLevel := LOG_ALL;
-      Enabled := True;
-    end;
-
-    with GlobalLogConsoleProvider do
-    begin
-      LogLevel := LOG_DEBUG;
-      ShowEventColors := True;
-      Enabled := True;
-    end;
+    GLog.InitDefault('.\Log\Logger.log', True, True, True, 50, False, 10);
 
     Logger.Info('=====================================================');
     Logger.Info('  DEMO 02: JWT Security & WAF Protection Server');

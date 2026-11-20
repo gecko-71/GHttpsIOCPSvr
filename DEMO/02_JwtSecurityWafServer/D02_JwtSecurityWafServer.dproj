@@ -51,6 +51,7 @@
         <DelphiCompile Include="$(MainSource)">
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
+        <DCCReference Include="..\..\src\GLogger.pas"/>
         <DCCReference Include="..\..\src\GHttpsServerIOCP.pas"/>
         <DCCReference Include="..\..\src\GHttpsServerTypes.pas"/>
         <DCCReference Include="..\..\src\GSchannelTlsManager.pas"/>
@@ -58,6 +59,8 @@
         <DCCReference Include="..\..\src\GWebSocketBridge.pas"/>
         <DCCReference Include="..\..\src\GHttp3WebTransportBridge.pas"/>
         <DCCReference Include="..\..\src\GIocpWorkerEngine.pas"/>
+        <DCCReference Include="..\..\src\GOpenSslApi.pas"/>
+        <DCCReference Include="..\..\src\GOpenSslTlsEngine.pas"/>
         <DCCReference Include="..\..\src\GWebSocket.pas"/>
         <DCCReference Include="..\..\src\GJWTManager.pas"/>
         <DCCReference Include="..\..\src\GRequest.pas"/>

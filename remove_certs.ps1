@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [switch]$VerifyOnly,
-    [switch]$SkipUserRoot
+    [switch]$SkipUserRoot,
+    [string]$TlsProvider = $env:GHTTPS_TLS_PROVIDER,
+    [switch]$CleanPemFiles
 )
 
 $ErrorActionPreference = 'Continue'
@@ -17,9 +19,18 @@ function Remove-CertificateKey([System.Security.Cryptography.X509Certificates.X5
         $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
         if ($rsa -is [System.Security.Cryptography.RSACng]) {
             $rsa.Key.Delete()
+            return
         } elseif ($rsa -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
             $rsa.PersistKeyInCsp = $false
             $rsa.Clear()
+            return
+        }
+    } catch {
+    }
+    try {
+        $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($Cert)
+        if ($ecdsa -is [System.Security.Cryptography.ECDsaCng]) {
+            $ecdsa.Key.Delete()
         }
     } catch {
     }
@@ -35,6 +46,7 @@ Write-Host '====================================================================
 $Removed = 0
 $Failed = 0
 $Remaining = 0
+$MachineStoreCerts = @{}
 
 foreach ($Location in @('LocalMachine', 'CurrentUser')) {
     if ($Location -eq 'LocalMachine' -and -not $IsAdmin -and -not $VerifyOnly) {
@@ -54,6 +66,9 @@ foreach ($Location in @('LocalMachine', 'CurrentUser')) {
             $Targets = @($Store.Certificates | Where-Object { $_.Subject -match $SubjectPattern -and $ExcludedFriendlyNames -notcontains $_.FriendlyName })
             foreach ($Cert in $Targets) {
                 $Label = "{0}\{1} {2} [{3}] expires {4:yyyy-MM-dd}" -f $Location, $StoreName, $Cert.Subject, $Cert.Thumbprint, $Cert.NotAfter
+                if ($Location -eq 'LocalMachine') {
+                    $MachineStoreCerts["$StoreName|$($Cert.Thumbprint)"] = $true
+                }
                 if ($VerifyOnly -or ($Location -eq 'LocalMachine' -and -not $IsAdmin)) {
                     Write-Host "  FOUND   $Label" -ForegroundColor Red
                     $Remaining++
@@ -65,12 +80,77 @@ foreach ($Location in @('LocalMachine', 'CurrentUser')) {
                     Write-Host "  REMOVED $Label" -ForegroundColor Cyan
                     $Removed++
                 } catch {
-                    Write-Host "  FAILED  $Label : $($_.Exception.Message)" -ForegroundColor DarkYellow
-                    $Failed++
+                    if (-not $IsAdmin -and $MachineStoreCerts.ContainsKey("$StoreName|$($Cert.Thumbprint)")) {
+                        Write-Host "  SKIPPED $Label (inherited from LocalMachine)" -ForegroundColor DarkYellow
+                    } else {
+                        Write-Host "  FAILED  $Label : $($_.Exception.Message)" -ForegroundColor DarkYellow
+                        $Failed++
+                    }
                 }
             }
         } finally {
             $Store.Close()
+        }
+    }
+}
+
+$EffectiveTlsProvider = if ([string]::IsNullOrWhiteSpace($TlsProvider)) { 'tpSchannel' } else { $TlsProvider }
+$ShouldHandleFiles = $CleanPemFiles -or ($EffectiveTlsProvider -match '(?i)openssl')
+if ($ShouldHandleFiles) {
+    $LocalCertRelPaths = @(
+        'localhost.cer',
+        'localhost.crt',
+        'localhost.key',
+        'server.crt',
+        'server.key',
+        'mcp_server.crt',
+        'mcp_server.key'
+    )
+    $TargetDirs = @(
+        '.',
+        'certs',
+        'Win64\Debug\certs',
+        'Win64\Release\certs',
+        'GTermBox\Win64\Debug\certs',
+        'GTermBox\Win64\Release\certs',
+        'test_jeden\Win64\Debug\certs',
+        'testy\Win64\Debug\certs',
+        'GMcpSvr\Win64\Debug\certs',
+        'benchmark_suite\servers\ghttps_bench\Win64\Debug\certs',
+        'benchmark_suite\servers\ghttps_bench\Win64\Release\certs',
+        'benchmark_suite\servers\indy_bench\Win64\Debug\certs',
+        'benchmark_suite\servers\horse_bench\Win64\Debug\certs',
+        'DEMO\01_StaticAndSpaServer\Win64\Debug\certs',
+        'DEMO\02_JwtSecurityWafServer\Win64\Debug\certs',
+        'DEMO\03_HighSpeedFileStreamServer\Win64\Debug\certs',
+        'DEMO\04_WebSocketChatAndTelemetryServer\Win64\Debug\certs',
+        'DEMO\05_Http3QuicSpeedServer\Win64\Debug\certs',
+        'DEMO\06_TriProtocolHybridServer\Win64\Debug\certs',
+        'DEMO\08_MorseAudioServer\Win64\Debug\certs',
+        'DEMO\09_MoveServer\Win64\Debug\certs',
+        'DEMO\10_mTLSAuthServerAndClient\Win64\Debug\certs',
+        'DEMO\11_mTLSAuthSimpleServerAndClient\Win64\Debug\certs'
+    )
+    foreach ($relDir in $TargetDirs) {
+        $dirPath = Join-Path $PSScriptRoot $relDir
+        if (-not (Test-Path $dirPath)) { continue }
+        foreach ($relFile in $LocalCertRelPaths) {
+            $candPath = Join-Path $dirPath $relFile
+            if (Test-Path $candPath) {
+                if ($VerifyOnly) {
+                    Write-Host "  FOUND FILE $candPath" -ForegroundColor Red
+                    $Remaining++
+                } else {
+                    try {
+                        Remove-Item -Path $candPath -Force -ErrorAction Stop
+                        Write-Host "  REMOVED FILE $candPath" -ForegroundColor Cyan
+                        $Removed++
+                    } catch {
+                        Write-Host "  FAILED FILE $candPath : $($_.Exception.Message)" -ForegroundColor DarkYellow
+                        $Failed++
+                    }
+                }
+            }
         }
     }
 }

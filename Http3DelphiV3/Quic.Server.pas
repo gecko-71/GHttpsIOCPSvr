@@ -51,7 +51,7 @@ uses
   MsQuic.Certificate,
   MsQuic.Listener,
   MsQuic.Errors,
-  Quick.Logger,
+  GLogger,
   WinApiAdditions;
 
 const
@@ -127,6 +127,9 @@ type
     FCertHashHex: string;
     FCertStoreName: string;
     FCertSubjectName: string;
+    FTlsProvider: TTlsProvider;
+    FTlsCertFile: string;
+    FTlsKeyFile: string;
     FServerCertStore: HCERTSTORE;
     FStartupWorkingSetMB: Double;
     FStartupPageFileMB: Double;
@@ -195,6 +198,9 @@ type
     property mTLSRequired: Boolean read FmTLSRequired write FmTLSRequired;
     property mTLSOptional: Boolean read FmTLSOptional write FmTLSOptional;
     property CACertContext: WinApiAdditions.PCCERT_CONTEXT read FCACertContext write FCACertContext;
+    property TlsProvider: TTlsProvider read FTlsProvider write FTlsProvider;
+    property TlsCertFile: string read FTlsCertFile write FTlsCertFile;
+    property TlsKeyFile: string read FTlsKeyFile write FTlsKeyFile;
     property OnValidateClientCertificate: TClientCertValidateEvent read FOnValidateClientCertificate write FOnValidateClientCertificate;
   end;
 
@@ -244,6 +250,7 @@ begin
   FCertStoreName             := CertStoreName;
   FCertSubjectName           := CertSubjectName;
   FServerCertStore           := ServerCertStore;
+  FTlsProvider               := GetConfiguredTlsProvider(tpSchannel);
   FSendCtxAllocated          := 0;
   FSendCtxFreed              := 0;
   FConnSeqId                 := 0;
@@ -803,13 +810,18 @@ var
   Settings: QUIC_SETTINGS;
   MemCounters: TProcessMemoryCounters;
   RetryPercent: UInt16;
+  QuicDllName: string;
 begin
-  Logger.Info('Initializing TQuicServer (including msquic.dll loading) on port %d...', [Port]);
+  if (FTlsProvider = tpOpenSSL) or (GetConfiguredTlsProvider(tpSchannel) = tpOpenSSL) or ((FTlsCertFile <> '') and (FTlsKeyFile <> '')) then
+    QuicDllName := 'msquicSSL.dll'
+  else
+    QuicDllName := 'msquic.dll';
+  Logger.Info('Initializing TQuicServer (including %s loading) on port %d...', [QuicDllName, Port]);
 
   if FAlpnProtocol = '' then
     raise EMsQuicError.Create('No ALPN protocol configured. Set AlpnProtocol before calling Start.', $80004005);
 
-  FMsQuic := TMsQuicLibrary.Create('msquic.dll');
+  FMsQuic := TMsQuicLibrary.Create(QuicDllName);
   FMsQuic.Start;
 
   if FForceStatelessRetry and (FMsQuic.Api <> nil) then
@@ -841,9 +853,9 @@ begin
   FConfiguration := TMsQuicConfiguration.Create(FMsQuic.Api, FRegistration, FAlpnProtocol, @Settings);
   Logger.Info('MsQuic configuration opened with SendBufferingEnabled=0 (msh3 pattern). Handle: %p', [FConfiguration.Handle]);
   FCertificate := TMsQuicCertificate.Create;
-  if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName, FmTLSRequired, FmTLSOptional) then
+  if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName, FmTLSRequired, FmTLSOptional, FTlsCertFile, FTlsKeyFile) then
   begin
-    Logger.Error('Error loading certificate from store or binding it to configuration.');
+    Logger.Error('Error loading certificate or binding it to configuration.');
     raise EMsQuicError.Create('Fatal: Failed to load TLS certificate or bind it to configuration. Server cannot start.', $80004005);
   end;
   Logger.Info('Certificate successfully loaded and bound to the configuration.');
@@ -870,7 +882,7 @@ begin
   if (FConfiguration <> nil) and (FCertificate <> nil) then
   begin
     Logger.Info('[Hot-Reload] Loading new certificate with hash: %s', [FCertHashHex]);
-    if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName, FmTLSRequired, FmTLSOptional) then
+    if not FCertificate.LoadServerCertificate(FConfiguration, FCertHashHex, FCertStoreName, FServerCertStore, FCertSubjectName, FmTLSRequired, FmTLSOptional, FTlsCertFile, FTlsKeyFile) then
     begin
       Logger.Error('[Hot-Reload] Fatal: Failed to dynamically load new certificate!');
       raise EMsQuicError.Create('Failed to hot-reload TLS certificate.', $80004005);

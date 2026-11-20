@@ -27,7 +27,7 @@ unit GResponse;
 interface
 
 uses
-  Quick.Logger,
+  GLogger,
   System.SysUtils, System.Classes, System.Threading, System.SyncObjs,
   System.Generics.Collections, System.Math, System.IOUtils, System.DateUtils,
   System.StrUtils, System.ZLib,

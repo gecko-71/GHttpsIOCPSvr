@@ -32,7 +32,7 @@ uses
   System.StrUtils,
   System.SyncObjs,
   System.Generics.Collections,
-  Quick.Logger,
+  GLogger,
   GRequest,
   GResponse,
   WinApiAdditions,
