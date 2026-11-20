@@ -13,6 +13,8 @@ uses
 
 type
   TGLogLevel = (llTrace, llDebug, llInfo, llWarn, llError, llCritical, llOff);
+  TGLogTimeFormat = (ltfLocal, ltfUtc);
+  TGLogDropPolicy = (dpTailDrop, dpHeadDrop);
 
   TGLogConfig = record
     Enabled: Boolean;
@@ -31,6 +33,8 @@ type
     FlushIntervalMs: Integer;
     BufferSizeKB: Integer;
     WaitForFlushSeconds: Integer;
+    TimeFormat: TGLogTimeFormat;
+    DropPolicy: TGLogDropPolicy;
     class function Default: TGLogConfig; static;
   end;
 
@@ -78,7 +82,9 @@ type
   end;
 
   GLog = TGLogger;
+{$IFNDEF GLOGGER_NO_LOGGER_ALIAS}
   Logger = TGLogger;
+{$ENDIF}
 
 implementation
 
@@ -86,12 +92,14 @@ implementation
 uses
 {$IFDEF FPC}
   Classes,
-  SyncObjs
+  SyncObjs,
+  DateUtils
   {$IFDEF UNIX}, BaseUnix{$ENDIF}
 {$ELSE}
   System.Classes,
-  System.SyncObjs
-  {$IFDEF POSIX}, Posix.Unistd{$ENDIF}
+  System.SyncObjs,
+  System.DateUtils
+  {$IFDEF POSIX}, Posix.Unistd, Posix.Fcntl, Posix.Pthread{$ENDIF}
 {$ENDIF}
 {$IFDEF MSWINDOWS}
   {$IFDEF FPC}, Windows{$ELSE}, Winapi.Windows{$ENDIF}
@@ -113,6 +121,11 @@ var
   GDroppedTotal: Int64 = 0;
   GDroppedPendingReport: Int64 = 0;
   GErrorTotal: Int64 = 0;
+  GTimeFormat: TGLogTimeFormat = ltfLocal;
+  GDropPolicy: TGLogDropPolicy = dpTailDrop;
+{$IFDEF MSWINDOWS}
+  GOrigConsoleOutputCP: Cardinal = 0;
+{$ENDIF}
 
 {$IFNDEF GLOGGER_DISABLED}
 function AtomicInc64(var ATarget: Int64): Int64;
@@ -133,7 +146,16 @@ begin
 {$ENDIF}
 end;
 
-function AtomicRead64(var ATarget: Int64): Int64; inline;
+function AtomicAdd64(var ATarget: Int64; AValue: Int64): Int64;
+begin
+{$IFDEF FPC}
+  Result := InterlockedExchangeAdd64(ATarget, AValue) + AValue;
+{$ELSE}
+  Result := TInterlocked.Add(ATarget, AValue);
+{$ENDIF}
+end;
+
+function AtomicRead64(var ATarget: Int64): Int64;
 begin
 {$IF DEFINED(CPUX64)}
   Result := PInt64(@ATarget)^;
@@ -242,7 +264,12 @@ var
   GFileMinLevel: TGLogLevel = llTrace;
   GConsoleMinLevel: TGLogLevel = llDebug;
   GDefaultShardCap: Integer = 262144;
-  GHighWatermark: Integer = 524288;
+  GHighWatermark: Integer = 131072;
+  GNextFileCheckTick: UInt64 = 0;
+  GNextShardRoundRobin: Integer = 0;
+
+threadvar
+  GThreadShardIdx: Integer;
 
 procedure MarkFlushThreadBodyDone;
 begin
@@ -264,20 +291,23 @@ begin
 {$ENDIF}
 end;
 
-function GetShardIndex: Integer; inline;
+function GetShardIndex: Integer;
 var
-  Tid: Cardinal;
+  ShardIdx: Integer;
 begin
-{$IFDEF MSWINDOWS}
-  Tid := GetCurrentThreadId;
+  ShardIdx := GThreadShardIdx;
+  if ShardIdx > 0 then
+  begin
+    Result := ShardIdx - 1;
+    Exit;
+  end;
+{$IFDEF FPC}
+  ShardIdx := InterlockedIncrement(GNextShardRoundRobin) and (CShardCount - 1);
 {$ELSE}
-  {$IFDEF FPC}
-  Tid := Cardinal(PtrUInt(GetThreadID));
-  {$ELSE}
-  Tid := Cardinal(NativeUInt(TThread.CurrentThread.ThreadID));
-  {$ENDIF}
+  ShardIdx := TInterlocked.Increment(GNextShardRoundRobin) and (CShardCount - 1);
 {$ENDIF}
-  Result := Integer(((Tid shr 2) xor (Tid shr 7) xor (Tid shr 13)) and (CShardCount - 1));
+  GThreadShardIdx := ShardIdx + 1;
+  Result := ShardIdx;
 end;
 
 procedure WriteTwoDigits(AValue: Word; ADest: PAnsiChar); inline;
@@ -324,6 +354,29 @@ begin
   end;
 end;
 
+procedure InvalidateTimeCache;
+begin
+{$IFDEF FPC}
+  if GTimeLock = nil then
+    Exit;
+  GTimeLock.Enter;
+{$ELSE}
+  GTimeLock.Enter;
+{$ENDIF}
+  try
+    AtomicInc64(GTimeSeq);
+    GLastWallSec := 0;
+    GCachedTimeUtf8[0] := #0;
+    AtomicInc64(GTimeSeq);
+  finally
+{$IFDEF FPC}
+    GTimeLock.Leave;
+{$ELSE}
+    GTimeLock.Exit;
+{$ENDIF}
+  end;
+end;
+
 procedure GetCurrentTimeAndDay(out ATimeBuf: TGLogTimeBuf; out ADay: Integer);
 var
 {$IFDEF MSWINDOWS}
@@ -347,21 +400,34 @@ begin
     MSec := Word((FT64 div 10000) mod 1000);
     if (WallSec <> GLastWallSec) or (GCachedTimeUtf8[0] = #0) then
     begin
-      FileTimeToLocalFileTime(FT, LocalFT);
-      FileTimeToSystemTime(LocalFT, SysTime);
+      if GTimeFormat = ltfUtc then
+        FileTimeToSystemTime(FT, SysTime)
+      else
+      begin
+        FileTimeToLocalFileTime(FT, LocalFT);
+        FileTimeToSystemTime(LocalFT, SysTime);
+      end;
       DayVal := Integer(SysTime.wYear) * 10000 + Integer(SysTime.wMonth) * 100 + Integer(SysTime.wDay);
       RefreshTimeCache(WallSec, DayVal, SysTime.wYear, SysTime.wMonth, SysTime.wDay,
         SysTime.wHour, SysTime.wMinute, SysTime.wSecond);
     end;
 {$ELSE}
     NowDt := Now;
-    DecodeDate(NowDt, Y, M, D);
-    DecodeTime(NowDt, H, N, S, MSec);
-    WallSec := (((UInt64(Y) * 13 + M) * 32 + D) * 86400) +
-      UInt64(H) * 3600 + UInt64(N) * 60 + UInt64(S);
-    DayVal := Integer(Y) * 10000 + Integer(M) * 100 + Integer(D);
+    WallSec := UInt64(Trunc(NowDt * 86400.0));
+    MSec := Word(Trunc(Frac(NowDt * 86400.0) * 1000.0) mod 1000);
     if (WallSec <> GLastWallSec) or (GCachedTimeUtf8[0] = #0) then
+    begin
+      if GTimeFormat = ltfUtc then
+{$IFDEF FPC}
+        NowDt := LocalTimeToUniversal(NowDt);
+{$ELSE}
+        NowDt := TTimeZone.Local.ToUniversalTime(NowDt);
+{$ENDIF}
+      DecodeDate(NowDt, Y, M, D);
+      DecodeTime(NowDt, H, N, S, MSec);
+      DayVal := Integer(Y) * 10000 + Integer(M) * 100 + Integer(D);
       RefreshTimeCache(WallSec, DayVal, Y, M, D, H, N, S);
+    end;
 {$ENDIF}
 
     Seq1 := AtomicRead64(GTimeSeq);
@@ -389,9 +455,13 @@ end;
 
 function ShardReserve(var AShard: TGLogShard; ALen: Integer; out AOffset: Integer): Boolean; inline;
 var
-  ReqLen, NewCap: Integer;
+  ReqLen, NewCap, DropBytesNeeded, ChunkDrop, CutPos, I, LinesDropped, MaxBytes: Integer;
 begin
-  if (ALen <= 0) or (ALen > CMaxShardBytes) or (ALen > CMaxShardBytes - AShard.Core.Len) then
+  MaxBytes := GDefaultShardCap;
+  if MaxBytes <= 0 then
+    MaxBytes := CMaxShardBytes;
+
+  if (ALen <= 0) or (ALen > MaxBytes) then
   begin
     if ALen > 0 then
     begin
@@ -403,6 +473,56 @@ begin
     Exit;
   end;
 
+  if ALen > MaxBytes - AShard.Core.Len then
+  begin
+    if GDropPolicy = dpTailDrop then
+    begin
+      AtomicInc64(GDroppedTotal);
+      AtomicInc64(GDroppedPendingReport);
+      AOffset := 0;
+      Result := False;
+      Exit;
+    end;
+
+    DropBytesNeeded := ALen - (MaxBytes - AShard.Core.Len);
+    ChunkDrop := AShard.Core.Len div 4;
+    if ChunkDrop < DropBytesNeeded then
+      ChunkDrop := DropBytesNeeded;
+    if ChunkDrop > AShard.Core.Len then
+      ChunkDrop := AShard.Core.Len;
+
+    CutPos := ChunkDrop - 1;
+    if CutPos < 0 then
+      CutPos := 0;
+    while (CutPos < AShard.Core.Len) and (AShard.Core.Buf[CutPos] <> 10) do
+      Inc(CutPos);
+
+    if CutPos < AShard.Core.Len then
+      Inc(CutPos)
+    else
+      CutPos := AShard.Core.Len;
+
+    LinesDropped := 0;
+    for I := 0 to CutPos - 1 do
+    begin
+      if AShard.Core.Buf[I] = 10 then
+        Inc(LinesDropped);
+    end;
+    if LinesDropped = 0 then
+      LinesDropped := 1;
+
+    if CutPos < AShard.Core.Len then
+    begin
+      Move(AShard.Core.Buf[CutPos], AShard.Core.Buf[0], AShard.Core.Len - CutPos);
+      Dec(AShard.Core.Len, CutPos);
+    end
+    else
+      AShard.Core.Len := 0;
+
+    AtomicAdd64(GDroppedTotal, LinesDropped);
+    AtomicAdd64(GDroppedPendingReport, LinesDropped);
+  end;
+
   ReqLen := AShard.Core.Len + ALen;
   if ReqLen > Length(AShard.Core.Buf) then
   begin
@@ -411,8 +531,8 @@ begin
       NewCap := GDefaultShardCap;
     if NewCap < ReqLen then
       NewCap := ReqLen + 65536;
-    if NewCap > CMaxShardBytes then
-      NewCap := CMaxShardBytes;
+    if NewCap > MaxBytes then
+      NewCap := MaxBytes;
     SetLength(AShard.Core.Buf, NewCap);
   end;
   AOffset := AShard.Core.Len;
@@ -421,7 +541,7 @@ begin
 end;
 
 function StackAppendUtf8Ptr(ADest: PAnsiChar; ADestCap: Integer; var APos: Integer;
-  ASrc: PChar; ACount: Integer): Boolean;
+  ASrc: PWideChar; ACount: Integer): Boolean;
 var
   I: Integer;
   W1, W2: Word;
@@ -536,7 +656,7 @@ begin
   MaxLen := SLen * 3;
   SetLength(Result, MaxLen);
   OutPos := 0;
-  StackAppendUtf8Ptr(PAnsiChar(Pointer(Result)), MaxLen, OutPos, PChar(Pointer(AMsg)), SLen);
+  StackAppendUtf8Ptr(PAnsiChar(Pointer(Result)), MaxLen, OutPos, PWideChar(Pointer(AMsg)), SLen);
   SetLength(Result, OutPos);
 end;
 
@@ -632,8 +752,8 @@ function TryFastFormatToStack(ADest: PAnsiChar; ADestCap: Integer; var APos: Int
   const AFmt: string; const AArgs: array of const): Boolean;
 var
   I, J, Len, ArgIdx, StartPos, SArgLen: Integer;
-  Spec: Char;
-  FmtPtr, ArgPtr: PChar;
+  Spec: WideChar;
+  FmtPtr, ArgPtr: PWideChar;
   AnsiPtr: PAnsiChar;
   UV: UInt64;
   B: Byte;
@@ -645,7 +765,7 @@ begin
     Result := True;
     Exit;
   end;
-  FmtPtr := PChar(Pointer(AFmt));
+  FmtPtr := PWideChar(Pointer(AFmt));
 
   ArgIdx := 0;
   I := 0;
@@ -684,7 +804,7 @@ begin
           case AArgs[ArgIdx].VType of
             vtUnicodeString:
               begin
-                ArgPtr := PChar(AArgs[ArgIdx].VUnicodeString);
+                ArgPtr := PWideChar(AArgs[ArgIdx].VUnicodeString);
                 if ArgPtr <> nil then
                 begin
                   SArgLen := Length(UnicodeString(AArgs[ArgIdx].VUnicodeString));
@@ -797,6 +917,55 @@ begin
 {$ENDIF}
 end;
 
+function GetFileModificationDay(AHandle: THandle; const AFileName: string): Integer;
+var
+{$IFDEF MSWINDOWS}
+  FtWrite, FtLocal: TFileTime;
+  St: TSystemTime;
+{$ELSE}
+  FileDt: TDateTime;
+  Y, M, D: Word;
+{$ENDIF}
+begin
+  Result := 0;
+{$IFDEF MSWINDOWS}
+  if (AHandle <> INVALID_HANDLE_VALUE) and (AHandle <> 0) then
+  begin
+    FillChar(FtWrite, SizeOf(FtWrite), 0);
+    if GetFileTime(AHandle, nil, nil, @FtWrite) then
+    begin
+      FillChar(St, SizeOf(St), 0);
+      if GTimeFormat = ltfUtc then
+      begin
+        if FileTimeToSystemTime(FtWrite, St) then
+          Result := Integer(St.wYear) * 10000 + Integer(St.wMonth) * 100 + Integer(St.wDay);
+      end
+      else
+      begin
+        FillChar(FtLocal, SizeOf(FtLocal), 0);
+        if FileTimeToLocalFileTime(FtWrite, FtLocal) then
+        begin
+          if FileTimeToSystemTime(FtLocal, St) then
+            Result := Integer(St.wYear) * 10000 + Integer(St.wMonth) * 100 + Integer(St.wDay);
+        end;
+      end;
+    end;
+  end;
+{$ELSE}
+  if FileAge(AFileName, FileDt) then
+  begin
+    if GTimeFormat = ltfUtc then
+{$IFDEF FPC}
+      FileDt := LocalTimeToUniversal(FileDt);
+{$ELSE}
+      FileDt := TTimeZone.Local.ToUniversalTime(FileDt);
+{$ENDIF}
+    DecodeDate(FileDt, Y, M, D);
+    Result := Integer(Y) * 10000 + Integer(M) * 100 + Integer(D);
+  end;
+{$ENDIF}
+end;
+
 procedure OpenLogFile(ACurDay: Integer);
 var
   LogDir: string;
@@ -813,7 +982,7 @@ begin
 
 {$IFDEF MSWINDOWS}
   GFileHandle := CreateFileW(
-    PChar(GConfig.FileName),
+    PWideChar(GConfig.FileName),
     FILE_APPEND_DATA_FLAG or FILE_READ_ATTRIBUTES_FLAG or SYNCHRONIZE,
     FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
     nil,
@@ -823,7 +992,11 @@ begin
   if GFileHandle = INVALID_HANDLE_VALUE then
     RaiseLastOSError;
   FileSz := 0;
+{$IFDEF FPC}
+  if GetFileSizeEx(GFileHandle, PLARGE_INTEGER(@FileSz)) then
+{$ELSE}
   if GetFileSizeEx(GFileHandle, FileSz) then
+{$ENDIF}
     GFileSize := FileSz
   else
     GFileSize := 0;
@@ -838,7 +1011,22 @@ begin
     GFileStream := TFileStream.Create(GConfig.FileName, fmCreate or fmShareDenyNone);
     GFileSize := 0;
   end;
+{$IFDEF POSIX}
+  {$IFDEF FPC}
+  fpfcntl(GFileStream.Handle, F_SETFL, fpfcntl(GFileStream.Handle, F_GETFL, 0) or O_APPEND);
+  {$ELSE}
+  fcntl(GFileStream.Handle, F_SETFL, fcntl(GFileStream.Handle, F_GETFL, 0) or O_APPEND);
+  {$ENDIF}
 {$ENDIF}
+{$ENDIF}
+  if (GLastFileDay = 0) and (GFileSize > 0) then
+  begin
+{$IFDEF MSWINDOWS}
+    GLastFileDay := GetFileModificationDay(GFileHandle, GConfig.FileName);
+{$ELSE}
+    GLastFileDay := GetFileModificationDay(0, GConfig.FileName);
+{$ENDIF}
+  end;
   if GLastFileDay = 0 then
     GLastFileDay := ACurDay;
 end;
@@ -962,6 +1150,45 @@ begin
   Result := True;
 end;
 
+function CompareArchiveFileNames(List: TStringList; Index1, Index2: Integer): Integer;
+var
+  Name1, Name2, Base1, Base2, Date1, Date2, SeqStr1, SeqStr2: string;
+  LastUnderscore1, LastUnderscore2, Seq1, Seq2: Integer;
+begin
+  Name1 := ChangeFileExt(ExtractFileName(List[Index1]), '');
+  Name2 := ChangeFileExt(ExtractFileName(List[Index2]), '');
+  LastUnderscore1 := LastDelimiter('_', Name1);
+  LastUnderscore2 := LastDelimiter('_', Name2);
+  if (LastUnderscore1 > 11) and (LastUnderscore2 > 11) and
+     (Name1[LastUnderscore1 - 11] = '_') and (Name2[LastUnderscore2 - 11] = '_') then
+  begin
+    Base1 := Copy(Name1, 1, LastUnderscore1 - 12);
+    Base2 := Copy(Name2, 1, LastUnderscore2 - 12);
+    if not SameFileName(Base1, Base2) then
+    begin
+      Result := CompareStr(Base1, Base2);
+      Exit;
+    end;
+    Date1 := Copy(Name1, LastUnderscore1 - 10, 10);
+    Date2 := Copy(Name2, LastUnderscore2 - 10, 10);
+    if Date1 <> Date2 then
+    begin
+      Result := CompareStr(Date1, Date2);
+      Exit;
+    end;
+    SeqStr1 := Copy(Name1, LastUnderscore1 + 1, MaxInt);
+    SeqStr2 := Copy(Name2, LastUnderscore2 + 1, MaxInt);
+    Seq1 := StrToIntDef(SeqStr1, 0);
+    Seq2 := StrToIntDef(SeqStr2, 0);
+    if Seq1 <> Seq2 then
+    begin
+      Result := Seq1 - Seq2;
+      Exit;
+    end;
+  end;
+  Result := CompareStr(List[Index1], List[Index2]);
+end;
+
 procedure EnforceFileRetention(const ABaseName, AExtName: string; AMaxFiles: Integer);
 var
   DirPath, Pattern, FullCand, BaseFileOnly: string;
@@ -1004,7 +1231,7 @@ begin
 
     if Files.Count > AMaxFiles then
     begin
-      Files.Sort;
+      Files.CustomSort(CompareArchiveFileNames);
       DeleteCount := Files.Count - AMaxFiles;
       for I := 0 to DeleteCount - 1 do
 {$IFDEF FPC}
@@ -1203,7 +1430,22 @@ begin
   Offset := 0;
 
   try
-    OpenLogFile(ADay);
+    if IsLogFileOpen and (GFileSize > 0) then
+    begin
+      NowTick := GetMonoTick64;
+      if NowTick >= GNextFileCheckTick then
+      begin
+        GNextFileCheckTick := NowTick + 1000;
+        if not FileExists(GConfig.FileName) then
+        begin
+          CloseLogFile;
+          OpenLogFile(ADay);
+        end;
+      end;
+    end
+    else
+      OpenLogFile(ADay);
+
     if not IsLogFileOpen then
       Exit;
 
@@ -1542,7 +1784,7 @@ begin
     Move(CLevelTags[ALevel][0], LineBuf[LineLen], CLevelTagLen);
     Inc(LineLen, CLevelTagLen);
     if Length(AMsg) > 0 then
-      UseStack := StackAppendUtf8Ptr(@LineBuf[0], SizeOf(LineBuf) - 2, LineLen, PChar(Pointer(AMsg)), Length(AMsg))
+      UseStack := StackAppendUtf8Ptr(@LineBuf[0], SizeOf(LineBuf) - 2, LineLen, PWideChar(Pointer(AMsg)), Length(AMsg))
     else
       UseStack := True;
   end
@@ -1627,9 +1869,9 @@ begin
         end;
       end;
 
-      if (ALevel >= llError) or GAutoFlush or DroppedHere then
+      if (ALevel >= llCritical) or DroppedHere then
         NeedWake := True;
-      if NeedWake and (GFlushEvent <> nil) then
+      if NeedWake and (not GFinalizing) and (GFlushEvent <> nil) then
         GFlushEvent.SetEvent;
     except
       AtomicInc64(GErrorTotal);
@@ -1746,6 +1988,8 @@ begin
   Result.FlushIntervalMs := 50;
   Result.BufferSizeKB := 128;
   Result.WaitForFlushSeconds := 10;
+  Result.TimeFormat := ltfLocal;
+  Result.DropPolicy := dpTailDrop;
 end;
 
 class procedure TGLogger.Configure(const AConfig: TGLogConfig);
@@ -1756,7 +2000,7 @@ var
 {$IFDEF GLOGGER_BACKEND_FAST}
 var
   NewCap, I: Integer;
-  RequestedBytes, HighCapBytes: Int64;
+  RequestedBytes: Int64;
   NewMin: TGLogLevel;
   SameFile: Boolean;
   OldThread: TLogFlushThread;
@@ -1809,10 +2053,10 @@ begin
       begin
         GRetryFileLen := 0;
         GRotateSeq := 0;
+        GLastFileDay := 0;
       end;
       GRotateCooldownUntilTick := 0;
       GFileSize := 0;
-      GLastFileDay := 0;
 
       GConfig := AConfig;
       GFlushIntervalMs := AConfig.FlushIntervalMs;
@@ -1822,14 +2066,34 @@ begin
       GEnableConsole := AConfig.EnableConsole;
       GConsoleColors := AConfig.ConsoleColors;
       GAutoFlush := AConfig.AutoFlush;
-      GFileMinLevel := AConfig.FileMinLevel;
-      GConsoleMinLevel := AConfig.ConsoleMinLevel;
+      GTimeFormat := AConfig.TimeFormat;
+      GDropPolicy := AConfig.DropPolicy;
+      GNextFileCheckTick := 0;
+      InvalidateTimeCache;
+
+      if AConfig.FileMinLevel > AConfig.MinLevel then
+        GFileMinLevel := AConfig.FileMinLevel
+      else
+        GFileMinLevel := AConfig.MinLevel;
+
+      if AConfig.ConsoleMinLevel > AConfig.MinLevel then
+        GConsoleMinLevel := AConfig.ConsoleMinLevel
+      else
+        GConsoleMinLevel := AConfig.MinLevel;
 
       NewMin := AConfig.MinLevel;
-      if GEnableFile and (AConfig.FileMinLevel < NewMin) then
-        NewMin := AConfig.FileMinLevel;
-      if GEnableConsole and (AConfig.ConsoleMinLevel < NewMin) then
-        NewMin := AConfig.ConsoleMinLevel;
+      if GEnableFile and GEnableConsole then
+      begin
+        if GFileMinLevel < GConsoleMinLevel then
+          NewMin := GFileMinLevel
+        else
+          NewMin := GConsoleMinLevel;
+      end
+      else if GEnableFile then
+        NewMin := GFileMinLevel
+      else if GEnableConsole then
+        NewMin := GConsoleMinLevel;
+
       GMinLevel := NewMin;
       GEnabled := AConfig.Enabled;
 
@@ -1846,11 +2110,7 @@ begin
       else
         NewCap := 262144;
       GDefaultShardCap := NewCap;
-      HighCapBytes := Int64(NewCap) * 2;
-      if HighCapBytes <= CMaxShardBytes then
-        GHighWatermark := Integer(HighCapBytes)
-      else
-        GHighWatermark := CMaxShardBytes;
+      GHighWatermark := NewCap div 2;
 
       if GShardsReady then
       begin
@@ -1873,6 +2133,8 @@ begin
 {$IFDEF MSWINDOWS}
       if GEnableConsole and IsConsole then
       begin
+        if GOrigConsoleOutputCP = 0 then
+          GOrigConsoleOutputCP := GetConsoleOutputCP;
         SetConsoleOutputCP(CP_UTF8);
         if GConsoleColors then
         begin
@@ -1881,8 +2143,15 @@ begin
           begin
             ConMode := 0;
             if GetConsoleMode(ConHandle, ConMode) then
-              SetConsoleMode(ConHandle, ConMode or ENABLE_VIRTUAL_TERMINAL_PROCESSING_FLAG);
-          end;
+            begin
+              if not SetConsoleMode(ConHandle, ConMode or ENABLE_VIRTUAL_TERMINAL_PROCESSING_FLAG) then
+                GConsoleColors := False;
+            end
+            else
+              GConsoleColors := False;
+          end
+          else
+            GConsoleColors := False;
         end;
       end;
 {$ENDIF}
@@ -1896,6 +2165,8 @@ begin
   if GClosed then
     GClosed := False;
   GConfig := AConfig;
+  GTimeFormat := AConfig.TimeFormat;
+  GDropPolicy := AConfig.DropPolicy;
   GEnabled := AConfig.Enabled;
   GMinLevel := AConfig.MinLevel;
   if AConfig.EnableFile and (AConfig.FileMinLevel < GMinLevel) then
@@ -2134,6 +2405,13 @@ begin
     finally
       GSinkLock.Leave;
     end;
+  end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+  if GOrigConsoleOutputCP <> 0 then
+  begin
+    SetConsoleOutputCP(GOrigConsoleOutputCP);
+    GOrigConsoleOutputCP := 0;
   end;
 {$ENDIF}
 {$ENDIF}
@@ -2430,9 +2708,9 @@ begin
         GInLoggerThread := False;
       end;
 
-      if (ALevel >= llError) or GAutoFlush or DroppedHere then
+      if (ALevel >= llCritical) or DroppedHere then
         NeedWake := True;
-      if NeedWake and (GFlushEvent <> nil) then
+      if NeedWake and (not GFinalizing) and (GFlushEvent <> nil) then
         GFlushEvent.SetEvent;
       Exit;
     end;
@@ -2512,6 +2790,10 @@ end;
 procedure FreeShards;
 var
   I: Integer;
+{$IFNDEF FPC}
+  Ev1, Ev2: TEvent;
+  WLock: TCriticalSection;
+{$ENDIF}
 begin
   GShardsReady := False;
   for I := 0 to CShardCount - 1 do
@@ -2519,19 +2801,36 @@ begin
     GShards[I].Core.Buf := nil;
     GShards[I].Core.Len := 0;
 {$IFDEF FPC}
-    FreeAndNil(GShards[I].Core.Lock);
+    if not GFinalizing then
+      FreeAndNil(GShards[I].Core.Lock);
 {$ENDIF}
   end;
 {$IFDEF FPC}
-  FreeAndNil(GTimeLock);
+  if not GFinalizing then
+    FreeAndNil(GTimeLock);
 {$ENDIF}
   GFlushBuf := nil;
   GFilteredBuf := nil;
   GRetryFileBuf := nil;
   GRetryFileLen := 0;
-  FreeAndNil(GFlushDoneEvent);
-  FreeAndNil(GFlushEvent);
-  FreeAndNil(GWriteLock);
+{$IFDEF FPC}
+  if not GFinalizing then
+  begin
+    FreeAndNil(GFlushDoneEvent);
+    FreeAndNil(GFlushEvent);
+    FreeAndNil(GWriteLock);
+  end;
+{$ELSE}
+  Ev1 := GFlushDoneEvent;
+  GFlushDoneEvent := nil;
+  FreeAndNil(Ev1);
+  Ev2 := GFlushEvent;
+  GFlushEvent := nil;
+  FreeAndNil(Ev2);
+  WLock := GWriteLock;
+  GWriteLock := nil;
+  FreeAndNil(WLock);
+{$ENDIF}
 end;
 
 procedure InitShards;
