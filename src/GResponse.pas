@@ -238,6 +238,7 @@ type
     function Compress(const AEncoding: string = 'gzip'): Boolean;
     procedure Reset(ASocket: TSocket);
     function ApplyContentEncoding(const AAcceptEncoding: string): Boolean;
+    procedure AddRawBytesContent(const ContentType: string; DataPtr: PByte; DataLen: Integer);
     property Headers: TStringList read FHeaders;
     property ContentType: string read FContentType;
     property Socket: TSocket read FSocket;
@@ -2453,6 +2454,18 @@ begin
 
   if ChosenEncoding <> '' then
     Result := Compress(ChosenEncoding);
+end;
+
+procedure TResponse.AddRawBytesContent(const ContentType: string; DataPtr: PByte; DataLen: Integer);
+begin
+  FContentType := ContentType;
+  if Length(FContentBytes) < DataLen then
+    SetLength(FContentBytes, DataLen);
+  if (DataLen > 0) and (DataPtr <> nil) then
+    Move(DataPtr^, FContentBytes[0], DataLen);
+  FTotalContentSize := DataLen;
+  FContentBytesBuilt := True;
+  FContentFinalized := True;
 end;
 
 initialization

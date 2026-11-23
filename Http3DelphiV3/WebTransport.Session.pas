@@ -134,7 +134,7 @@ const
   );
   StandardConnect200: array[0..4] of Byte = ($01, $03, $00, $00, $D9);
 begin
-  if (Api = nil) or (Stream = nil) or (ConnCtx = nil) then 
+  if (Api = nil) or (Stream = nil) or (ConnCtx = nil) then
      Exit;
 
   if IncludeDraft02 then
@@ -269,7 +269,8 @@ procedure WTCloseSession(Api: PQuicApiTable; Session: PWTSessionContext; ErrorCo
 const
   QUIC_STREAM_SHUTDOWN_FLAG_ABORT = $0006;
 begin
-  if (Session = nil) or (Session.ConnectStream = nil) then Exit;
+  if (Session = nil) or (Session.ConnectStream = nil) then
+    Exit;
   if (Session.Server <> nil) and (Session.Server is TWebTransportServer) then
   begin
     TWebTransportServer(Session.Server).CloseSession(Session.ConnectStream, ErrorCode);
@@ -288,10 +289,10 @@ var
   Svr: TQuicServer;
 begin
   PConn := PConnectionContext(ConnCtx);
-  if (PConn = nil) or (PConn.Server = nil) then 
+  if (PConn = nil) or (PConn.Server = nil) then
      Exit;
   Svr := TQuicServer(PConn.Server);
-  if (Svr.MsQuic = nil) or (Svr.MsQuic.Api = nil) then 
+  if (Svr.MsQuic = nil) or (Svr.MsQuic.Api = nil) then
      Exit;
   WTSendOnStream(Svr.MsQuic.Api, ConnCtx, Stream, Data, CloseSend);
 end;
@@ -330,10 +331,10 @@ var
   Svr: TQuicServer;
 begin
   PConn := PConnectionContext(ConnCtx);
-  if (PConn = nil) or (PConn.Server = nil) then 
+  if (PConn = nil) or (PConn.Server = nil) then
      Exit;
   Svr := TQuicServer(PConn.Server);
-  if (Svr.MsQuic = nil) or (Svr.MsQuic.Api = nil) then 
+  if (Svr.MsQuic = nil) or (Svr.MsQuic.Api = nil) then
      Exit;
   WTCloseSession(Svr.MsQuic.Api, @Self, ErrorCode);
 end;
