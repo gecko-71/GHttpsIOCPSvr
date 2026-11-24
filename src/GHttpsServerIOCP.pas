@@ -754,7 +754,8 @@ begin
   for FastIdx := 0 to FFastEndpointCount - 1 do
   begin
     if (FFastEndpoints[FastIdx].Method = AMethod) and
-       (FFastEndpoints[FastIdx].Path = APath) then
+       (Length(FFastEndpoints[FastIdx].Path) = Length(APath)) and
+       FastRawBytesEquals(PByte(PChar(FFastEndpoints[FastIdx].Path)), PByte(PChar(APath)), Length(APath) * SizeOf(Char)) then
     begin
       Result := FFastEndpoints[FastIdx];
       Exit;
@@ -1277,7 +1278,7 @@ begin
     end;
 
     IsWebSocketRoute := False;
-    if (FWebSocketBridge.HasWebSocketRoutes <> 0) and (Request.RequestInfo.Method = hmGET) then
+    if Request.Headers.HasUpgradeHeader and (FWebSocketBridge.HasWebSocketRoutes <> 0) and (Request.RequestInfo.Method = hmGET) then
       IsWebSocketRoute := FWebSocketBridge.HasRoute(Request.RequestInfo.Path.ToLower);
 
     if IsWebSocketRoute then
@@ -1410,7 +1411,8 @@ begin
         for EndpointIdx := 0 to FFastEndpointCount - 1 do
         begin
           if (FFastEndpoints[EndpointIdx].Method = Request.RequestInfo.Method) and
-             (FFastEndpoints[EndpointIdx].Path = Request.RequestInfo.Path) then
+             (Length(FFastEndpoints[EndpointIdx].Path) = Length(Request.RequestInfo.Path)) and
+             FastRawBytesEquals(PByte(PChar(FFastEndpoints[EndpointIdx].Path)), PByte(PChar(Request.RequestInfo.Path)), Length(Request.RequestInfo.Path) * SizeOf(Char)) then
           begin
             Endpoint := FFastEndpoints[EndpointIdx];
             Break;
@@ -1474,7 +1476,13 @@ begin
         end;
       end
       else
-        Response.SetNotFound('The requested resource could not be found..');
+      begin
+        if (FWebSocketBridge.HasWebSocketRoutes <> 0) and (Request.RequestInfo.Method = hmGET) and
+           FWebSocketBridge.HasRoute(Request.RequestInfo.Path.ToLower) then
+          Response.SetBadRequest('WebSocket Upgrade Header Required')
+        else
+          Response.SetNotFound('The requested resource could not be found..');
+      end;
     end;
     if Request.RequestInfo.Method = hmHEAD then
     begin

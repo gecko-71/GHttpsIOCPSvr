@@ -43,6 +43,7 @@ type
     FInitialSize: Integer;
     FTotalCreated: Integer;
     FMaxSize: Integer;
+    FMaxIdlePoolSize: Integer;
     FMinFreeMemoryMb: Cardinal;
     procedure FillPool(ACount: Integer);
     function HasSufficientMemory: Boolean;
@@ -58,6 +59,7 @@ type
     property Count: Integer read GetCount;
     property TotalCreated: Integer read FTotalCreated;
     property MaxSize: Integer read FMaxSize;
+    property MaxIdlePoolSize: Integer read FMaxIdlePoolSize write FMaxIdlePoolSize;
     property MaxMemoryLoadPercent: Byte read FMaxMemoryLoadPercent;
     property MinFreeMemoryMb: Cardinal read FMinFreeMemoryMb;
   end;
@@ -75,6 +77,7 @@ begin
   InitializeSRWLock(FLock);
   FInitialSize := AInitialSize;
   FMaxSize := AMaxSize;
+  FMaxIdlePoolSize := 256;
   FTotalCreated := 0;
   FMinFreeMemoryMb := AMinFreeMemoryMb;
   FMaxMemoryLoadPercent := AMaxMemoryLoadPercent;
@@ -125,6 +128,7 @@ begin
               Resp.Free;
           except
           end;
+          Overlapped^.Magic := 0;
           Dispose(Overlapped);
         end;
       end;
@@ -151,6 +155,7 @@ begin
     Initialize(Overlapped^);
     InitializeSRWLock(Overlapped^.SSLLock);
     Overlapped^.InPool := 1;
+    Overlapped^.Magic := OVERLAPPED_EX_MAGIC;
     FAllAllocated.AddOrSetValue(Overlapped, 1);
     FPool.Enqueue(Overlapped);
     Inc(FTotalCreated);
@@ -226,6 +231,7 @@ begin
     Initialize(Result^);
     InitializeSRWLock(Result^.SSLLock);
     Result^.InPool := 0;
+    Result^.Magic := OVERLAPPED_EX_MAGIC;
   end;
 end;
 
@@ -248,7 +254,7 @@ begin
   ShouldFree := False;
   AcquireSRWLockExclusive(FLock);
   try
-    if FPool.Count >= 256 then
+    if (FMaxIdlePoolSize > 0) and (FPool.Count >= FMaxIdlePoolSize) then
     begin
       if Assigned(FAllAllocated) then
         FAllAllocated.Remove(AOverlapped);
@@ -281,6 +287,7 @@ begin
         Resp.Free;
     except
     end;
+    AOverlapped^.Magic := 0;
     Dispose(AOverlapped);
   end;
 end;

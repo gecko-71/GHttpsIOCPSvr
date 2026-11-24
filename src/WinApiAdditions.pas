@@ -110,12 +110,33 @@ type
     WebSocketSession: TObject;
     WebSocketState: Integer;
     InPool: LongInt;
+    Magic: Cardinal;
     ALPNProtocol: array[0..31] of AnsiChar;
     ClientIP: array[0..45] of AnsiChar;
     ClientCertInfo: TGClientCertInfo;
   end;
 
+  TOverlappedEntry = record
+    lpCompletionKey: ULONG_PTR;
+    lpOverlapped: POverlapped;
+    Internal: ULONG_PTR;
+    dwNumberOfBytesTransferred: DWORD;
+  end;
+  POverlappedEntry = ^TOverlappedEntry;
+
   TOverlappedTlsCleanupProc = procedure(var OverlappedEx: TOverlappedEx);
+
+function GetQueuedCompletionStatusEx(
+  CompletionPort: THandle;
+  lpCompletionPortEntries: POverlappedEntry;
+  ulCount: ULONG;
+  var ulNumEntriesRemoved: ULONG;
+  dwMilliseconds: DWORD;
+  fAlertable: BOOL
+): BOOL; stdcall; external 'kernel32.dll';
+
+function FastRawBytesEquals(P1, P2: PByte; Len: Integer): Boolean;
+function FastRawPathEquals(const APathRaw: RawByteString; APtr: PByte; ALen: Integer): Boolean; inline;
 
 var
   GOverlappedTlsCleanupProc: TOverlappedTlsCleanupProc = nil;
@@ -126,6 +147,7 @@ const
   ASC_REQ_SESSION_TICKET = $00000040;
   ASC_REQ_MUTUAL_AUTH = $00000002;
   FILE_SKIP_COMPLETION_PORT_ON_SUCCESS = $01;
+  OVERLAPPED_EX_MAGIC = $47485454;
 
   WORKER_THREAD_COUNT = 48;
 
@@ -1106,6 +1128,58 @@ begin
     if TryCertKeyPairInDir(CurDir, 'server.crt', 'server.key', ACertFile, AKeyFile) then
       Exit(True);
   end;
+end;
+
+function FastRawBytesEquals(P1, P2: PByte; Len: Integer): Boolean;
+var
+  Remaining: Integer;
+begin
+  if Len <= 0 then
+    Exit(Len = 0);
+  if (P1 = nil) or (P2 = nil) then
+    Exit(False);
+  if P1 = P2 then
+    Exit(True);
+  Remaining := Len;
+  while Remaining >= 8 do
+  begin
+    if PUInt64(P1)^ <> PUInt64(P2)^ then
+      Exit(False);
+    Inc(P1, 8);
+    Inc(P2, 8);
+    Dec(Remaining, 8);
+  end;
+  if Remaining >= 4 then
+  begin
+    if PCardinal(P1)^ <> PCardinal(P2)^ then
+      Exit(False);
+    Inc(P1, 4);
+    Inc(P2, 4);
+    Dec(Remaining, 4);
+  end;
+  if Remaining >= 2 then
+  begin
+    if PWord(P1)^ <> PWord(P2)^ then
+      Exit(False);
+    Inc(P1, 2);
+    Inc(P2, 2);
+    Dec(Remaining, 2);
+  end;
+  if Remaining = 1 then
+  begin
+    if P1^ <> P2^ then
+      Exit(False);
+  end;
+  Result := True;
+end;
+
+function FastRawPathEquals(const APathRaw: RawByteString; APtr: PByte; ALen: Integer): Boolean;
+begin
+  if Length(APathRaw) <> ALen then
+    Exit(False);
+  if ALen = 0 then
+    Exit(True);
+  Result := FastRawBytesEquals(PByte(PAnsiChar(APathRaw)), APtr, ALen);
 end;
 
 initialization

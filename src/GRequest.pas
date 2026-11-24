@@ -471,20 +471,46 @@ end;
 function TRequest.FindHeadersEnd(const Buffer: TBytes; Size: Integer): Integer;
 var
   I: Integer;
+  J: Integer;
+  Limit8: Integer;
   P: PByte;
+  Word64: UInt64;
+  XorCR: UInt64;
+  HasCR: UInt64;
 begin
   Result := -1;
   if Size < 4 then
     Exit;
 
   P := @Buffer[0];
-  for I := 0 to Size - 4 do
+  I := 0;
+  Limit8 := Size - 11;
+  while I <= Limit8 do
+  begin
+    Word64 := PUInt64(P + I)^;
+    XorCR := Word64 xor UInt64($0D0D0D0D0D0D0D0D);
+    HasCR := (XorCR - UInt64($0101010101010101)) and (not XorCR) and UInt64($8080808080808080);
+    if HasCR <> 0 then
+    begin
+      for J := I to I + 7 do
+      begin
+        if PCardinal(P + J)^ = $0A0D0A0D then
+        begin
+          Result := J + 4;
+          Exit;
+        end;
+      end;
+    end;
+    Inc(I, 8);
+  end;
+  while I <= Size - 4 do
   begin
     if PCardinal(P + I)^ = $0A0D0A0D then
     begin
       Result := I + 4;
       Exit;
     end;
+    Inc(I);
   end;
 end;
 

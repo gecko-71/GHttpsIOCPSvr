@@ -144,6 +144,7 @@ type
     FHeaders: TStringList;
     FContentType: string;
     FHeadersData: TBytes;
+    FHeadersDataLen: Integer;
     FHeadersBuilt: Boolean;
     FHeadersSent: Boolean;
     FBytesSent: Integer;
@@ -522,7 +523,8 @@ begin
     CleanupTempFile;
   FSocket := ASocket;
   FStatus := hsOK;
-  FHeaders.Clear;
+  if FHeaders.Count > 0 then
+    FHeaders.Clear;
   FContentType := 'text/plain';
   FBytesSent := 0;
   FHeaderPosition := 0;
@@ -548,7 +550,9 @@ begin
   if Assigned(FInMemoryFiles) then
     FInMemoryFiles.Clear;
   FCurrentInMemoryFile := nil;
-  SetLength(FHeadersData, 0);
+  FHeadersDataLen := 0;
+  if Length(FHeadersData) > 16384 then
+    SetLength(FHeadersData, 0);
   if Length(FContentBytes) > 65536 then
     SetLength(FContentBytes, 0);
   FKeepAlive := False;
@@ -1602,12 +1606,17 @@ begin
       end;
       if IsAsciiOnly then
       begin
-        SetLength(FHeadersData, FastLen);
+        if Length(FHeadersData) < FastLen then
+          SetLength(FHeadersData, FastLen);
+        FHeadersDataLen := FastLen;
         for I := 1 to FastLen do
           FHeadersData[I - 1] := Byte(Ord(FastHeaderStr[I]));
       end
       else
+      begin
         FHeadersData := TEncoding.UTF8.GetBytes(FastHeaderStr);
+        FHeadersDataLen := Length(FHeadersData);
+      end;
       FHeadersBuilt := True;
       Exit;
     end;
@@ -1664,6 +1673,7 @@ begin
           HeaderBuilder.AppendLine(FinalHeaders[I]);
         HeaderBuilder.AppendLine;
         FHeadersData := TEncoding.UTF8.GetBytes(HeaderBuilder.ToString);
+        FHeadersDataLen := Length(FHeadersData);
         FHeadersBuilt := True;
       finally
         HeaderBuilder.Free;
@@ -1803,16 +1813,16 @@ begin
     begin
       if not FHeadersBuilt then
         BuildHeaders;
-      if Length(FHeadersData) > 0 then
+      if FHeadersDataLen > 0 then
       begin
-        RemainingHeaderBytes := Length(FHeadersData) - FHeaderPosition;
+        RemainingHeaderBytes := FHeadersDataLen - FHeaderPosition;
         if RemainingHeaderBytes > 0 then
         begin
           BytesToCopy := Min(RemainingHeaderBytes, BufferSize);
           Move(FHeadersData[FHeaderPosition], Buffer^, BytesToCopy);
           Inc(FHeaderPosition, BytesToCopy);
           HeaderCopied := BytesToCopy;
-          if FHeaderPosition >= Length(FHeadersData) then
+          if FHeaderPosition >= FHeadersDataLen then
             FHeadersSent := True;
           if (not FHeadersSent) or (HeaderCopied >= BufferSize) then
           begin

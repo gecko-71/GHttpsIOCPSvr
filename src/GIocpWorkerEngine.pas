@@ -1251,21 +1251,58 @@ var
   IsActive: Boolean;
   OsslHasPlain: Boolean;
   OsslErrMsg: string;
+  BatchEntries: array[0..31] of TOverlappedEntry;
+  BatchCount: ULONG;
+  BatchIdx: ULONG;
+  EntryInternal: ULONG_PTR;
 begin
   Engine := TIocpWorkerEngine(Parameter);
   GracefulShutdown := False;
   ConsecutiveErrors := 0;
   Logger.Info('Worker thread started');
   OverlappedEx := nil;
+  CompletionOK := False;
+  CompletionKey := 0;
+  BytesTransferred := 0;
   SkipDequeue := False;
   InlineIter := 0;
+  BatchCount := 0;
+  BatchIdx := 0;
   while Engine.FRunning and not GracefulShutdown do
   begin
     if not SkipDequeue then
     begin
       InlineIter := 0;
-      CompletionOK := GetQueuedCompletionStatus(Engine.FCompletionPort, BytesTransferred,
-                                                CompletionKey, POverlapped(OverlappedEx), 2000);
+      if BatchIdx >= BatchCount then
+      begin
+        BatchCount := 0;
+        BatchIdx := 0;
+        if not GetQueuedCompletionStatusEx(Engine.FCompletionPort, @BatchEntries[0], 32, BatchCount, 2000, False) then
+        begin
+          CompletionOK := False;
+          OverlappedEx := nil;
+          BytesTransferred := 0;
+          CompletionKey := 0;
+        end;
+      end;
+      if BatchIdx < BatchCount then
+      begin
+        CompletionKey := BatchEntries[BatchIdx].lpCompletionKey;
+        OverlappedEx := POverlappedEx(BatchEntries[BatchIdx].lpOverlapped);
+        BytesTransferred := BatchEntries[BatchIdx].dwNumberOfBytesTransferred;
+        EntryInternal := BatchEntries[BatchIdx].Internal;
+        Inc(BatchIdx);
+        if (OverlappedEx <> nil) and ((EntryInternal and $C0000000) = $C0000000) then
+        begin
+          CompletionOK := False;
+          if EntryInternal = $C0000120 then
+            SetLastError(ERROR_OPERATION_ABORTED)
+          else
+            SetLastError(ERROR_NETNAME_DELETED);
+        end
+        else
+          CompletionOK := True;
+      end;
     end
     else
     begin
@@ -1281,9 +1318,7 @@ begin
         Break;
       end;
 
-      if not Engine.FOverlappedPool.IsAllocated(OverlappedEx) then
-        Continue;
-      if OverlappedEx^.InPool <> 0 then
+      if (OverlappedEx^.Magic <> OVERLAPPED_EX_MAGIC) or (OverlappedEx^.InPool <> 0) then
         Continue;
 
       if (CompletionKey <> 0) and (OverlappedEx^.OpType <> otAccept) and (CompletionKey <> ULONG_PTR(OverlappedEx^.Socket)) then
@@ -2092,7 +2127,7 @@ begin
         end;
         if CanCheckInlineRecv then
         begin
-          if Engine.FOverlappedPool.IsAllocated(OverlappedEx) and (OverlappedEx^.InPool = 0) and OverlappedEx^.InlineRecvReady then
+          if (OverlappedEx^.Magic = OVERLAPPED_EX_MAGIC) and (OverlappedEx^.InPool = 0) and OverlappedEx^.InlineRecvReady then
           begin
             OverlappedEx^.InlineRecvReady := False;
             Inc(InlineIter);

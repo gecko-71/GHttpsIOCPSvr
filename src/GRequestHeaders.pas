@@ -44,6 +44,7 @@ type
     FSlotValues: array[0..15] of string;
     FSlotCount: Integer;
     FUseDict: Boolean;
+    FHasUpgradeHeader: Boolean;
     FValidationLevel: TValidationLevel;
     FContentEncodingHandler: TContentEncodingHandler;
     function NormalizeHeaderName(const HeaderName: string): string;
@@ -84,6 +85,7 @@ type
     function GetSlotValue(Index: Integer): string; inline;
     property UseDict: Boolean read FUseDict;
     property SlotCount: Integer read FSlotCount;
+    property HasUpgradeHeader: Boolean read FHasUpgradeHeader;
     property ValidationLevel: TValidationLevel read FValidationLevel write FValidationLevel;
     property ContentLength: string read GetContentLength;
     property ContentType: string read GetContentType;
@@ -456,6 +458,8 @@ var
 begin
   if NormalizedName = '' then
     Exit;
+  if (Length(NormalizedName) = 7) and (NormalizedName[1] = 'u') and (NormalizedName = 'upgrade') then
+    FHasUpgradeHeader := True;
   if not FUseDict then
   begin
     if FSlotCount = 0 then
@@ -638,6 +642,7 @@ var
   Pair: TPair<string, TStringList>;
   I: Integer;
 begin
+  FHasUpgradeHeader := False;
   try
     if not FUseDict then
     begin
