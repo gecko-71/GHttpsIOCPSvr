@@ -398,6 +398,9 @@ function HTMLEncode(const Input: string): string;
 
 implementation
 
+uses
+  WinApiAdditions;
+
 function GetTempDir: string;
 var
   ExeDir, TempPath: string;
@@ -2088,13 +2091,12 @@ begin
       begin
         var HeaderData: TBytes;
         HeadersEndPos := -1;
-        if Length(BufferBytes) - BufferPos >= Length(DOUBLE_CRLF) then
-          for var i := BufferPos to Length(BufferBytes) - Length(DOUBLE_CRLF) do
-            if CompareMem(@BufferBytes[i], @DOUBLE_CRLF[0], Length(DOUBLE_CRLF)) then
-            begin
-              HeadersEndPos := i;
-              Break;
-            end;
+        if Length(BufferBytes) - BufferPos >= 4 then
+        begin
+          HeadersEndPos := FastFindPattern4(@BufferBytes[BufferPos], Length(BufferBytes) - BufferPos, $0A0D0A0D);
+          if HeadersEndPos >= 0 then
+            Inc(HeadersEndPos, BufferPos);
+        end;
         if HeadersEndPos > -1 then
         begin
           HeaderData := Copy(BufferBytes, BufferPos, HeadersEndPos - BufferPos);
@@ -2186,23 +2188,39 @@ end;
 function TMultipartBodyPart.FindBoundary(const Data: TBytes; StartPos: Integer; out IsFinal: Boolean): Integer;
 var
   I: Integer;
+  BoundaryLen: Integer;
+  DataLen: Integer;
+  MaxStart: Integer;
+  FirstByte: Byte;
+  RelIdx: Integer;
+  CheckPos: Integer;
 begin
   Result := -1;
   IsFinal := False;
-  if (Length(FBoundaryBytes) = 0) or (Length(Data) = 0) then
-     Exit;
-  if Length(Data) - StartPos < Length(FBoundaryBytes) then
-     Exit;
-  for I := StartPos to Length(Data) - Length(FBoundaryBytes) do
+  BoundaryLen := Length(FBoundaryBytes);
+  DataLen := Length(Data);
+  if (BoundaryLen = 0) or (DataLen = 0) then
+    Exit;
+  if DataLen - StartPos < BoundaryLen then
+    Exit;
+  FirstByte := FBoundaryBytes[0];
+  MaxStart := DataLen - BoundaryLen;
+  I := StartPos;
+  while I <= MaxStart do
   begin
-    if CompareMem(@Data[I], @FBoundaryBytes[0], Length(FBoundaryBytes)) then
+    RelIdx := FastFindByte(@Data[I], MaxStart - I + 1, FirstByte);
+    if RelIdx < 0 then
+      Exit;
+    Inc(I, RelIdx);
+    if FastRawBytesEquals(@Data[I], @FBoundaryBytes[0], BoundaryLen) then
     begin
       Result := I;
-      var CheckPos := I + Length(FBoundaryBytes);
-      if (CheckPos + 1 < Length(Data)) and (Data[CheckPos] = Ord('-')) and (Data[CheckPos + 1] = Ord('-')) then
-         IsFinal := True;
+      CheckPos := I + BoundaryLen;
+      if (CheckPos + 1 < DataLen) and (Data[CheckPos] = Ord('-')) and (Data[CheckPos + 1] = Ord('-')) then
+        IsFinal := True;
       Exit;
     end;
+    Inc(I);
   end;
 end;
 

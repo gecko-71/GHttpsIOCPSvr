@@ -263,6 +263,9 @@ function IsHexDigit(c: Char): Boolean;
 
 implementation
 
+uses
+  WinApiAdditions;
+
 const
   CRLF = #13#10;
   DOUBLE_CRLF = #13#10#13#10;
@@ -470,48 +473,14 @@ end;
 
 function TRequest.FindHeadersEnd(const Buffer: TBytes; Size: Integer): Integer;
 var
-  I: Integer;
-  J: Integer;
-  Limit8: Integer;
-  P: PByte;
-  Word64: UInt64;
-  XorCR: UInt64;
-  HasCR: UInt64;
+  Idx: Integer;
 begin
   Result := -1;
-  if Size < 4 then
+  if (Size < 4) or (Length(Buffer) < Size) then
     Exit;
-
-  P := @Buffer[0];
-  I := 0;
-  Limit8 := Size - 11;
-  while I <= Limit8 do
-  begin
-    Word64 := PUInt64(P + I)^;
-    XorCR := Word64 xor UInt64($0D0D0D0D0D0D0D0D);
-    HasCR := (XorCR - UInt64($0101010101010101)) and (not XorCR) and UInt64($8080808080808080);
-    if HasCR <> 0 then
-    begin
-      for J := I to I + 7 do
-      begin
-        if PCardinal(P + J)^ = $0A0D0A0D then
-        begin
-          Result := J + 4;
-          Exit;
-        end;
-      end;
-    end;
-    Inc(I, 8);
-  end;
-  while I <= Size - 4 do
-  begin
-    if PCardinal(P + I)^ = $0A0D0A0D then
-    begin
-      Result := I + 4;
-      Exit;
-    end;
-    Inc(I);
-  end;
+  Idx := FastFindPattern4(@Buffer[0], Size, $0A0D0A0D);
+  if Idx >= 0 then
+    Result := Idx + 4;
 end;
 
 procedure TRequest.AppendData(const Data: array of Byte; Size: Integer);
@@ -1452,15 +1421,9 @@ begin
       SetError('Obsolete line folding (obs-fold) is not permitted: ' + Line, stRequestSmuggling);
       Exit(True);
     end;
-    ColonPos := -1;
-    for I := LineStart to LineEnd - 1 do
-    begin
-      if DataPtr[I] = Ord(':') then
-      begin
-        ColonPos := I;
-        Break;
-      end;
-    end;
+    ColonPos := FastFindByte(DataPtr + LineStart, LineLen, Ord(':'));
+    if ColonPos >= 0 then
+      Inc(ColonPos, LineStart);
     if ColonPos >= 0 then
     begin
       if (ColonPos > LineStart) and ((DataPtr[ColonPos - 1] = 32) or (DataPtr[ColonPos - 1] = 9)) then

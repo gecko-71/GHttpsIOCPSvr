@@ -137,6 +137,10 @@ function GetQueuedCompletionStatusEx(
 
 function FastRawBytesEquals(P1, P2: PByte; Len: Integer): Boolean;
 function FastRawPathEquals(const APathRaw: RawByteString; APtr: PByte; ALen: Integer): Boolean; inline;
+{$IFOPT Q+}{$DEFINE HAD_Q_SWAR}{$Q-}{$ENDIF}
+{$IFOPT R+}{$DEFINE HAD_R_SWAR}{$R-}{$ENDIF}
+function FastFindByte(P: PByte; Size: Integer; TargetByte: Byte): Integer;
+function FastFindPattern4(P: PByte; Size: Integer; Pattern: Cardinal): Integer;
 
 var
   GOverlappedTlsCleanupProc: TOverlappedTlsCleanupProc = nil;
@@ -1181,6 +1185,90 @@ begin
     Exit(True);
   Result := FastRawBytesEquals(PByte(PAnsiChar(APathRaw)), APtr, ALen);
 end;
+
+{$IFOPT Q+}{$DEFINE HAD_Q_SWAR}{$Q-}{$ENDIF}
+{$IFOPT R+}{$DEFINE HAD_R_SWAR}{$R-}{$ENDIF}
+function FastFindByte(P: PByte; Size: Integer; TargetByte: Byte): Integer;
+var
+  I: Integer;
+  J: Integer;
+  Limit8: Integer;
+  Mask: UInt64;
+  Word64: UInt64;
+  XorVal: UInt64;
+  HasMatch: UInt64;
+begin
+  Result := -1;
+  if (P = nil) or (Size <= 0) then
+    Exit;
+  Mask := UInt64(TargetByte) * UInt64($0101010101010101);
+  I := 0;
+  Limit8 := Size - 8;
+  while I <= Limit8 do
+  begin
+    Word64 := PUInt64(P + I)^;
+    XorVal := Word64 xor Mask;
+    HasMatch := (XorVal - UInt64($0101010101010101)) and (not XorVal) and UInt64($8080808080808080);
+    if HasMatch <> 0 then
+    begin
+      for J := I to I + 7 do
+      begin
+        if P[J] = TargetByte then
+          Exit(J);
+      end;
+    end;
+    Inc(I, 8);
+  end;
+  while I < Size do
+  begin
+    if P[I] = TargetByte then
+      Exit(I);
+    Inc(I);
+  end;
+end;
+
+function FastFindPattern4(P: PByte; Size: Integer; Pattern: Cardinal): Integer;
+var
+  I: Integer;
+  J: Integer;
+  Limit8: Integer;
+  FirstByte: Byte;
+  Mask: UInt64;
+  Word64: UInt64;
+  XorVal: UInt64;
+  HasMatch: UInt64;
+begin
+  Result := -1;
+  if (P = nil) or (Size < 4) then
+    Exit;
+  FirstByte := Byte(Pattern and $FF);
+  Mask := UInt64(FirstByte) * UInt64($0101010101010101);
+  I := 0;
+  Limit8 := Size - 11;
+  while I <= Limit8 do
+  begin
+    Word64 := PUInt64(P + I)^;
+    XorVal := Word64 xor Mask;
+    HasMatch := (XorVal - UInt64($0101010101010101)) and (not XorVal) and UInt64($8080808080808080);
+    if HasMatch <> 0 then
+    begin
+      for J := I to I + 7 do
+      begin
+        if PCardinal(P + J)^ = Pattern then
+          Exit(J);
+      end;
+    end;
+    Inc(I, 8);
+  end;
+  while I <= Size - 4 do
+  begin
+    if PCardinal(P + I)^ = Pattern then
+      Exit(I);
+    Inc(I);
+  end;
+end;
+{$IFDEF HAD_R_SWAR}{$R+}{$UNDEF HAD_R_SWAR}{$ENDIF}
+{$IFDEF HAD_Q_SWAR}{$Q+}{$UNDEF HAD_Q_SWAR}{$ENDIF}
 
 initialization
   GAppendFileLock := TCriticalSection.Create;
